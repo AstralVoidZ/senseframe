@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SenseFrame ExperimentConfig",
+  "description": "s2: ExperimentConfig JSON Schema（供 IDE/外部工具静态校验 YAML 配置）",
+  "type": "object",
+  "properties": {
+    "output_dir": {"type": "string"},
+    "export_formats": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["state_dict", "torchscript", "onnx", "quantized_onnx"]
+      }
+    },
+    "scene": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"},
+        "model_id": {"type": "string"},
+        "dataset": {"type": "string"}
+      },
+      "required": ["name"]
+    },
+    "trainer": {
+      "type": "object",
+      "properties": {
+        "epochs": {"type": "integer", "minimum": 1},
+        "batch_size": {"type": "integer", "minimum": 1},
+        "lr": {"type": "number", "exclusiveMinimum": 0},
+        "optimizer": {"type": "string"},
+        "scheduler": {"type": "string"}
+      }
+    },
+    "hpo": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "num_trials": {"type": "integer", "minimum": 1},
+        "sampler": {"type": "string", "enum": ["tpe", "random", "cmaes"]},
+        "pruner": {"type": "string", "enum": ["median", "none", "hyperband"]}
+      }
+    }
+  },
+  "required": ["output_dir", "scene"]
+}

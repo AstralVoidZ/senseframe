@@ -1,0 +1,30 @@
+# 示例配置：UT_HAR + ResNet18 监督学习
+# 符合 ExperimentConfig schema，可用 validate_config.py 校验
+scene:
+  name: wifi_csi
+  dataset: UT_HAR_data
+  model_id: ResNet18
+  learning_mode: supervised
+  params:
+    metrics: [accuracy, macro_f1, micro_f1]
+    average: macro
+
+input_features:
+  - name: csi
+    type: csi
+    shape: [1, 250, 90]
+
+output_features:
+  - name: action
+    type: category
+    num_classes: 7
+
+trainer:
+  epochs: 200
+  learning_rate: 0.001
+  batch_size: 64
+  optimizer: adam
+  seed: 42
+
+output_dir: runs
+save_model: true

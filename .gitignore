@@ -1,0 +1,93 @@
+# 数据集与基准库
+CSI_DATASETS/
+
+# 开发文档暂时屏蔽
+docs/
+
+# 训练输出与测试结果
+runs/
+runs_test/
+runs_realtest/
+wandb/
+
+# 测评运行时产物
+benchmarks/runs/
+benchmarks/report_*.json
+
+# 推理产物
+models/
+result/
+eval.py
+
+# HPO 持久化数据库
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 虚拟环境
+.venv/
+env/
+ENV/
+.python-version
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# IDE / Agent 配置
+.idea/
+.vscode/
+.opencode/
+.trae/
+.uploads/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# 日志与临时文件
+*.log
+logs/
+*.tmp
+*.bak
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini

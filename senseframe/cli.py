@@ -1,0 +1,1363 @@
+"""
+CLI 接口：7 个子命令，所有输出为结构化 JSON。
+
+命令：
+- probe:         探测硬件资源
+- list-models:   列出可用模型（可按数据集/范式过滤）
+- list-datasets: 列出可用数据集
+- list-scenes:   列出已注册的场景容器
+- paradigms:     列出 SOTA 范式
+- recommend:     根据资源推荐可用模型
+- experiment:    执行声明式实验（YAML → ExperimentConfig → run_pipeline）
+"""
+
+import argparse
+import json
+import sys
+import traceback
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
+
+from .engine import ExperimentConfig, run_hpo
+from .engine.runner import run_experiment
+from .observability import setup_logging
+from .registry import DATASET_INFO, list_datasets, list_models
+from .routing import ResourceProbe, ResourceRouter
+from .scenes import list_scenes, activate_lazy_scenes
+
+
+# ============================================================
+# SOTA 范式知识库（Phase R6：从 paradigms.py 内联）
+# 预埋业界最优 WiFi CSI 动作识别训练范式，供 CLI paradigms 子命令使用。
+# ============================================================
+
+@dataclass
+class Paradigm:
+    """单个训练范式的结构化描述。"""
+
+    name: str
+    category: str
+    description: str
+    applicable_models: List[str]
+    best_for_datasets: List[str]
+    resource_level: str  # minimal / low / medium / high / extreme
+    expected_accuracy_range: str
+    training_time: str
+    key_papers: List[str] = field(default_factory=list)
+    config_template: Dict[str, Any] = field(default_factory=dict)
+    selection_criteria: str = ""
+    pros: List[str] = field(default_factory=list)
+    cons: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "category": self.category,
+            "description": self.description,
+            "applicable_models": self.applicable_models,
+            "best_for_datasets": self.best_for_datasets,
+            "resource_level": self.resource_level,
+            "expected_accuracy_range": self.expected_accuracy_range,
+            "training_time": self.training_time,
+            "key_papers": self.key_papers,
+            "config_template": self.config_template,
+            "selection_criteria": self.selection_criteria,
+            "pros": self.pros,
+            "cons": self.cons,
+        }
+
+
+PARADIGM_REGISTRY: Dict[str, Paradigm] = {
+    "traditional_ml": Paradigm(
+        name="traditional_ml",
+        category="传统机器学习",
+        description="使用 SVM / Random Forest / KNN 等传统算法，配合手工特征（方差、均值、频域特征）进行分类。适合作为基线或资源极度受限场景。",
+        applicable_models=["MLP"],
+        best_for_datasets=["UT_HAR_data", "NTU-Fi_HAR", "Widar"],
+        resource_level="minimal",
+        expected_accuracy_range="60%-80%",
+        training_time="秒级",
+        key_papers=[
+            "Wang et al., 'Understanding and Using the WiFi Sensing Channel', 2024",
+        ],
+        config_template={
+            "epochs": 50,
+            "batch_size": 32,
+            "learning_rate": 1e-3,
+            "device": "cpu",
+        },
+        selection_criteria="资源极度受限（纯CPU、内存<2GB）或需要快速基线对比时选择。",
+        pros=["训练极快", "资源需求极低", "可解释性强"],
+        cons=["精度上限低", "需手工特征工程", "泛化能力弱"],
+    ),
+    "cnn": Paradigm(
+        name="cnn",
+        category="卷积神经网络",
+        description="将 CSI 数据图像化后使用 CNN 提取空间特征。LeNet 适合轻量场景，ResNet18/50/101 逐级提升精度但增加资源消耗。当前 WiFi CSI HAR 最主流的范式。",
+        applicable_models=["LeNet", "ResNet18", "ResNet50", "ResNet101"],
+        best_for_datasets=["UT_HAR_data", "NTU-Fi-HumanID", "NTU-Fi_HAR", "Widar"],
+        resource_level="medium",
+        expected_accuracy_range="80%-95%",
+        training_time="分钟级",
+        key_papers=[
+            "Ma et al., 'WiFi Sensing with Channel State Information: A Survey', 2022",
+            "Li et al., 'AutoFi: Automated WiFi Human Activity Recognition', 2023",
+        ],
+        config_template={
+            "epochs": 200,
+            "batch_size": 64,
+            "learning_rate": 1e-3,
+            "optimizer": "adam",
+        },
+        selection_criteria="通用首选。ResNet18 是精度/速度最佳平衡点；ResNet50/101 适合追求极致精度且有 GPU 的场景。",
+        pros=["精度高", "特征提取能力强", "成熟稳定"],
+        cons=["ResNet50/101 需 GPU", "对时序信息建模弱", "数据量小时易过拟合"],
+    ),
+    "rnn": Paradigm(
+        name="rnn",
+        category="循环神经网络",
+        description="利用 RNN / GRU / LSTM / BiLSTM 对 CSI 时序序列建模，捕捉动作的时间动态。适合需要时间维度信息的场景。",
+        applicable_models=["RNN", "GRU", "LSTM", "BiLSTM"],
+        best_for_datasets=["UT_HAR_data", "NTU-Fi-HumanID", "NTU-Fi_HAR", "Widar"],
+        resource_level="medium",
+        expected_accuracy_range="75%-90%",
+        training_time="分钟级（RNN 可能需要小时级，因 epoch 数大）",
+        key_papers=[
+            "Wang et al., 'A Deep Learning Approach for Activity Recognition', 2017",
+        ],
+        config_template={
+            "epochs": 200,
+            "batch_size": 64,
+            "learning_rate": 1e-3,
+            "optimizer": "adam",
+        },
+        selection_criteria="当动作的时间模式是关键区分因素时选择。GRU/LSTM 通常优于原始 RNN；BiLSTM 适合需要双向上下文的场景。",
+        pros=["时序建模能力强", "适合序列数据", "GRU/LSTM 训练稳定"],
+        cons=["RNN 训练慢（epoch 多）", "长序列梯度消失", "并行度低"],
+    ),
+    "hybrid": Paradigm(
+        name="hybrid",
+        category="CNN+RNN 混合",
+        description="CNN 提取空间特征 + RNN 建模时序动态，时空联合建模。CNN+GRU 是代表方法，兼顾空间和时间信息。",
+        applicable_models=["CNN+GRU"],
+        best_for_datasets=["UT_HAR_data", "NTU-Fi-HumanID", "NTU-Fi_HAR", "Widar"],
+        resource_level="medium",
+        expected_accuracy_range="82%-93%",
+        training_time="分钟级",
+        key_papers=[
+            "Li et al., 'AutoFi: Automated WiFi Human Activity Recognition', 2023",
+        ],
+        config_template={
+            "epochs": 200,
+            "batch_size": 64,
+            "learning_rate": 1e-3,
+            "optimizer": "adam",
+        },
+        selection_criteria="当单一 CNN 或 RNN 无法满足精度要求，且需要同时捕捉空间和时序特征时选择。",
+        pros=["时空联合建模", "精度通常优于单一 CNN/RNN", "结构灵活"],
+        cons=["参数量较大", "训练时间比单一模型长", "调参复杂度增加"],
+    ),
+    "transformer": Paradigm(
+        name="transformer",
+        category="Transformer / 注意力机制",
+        description="使用 ViT 等 Transformer 架构，通过自注意力机制捕捉 CSI 数据的全局依赖关系。适合大数据集和高精度需求场景。",
+        applicable_models=["ViT"],
+        best_for_datasets=["UT_HAR_data", "NTU-Fi-HumanID", "NTU-Fi_HAR", "Widar"],
+        resource_level="high",
+        expected_accuracy_range="85%-96%",
+        training_time="分钟级至小时级",
+        key_papers=[
+            "Dosovitskiy et al., 'An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale', 2021",
+            "Li et al., 'AutoFi: Automated WiFi Human Activity Recognition', 2023",
+        ],
+        config_template={
+            "epochs": 200,
+            "batch_size": 64,
+            "learning_rate": 1e-3,
+            "optimizer": "adam",
+            "device": "cuda",
+        },
+        selection_criteria="数据量充足、有 GPU 资源、追求最高精度时选择。小数据集上可能不如 CNN。",
+        pros=["全局注意力建模", "大数据集上精度最高", "可扩展性强"],
+        cons=["需 GPU", "小数据集易过拟合", "训练资源消耗大"],
+    ),
+    "self_supervised": Paradigm(
+        name="self_supervised",
+        category="自监督学习",
+        description="AutoFi 范式：先在无标注数据上自监督预训练（EntLoss: KL+EH+HE+KDE），再在有标注数据上监督微调。适合标注数据稀缺的场景。",
+        applicable_models=["MLP", "LeNet", "ResNet18", "ResNet50", "ResNet101",
+                           "RNN", "GRU", "LSTM", "BiLSTM", "CNN+GRU", "ViT"],
+        best_for_datasets=["NTU-Fi_HAR", "NTU-Fi-HumanID"],
+        resource_level="high",
+        expected_accuracy_range="85%-95%",
+        training_time="小时级（两阶段：100 epoch 预训练 + 300 epoch 微调）",
+        key_papers=[
+            "Li et al., 'AutoFi: Automated WiFi Human Activity Recognition', 2023",
+        ],
+        config_template={
+            "learning_mode": "self_supervised",
+            "epochs": 100,
+            "supervised_epochs": 300,
+            "batch_size": 64,
+            "learning_rate": 1e-3,
+            "optimizer": "adamw",
+            "weight_decay": 1.5e-6,
+        },
+        selection_criteria="标注数据稀缺、有大量未标注 CSI 数据时选择。两阶段训练资源消耗较大。",
+        pros=["利用无标注数据", "标注数据少时优势明显", "特征学习能力强"],
+        cons=["两阶段训练耗时长", "资源消耗大", "需大量无标注数据"],
+    ),
+    "cross_domain": Paradigm(
+        name="cross_domain",
+        category="跨域泛化",
+        description="通过域适应（Domain Adaptation）或元学习（Meta-Learning）提升模型在新环境、新用户、新位置的泛化能力。解决 WiFi CSI 的环境依赖问题。",
+        applicable_models=[],
+        best_for_datasets=["UT_HAR_data", "NTU-Fi_HAR", "Widar"],
+        resource_level="high",
+        expected_accuracy_range="70%-88%（跨域场景）",
+        training_time="小时级",
+        key_papers=[
+            "Zeng et al., 'A Survey of WiFi Sensing: From Theory to Applications', 2024",
+        ],
+        config_template={
+            "epochs": 200,
+            "batch_size": 64,
+            "learning_rate": 1e-3,
+            "domain_adaptation": True,
+        },
+        selection_criteria="模型需要部署到新环境（不同房间/用户/设备位置）时选择。当前框架未实现，作为范式预埋。",
+        pros=["跨域泛化能力强", "减少环境重新标注成本", "实际部署价值高"],
+        cons=["实现复杂", "需源域和目标域数据", "当前框架未覆盖"],
+    ),
+    "lightweight": Paradigm(
+        name="lightweight",
+        category="轻量化模型",
+        description="通过模型压缩（知识蒸馏、剪枝、量化）或高效架构（EfficientFi）降低模型大小和推理延迟，适合边缘设备部署。",
+        applicable_models=["MLP", "LeNet"],
+        best_for_datasets=["UT_HAR_data", "NTU-Fi_HAR"],
+        resource_level="low",
+        expected_accuracy_range="75%-90%",
+        training_time="分钟级",
+        key_papers=[
+            "Wang et al., 'EfficientFi: Efficient WiFi Human Activity Recognition', 2023",
+        ],
+        config_template={
+            "epochs": 100,
+            "batch_size": 64,
+            "learning_rate": 1e-3,
+            "device": "cpu",
+            "quantization": True,
+        },
+        selection_criteria="目标平台为边缘设备（树莓派、嵌入式设备）或对推理延迟有严格要求时选择。",
+        pros=["模型小、推理快", "适合边缘部署", "能耗低"],
+        cons=["精度有损失", "需额外压缩流程", "当前框架未实现蒸馏/剪枝"],
+    ),
+    "foundation_model": Paradigm(
+        name="foundation_model",
+        category="基础模型 / 预训练大模型",
+        description="在大规模 CSI 数据上预训练通用感知模型，通过微调适配各种下游任务。代表 WiFi CSI 感知的前沿方向。",
+        applicable_models=[],
+        best_for_datasets=["UT_HAR_data", "NTU-Fi-HumanID", "NTU-Fi_HAR", "Widar"],
+        resource_level="extreme",
+        expected_accuracy_range="90%-98%（预期）",
+        training_time="天级（预训练）",
+        key_papers=[
+            "Wang et al., 'Understanding and Using the WiFi Sensing Channel', 2024",
+            "Zeng et al., 'A Survey of WiFi Sensing: From Theory to Applications', 2024",
+        ],
+        config_template={
+            "pretrain_epochs": 1000,
+            "finetune_epochs": 100,
+            "batch_size": 256,
+            "learning_rate": 1e-4,
+            "device": "cuda",
+        },
+        selection_criteria="有大规模预训练数据和充足算力时选择。当前为前沿研究方向，框架未实现。",
+        pros=["通用感知能力强", "少样本学习", "跨任务迁移"],
+        cons=["预训练成本极高", "需大规模数据", "当前框架未覆盖"],
+    ),
+}
+
+
+def list_paradigms(category: Optional[str] = None) -> List[Dict[str, Any]]:
+    """列出所有范式，可按类别过滤。"""
+    if category:
+        return [p.to_dict() for p in PARADIGM_REGISTRY.values() if p.category == category]
+    return [p.to_dict() for p in PARADIGM_REGISTRY.values()]
+
+
+def get_paradigm(name: str) -> Optional[Paradigm]:
+    """查询单个范式详情。"""
+    return PARADIGM_REGISTRY.get(name)
+
+
+def _print_json(data: Any):
+    """输出 JSON 到 stdout。"""
+    print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+
+
+def _cmd_probe(args):
+    """探测硬件资源。"""
+    report = ResourceProbe.probe()
+    route_level = ResourceRouter.route(report)
+    route_config = ResourceRouter.get_route_config(route_level)
+    available_models = ResourceRouter.filter_models(route_level)
+    # RFC-004 方案 D：同时输出 lightning_params（输出契约层），便于用户理解实际 Lightning 参数
+    lightning_params = ResourceRouter.to_lightning_params(route_config)
+
+    _print_json({
+        "resource": report.to_dict(),
+        "route_level": route_level,
+        "route_config": route_config,  # 内部表示（调试用）
+        "lightning_params": lightning_params,  # 输出契约层（accelerator/devices/precision）
+        "available_models": available_models,
+    })
+
+
+def _cmd_list_models(args):
+    """列出可用模型。"""
+    activate_lazy_scenes()
+    models = list_models(
+        dataset=args.dataset,
+        paradigm=args.paradigm,
+        enabled_only=not args.all,
+    )
+    _print_json({"count": len(models), "models": models})
+
+
+def _cmd_list_datasets(args):
+    """列出可用数据集。"""
+    activate_lazy_scenes()
+    datasets = list_datasets()
+    _print_json({"count": len(datasets), "datasets": datasets})
+
+
+def _cmd_list_scenes(args):
+    """列出已注册的场景容器。"""
+    scenes = list_scenes()
+    scene_list = []
+    for name, meta in scenes.items():
+        scene_list.append({
+            "name": meta.name,
+            "supported_tasks": meta.supported_tasks,
+            "supported_models": meta.supported_models,
+            "supported_datasets": meta.supported_datasets,
+            "requires_custom_dataloader": meta.requires_custom_dataloader,
+            # Phase 6.3：补全能力声明字段，供 Agent 程序化查询
+            "supported_learning_modes": meta.supported_learning_modes,
+            "input_shape_hint": meta.input_shape_hint,
+        })
+    _print_json({"count": len(scene_list), "scenes": scene_list})
+
+
+def _cmd_paradigms(args):
+    """列出 SOTA 范式。"""
+    paradigms = list_paradigms(category=args.category)
+    _print_json({"count": len(paradigms), "paradigms": paradigms})
+
+
+def _has_factory(model_id: str, dataset: str) -> bool:
+    """检查模型是否绑定了指定数据集的工厂。"""
+    from .registry import resolve_factory
+    try:
+        resolve_factory(model_id, dataset)
+        return True
+    except Exception:
+        return False
+
+
+def _cmd_recommend(args):
+    """根据资源推荐可用模型。"""
+    activate_lazy_scenes()
+    report = ResourceProbe.probe()
+    route_level = ResourceRouter.route(report)
+    available = ResourceRouter.filter_models(route_level)
+
+    # 按数据集过滤（通过 resolve_factory 检测是否绑定了工厂）
+    if args.dataset:
+        available = [
+            m for m in available
+            if _has_factory(m, args.dataset)
+        ]
+
+    # 获取模型详情
+    from .registry import MODEL_TABLE
+    recommendations = []
+    for model_id in available:
+        info = MODEL_TABLE[model_id].copy()
+        info["model_id"] = model_id
+        if args.dataset:
+            from .registry import get_default_epochs
+            info["default_epochs"] = get_default_epochs(model_id, args.dataset)
+        recommendations.append(info)
+
+    # 按优先级排序
+    priority = args.priority or "balanced"
+    if priority == "accuracy":
+        recommendations.sort(key=lambda x: x.get("estimated_params_m", 0), reverse=True)
+    elif priority == "speed":
+        recommendations.sort(key=lambda x: x.get("estimated_params_m", 0))
+    elif priority == "memory":
+        recommendations.sort(key=lambda x: x.get("estimated_vram_mb", 0))
+
+    _print_json({
+        "resource": report.to_dict(),
+        "route_level": route_level,
+        "priority": priority,
+        "count": len(recommendations),
+        "recommendations": recommendations,
+    })
+
+
+def _cmd_dry_run(config: ExperimentConfig) -> dict:
+    """
+    Phase 6.3：预检模式（--dry-run）。
+
+    不实际执行训练，仅完成启动前检查并输出报告：
+    1. 配置 schema 校验
+    2. 场景/数据集/模型注册校验
+    3. 硬件资源探测 + 路由
+    4. 启动前预检（数据存在性、显存、磁盘空间）
+    5. 输出"将要执行"的训练计划摘要
+
+    Returns:
+        预检报告 dict（含 status: ok/blocked + 各检查项结果）
+    """
+    from .engine.config import DEFAULT_DATA_ROOT
+    from .engine.runner.resolver import experiment_config_to_dict
+    from .engine.runner.preflight import preflight_check as _preflight_check
+    from .scenes import get_scene, has_scene
+
+    report: Dict[str, Any] = {"status": "ok", "checks": []}
+
+    def _check(name: str, ok: bool, detail: Any = None):
+        report["checks"].append({"name": name, "ok": ok, "detail": detail})
+        if not ok:
+            report["status"] = "blocked"
+
+    # 1. 配置校验
+    try:
+        config.validate()
+        _check("config_validation", True)
+    except ValueError as e:
+        _check("config_validation", False, str(e))
+        return report
+
+    # 2. 场景注册校验
+    if not has_scene(config.scene.name):
+        _check("scene_registered", False,
+               f"Scene '{config.scene.name}' not registered")
+        return report
+    _check("scene_registered", True)
+
+    scene = get_scene(config.scene.name)
+    meta = scene.meta()
+
+    # 3. 数据集/模型支持校验
+    # Phase 8.1：CustomContainer 的 supported_datasets 动态由 manifest 决定
+    is_custom = (config.scene.name == "custom")
+    if not is_custom:
+        if config.scene.dataset not in meta.supported_datasets:
+            _check("dataset_supported", False,
+                   f"'{config.scene.dataset}' not in {meta.supported_datasets}")
+        else:
+            _check("dataset_supported", True)
+    else:
+        # CustomContainer：尝试加载 manifest 验证 dataset 名称匹配
+        try:
+            from .scenes.custom.container import _load_manifest_cached
+            manifest_path = config.scene.params.get("manifest_path") if config.scene.params else None
+            if manifest_path is None:
+                _check("dataset_supported", False,
+                       "CustomContainer 需要 scene.params.manifest_path")
+            else:
+                manifest = _load_manifest_cached(manifest_path)
+                if config.scene.dataset != manifest.name:
+                    _check("dataset_supported", False,
+                           f"dataset '{config.scene.dataset}' != manifest.name '{manifest.name}'")
+                else:
+                    _check("dataset_supported", True, {"manifest": manifest.name})
+        except Exception as e:
+            _check("dataset_supported", False, f"manifest 加载失败: {e}")
+
+    if config.scene.model_id not in meta.supported_models:
+        _check("model_supported", False,
+               f"'{config.scene.model_id}' not in {meta.supported_models}")
+    else:
+        _check("model_supported", True)
+
+    # 4. 学习模式支持校验（Phase 6.2 字段）
+    if config.scene.learning_mode not in meta.supported_learning_modes:
+        _check("learning_mode_supported", False,
+               f"'{config.scene.learning_mode}' not in {meta.supported_learning_modes}")
+    else:
+        _check("learning_mode_supported", True)
+
+    # 5. 硬件资源探测 + 路由
+    try:
+        resource = ResourceProbe.probe()
+        route_level = ResourceRouter.route(resource)
+        route_config = ResourceRouter.get_route_config(route_level)
+        _check("resource_probe", True, {
+            "has_cuda": resource.has_cuda,
+            "gpu_name": resource.gpu_name,
+            "gpu_free_vram_mb": resource.gpu_free_vram_mb,
+            "route_level": route_level,
+        })
+    except Exception as e:
+        _check("resource_probe", False, str(e))
+        return report
+
+    # 6. 启动前预检（数据存在性、显存、磁盘）
+    try:
+        config_dict = experiment_config_to_dict(config)
+        model_info = scene.get_model_info(config.scene.model_id)
+        _preflight_check(
+            config_dict, model_info, resource, config.scene.dataset,
+            scene_name=config.scene.name,
+            scene_params=config.scene.params,
+        )
+        _check("preflight", True, {
+            "data_root": config_dict.get("data_root") or DEFAULT_DATA_ROOT,
+            "estimated_vram_mb": model_info.get("estimated_vram_mb"),
+        })
+    except FileNotFoundError as e:
+        _check("preflight", False, f"DATA_NOT_FOUND: {e}")
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "vram" in msg:
+            _check("preflight", False, f"PREFLIGHT_ERROR (VRAM): {e}")
+        elif "disk" in msg:
+            _check("preflight", False, f"PREFLIGHT_ERROR (Disk): {e}")
+        else:
+            _check("preflight", False, str(e))
+    except Exception as e:
+        _check("preflight", False, str(e))
+
+    # 7. 训练计划摘要
+    # RFC-004 方案 D：输出契约分离 — 用 to_lightning_params() 转换 route_config，
+    # 不直接暴露内部表示（route_config 无 accelerator 字段，是 to_lightning_params 的派生）
+    lightning_params = ResourceRouter.to_lightning_params(route_config)
+    report["plan"] = {
+        "scene": config.scene.name,
+        "dataset": config.scene.dataset,
+        "model_id": config.scene.model_id,
+        "learning_mode": config.scene.learning_mode,
+        "epochs": config.trainer.epochs,
+        "batch_size": config.trainer.batch_size,
+        "learning_rate": config.trainer.learning_rate,
+        "optimizer": config.trainer.optimizer,
+        "device": route_config.get("device"),  # 原始设备（内部表示，供调试）
+        # lightning_params 是输出契约层（accelerator/devices/precision 派生自 device）
+        "accelerator": lightning_params["accelerator"],
+        "devices": lightning_params["devices"],
+        "precision": lightning_params["precision"],
+    }
+
+    return report
+
+
+def _cmd_export(args):
+    """
+    Phase 7.1：独立模型导出命令。
+
+    基于训练输出的 metadata.json + model.pth 导出多种格式。
+    """
+    from .export import export_from_metadata, SUPPORTED_FORMATS
+
+    metadata_path = Path(args.metadata)
+    if not metadata_path.exists():
+        print(json.dumps({
+            "error": f"Metadata file not found: {args.metadata}",
+            "code": "METADATA_NOT_FOUND",
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.exists():
+        print(json.dumps({
+            "error": f"Checkpoint file not found: {args.checkpoint}",
+            "code": "CHECKPOINT_NOT_FOUND",
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    formats = [f.strip() for f in args.formats.split(",") if f.strip()]
+    for fmt in formats:
+        if fmt not in SUPPORTED_FORMATS:
+            print(json.dumps({
+                "error": f"Unsupported format '{fmt}'. Supported: {SUPPORTED_FORMATS}",
+                "code": "UNSUPPORTED_FORMAT",
+            }, ensure_ascii=False))
+            sys.exit(1)
+
+    # Phase 12.2：CLI 输出激活参数
+    output_activation = getattr(args, "output_activation", None)
+    if output_activation and output_activation not in (
+        "none", "softmax", "sigmoid", "tanh", "relu"
+    ):
+        from .export import list_supported_activations
+        print(json.dumps({
+            "error": f"Unsupported output_activation '{output_activation}'. "
+                     f"Supported: {list_supported_activations()}",
+            "code": "UNSUPPORTED_ACTIVATION",
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    try:
+        result = export_from_metadata(
+            metadata_path=str(metadata_path),
+            checkpoint_path=str(checkpoint_path),
+            output_dir=args.output_dir,
+            formats=formats,
+            validate=args.validate,
+            output_activation=output_activation,
+        )
+        _print_json(result.to_dict())
+        if result.errors:
+            sys.exit(1)
+    except Exception as e:
+        print(json.dumps({
+            "error": str(e),
+            "code": type(e).__name__,
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+
+def _cmd_predict(args):
+    """
+    Phase 8.3：批量推理命令。
+
+    从训练产物（model.pth + metadata.json）加载模型，对样本列表执行推理，
+    输出 JSON 格式的预测结果。
+
+    样本输入格式（--samples 指向的 JSON 文件）：
+        [
+            {"path": "data/sample1.npy"},
+            {"path": "data/sample2.npy"}
+        ]
+
+    输出格式（--output 指向的 JSON 文件，或 stdout）：
+        [
+            {"path": "...", "label": 3, "label_name": "walk", "confidence": 0.92},
+            ...
+        ]
+    """
+    from .inference import predict
+
+    # 校验 model + metadata
+    model_path = Path(args.model)
+    if not model_path.exists():
+        print(json.dumps({
+            "error": f"Model file not found: {args.model}",
+            "code": "MODEL_NOT_FOUND",
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    metadata_path = Path(args.metadata)
+    if not metadata_path.exists():
+        print(json.dumps({
+            "error": f"Metadata file not found: {args.metadata}",
+            "code": "METADATA_NOT_FOUND",
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    # 加载样本列表
+    samples_path = Path(args.samples)
+    if not samples_path.exists():
+        print(json.dumps({
+            "error": f"Samples file not found: {args.samples}",
+            "code": "SAMPLES_NOT_FOUND",
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    try:
+        samples = json.loads(samples_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(json.dumps({
+            "error": f"Invalid JSON in samples file: {e}",
+            "code": "INVALID_SAMPLES_JSON",
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    if not isinstance(samples, list):
+        print(json.dumps({
+            "error": "Samples file must contain a JSON array",
+            "code": "INVALID_SAMPLES_FORMAT",
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    # 执行推理
+    try:
+        results = predict(
+            model_path=str(model_path),
+            metadata_path=str(metadata_path),
+            samples=samples,
+            output_format="dict",
+            include_logits=args.include_logits,
+            device=args.device,
+        )
+    except Exception as e:
+        print(json.dumps({
+            "error": f"Inference failed: {e}",
+            "code": type(e).__name__,
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    # 输出结果
+    output_json = json.dumps(results, ensure_ascii=False, indent=2)
+
+    if args.output:
+        Path(args.output).write_text(output_json, encoding="utf-8")
+        print(json.dumps({
+            "status": "success",
+            "num_samples": len(results),
+            "output_file": args.output,
+        }, ensure_ascii=False))
+    else:
+        print(output_json)
+
+
+def _cmd_experiment(args):
+    """
+    执行声明式实验（新入口）。
+
+    流程：
+    1. 加载 YAML 配置文件 → dict
+    2. ExperimentConfig.from_dict(dict) → 校验 schema
+    3. 若 --hpo 启用 → run_hpo(config)
+       否则 → run_experiment(config)
+    4. 输出结构化 JSON
+
+    YAML 配置示例：
+        scene:
+          name: wifi_csi
+          dataset: UT_HAR_data
+          model_id: ResNet18
+        input_features:
+          - name: csi
+            type: csi
+            shape: [270, 3]
+        output_features:
+          - name: action
+            type: category
+            num_classes: 7
+        trainer:
+          epochs: 50
+          batch_size: 64
+    """
+    # 配置日志级别
+    setup_logging(level=args.log_level, log_file=args.log_file)
+
+    # 加载 YAML 配置
+    if not args.config:
+        print(json.dumps({
+            "error": "--config is required for experiment command",
+            "code": "MISSING_CONFIG",
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    config_path = Path(args.config)
+    if not config_path.exists():
+        print(json.dumps({
+            "error": f"Config file not found: {args.config}",
+            "code": "CONFIG_NOT_FOUND",
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config_dict = yaml.safe_load(f)
+
+    if not isinstance(config_dict, dict):
+        print(json.dumps({
+            "error": "Config file must contain a YAML mapping at top level",
+            "code": "INVALID_CONFIG_FORMAT",
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    # 解析为 ExperimentConfig
+    try:
+        config = ExperimentConfig.from_dict(config_dict)
+        config.validate()
+    except ValueError as e:
+        print(json.dumps({
+            "error": str(e),
+            "code": "CONFIG_VALIDATION_ERROR",
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    # CLI 覆盖（可选）
+    if args.scene:
+        config.scene.name = args.scene
+    if args.dataset:
+        config.scene.dataset = args.dataset
+    if args.model:
+        config.scene.model_id = args.model
+    if args.epochs is not None:
+        config.trainer.epochs = args.epochs
+    if args.batch_size is not None:
+        config.trainer.batch_size = args.batch_size
+    if args.learning_rate is not None:
+        config.trainer.learning_rate = args.learning_rate
+    if args.output_dir:
+        config.output_dir = args.output_dir
+
+    # s2: export_formats 已纳入 ExperimentConfig schema，直接赋值
+    if args.export_formats:
+        from .export import SUPPORTED_FORMATS
+        formats = [f.strip() for f in args.export_formats.split(",") if f.strip()]
+        for fmt in formats:
+            if fmt not in SUPPORTED_FORMATS:
+                print(json.dumps({
+                    "error": f"Unsupported export format '{fmt}'. Supported: {SUPPORTED_FORMATS}",
+                    "code": "UNSUPPORTED_FORMAT",
+                }, ensure_ascii=False))
+                sys.exit(1)
+        config.export_formats = formats
+
+    # Phase 6.3：--dry-run 预检模式（不实际训练，仅输出检查报告）
+    if args.dry_run:
+        report = _cmd_dry_run(config)
+        _print_json(report)
+        sys.exit(0 if report["status"] == "ok" else 1)
+
+    # HPO 模式
+    if args.hpo:
+        config.hpo.enabled = True
+        if args.hpo_trials is not None:
+            config.hpo.n_trials = args.hpo_trials
+        if args.hpo_metric:
+            config.hpo.metric = args.hpo_metric
+        if args.hpo_direction:
+            config.hpo.direction = args.hpo_direction
+        # HPO 前重新校验
+        config.validate()
+        result = run_hpo(config)
+        _print_json(result.to_dict())
+    else:
+        # 单次实验
+        # Phase 7.2：自愈重试
+        use_retry = args.retry or getattr(config, "retry", False)
+        if args.no_retry:
+            use_retry = False
+
+        if use_retry:
+            from .retry import run_experiment_with_retry
+            retry_result = run_experiment_with_retry(
+                config=config,
+                run_fn=run_experiment,
+            )
+            output = retry_result.final_output
+        else:
+            output = run_experiment(config)
+
+        _print_json(output.to_dict())
+        if output.status == "error":
+            sys.exit(1)
+
+
+def _cmd_exploration(args):
+    """RFC-002 阶段 W：探索状态管理子命令。
+
+    P3: 路径自动发现——优先显式 --exploration-file，否则扫描 --output-dir 下最新的 exploration.json。
+    """
+    from pathlib import Path
+    from .exploration import ExplorationTracker, SearchSpaceMap
+
+    # P3: 路径解析
+    explicit_file = getattr(args, 'exploration_file', None)
+    if explicit_file:
+        # 显式指定路径
+        file_path = Path(explicit_file)
+        if not file_path.exists():
+            print(f"No exploration history found at {file_path}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # 自动发现：扫描 output_dir 下最新的 exploration.json
+        output_dir = Path(getattr(args, 'output_dir', '.'))
+        candidates = sorted(
+            output_dir.rglob("exploration.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            print(f"No exploration.json found under {output_dir}", file=sys.stderr)
+            sys.exit(1)
+        file_path = candidates[0]
+        print(f"Auto-discovered: {file_path}", file=sys.stderr)
+
+    tracker = ExplorationTracker.load(file_path)
+    action = args.explore_action
+
+    if action == "list":
+        trials = tracker.list_trials(status=args.status)
+        _print_json({"count": len(trials), "trials": trials})
+    elif action == "recommend":
+        recs = tracker.recommend_next(task_type=args.task_type, top_k=args.top_k)
+        _print_json({"count": len(recs), "recommendations": recs})
+    elif action == "coverage":
+        _print_json(tracker.coverage())
+    elif action == "map":
+        space_map = SearchSpaceMap(tracker)
+        overview = space_map.overview(task_type=args.task_type, dataset=args.dataset)
+        _print_json(overview)
+    elif action == "dashboard":
+        from .observability import ExplorationDashboard
+        dashboard = ExplorationDashboard(tracker)
+        # dashboard 输出文本（非 JSON）
+        print(dashboard.render(format=args.format))
+
+
+def _cmd_monitor(args):
+    """P2: 训练实时监控。
+
+    读取 <output_dir>/training_log.jsonl（IncrementalLogWriter 输出），
+    解析为 TrainingMonitor 并渲染实时指标曲线。
+    """
+    from pathlib import Path
+    import json as _json
+    from .observability import TrainingMonitor
+
+    output_dir = Path(args.output_dir)
+    log_path = output_dir / "training_log.jsonl"
+    if not log_path.exists():
+        print(f"No training log found at {log_path}", file=sys.stderr)
+        sys.exit(1)
+
+    monitor = TrainingMonitor()
+    for line in log_path.read_text(encoding="utf-8").strip().split("\n"):
+        if not line:
+            continue
+        try:
+            entry = _json.loads(line)
+            monitor.on_epoch_end(entry)
+        except _json.JSONDecodeError:
+            continue
+
+    print(monitor.render_text())
+
+
+def _cmd_serve(args):
+    """P3: 启动推理服务。
+
+    加载训练输出目录中的模型（model.onnx 或 model.pth + metadata.json），
+    通过 FastAPI 暴露 /predict /predict/batch /health /info HTTP 端点。
+    """
+    from .serving import InferenceServer
+
+    output_dir = Path(args.output_dir)
+    if not output_dir.exists():
+        print(json.dumps({
+            "error": f"Output directory not found: {args.output_dir}",
+            "code": "OUTPUT_DIR_NOT_FOUND",
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+    server = InferenceServer(args.output_dir, device=args.device)
+    server.start(host=args.host, port=args.port)
+
+
+def _cmd_skills(args):
+    """RFC-002 阶段 W：技能库管理子命令。"""
+    from .skills import list_skills, search_skills, load_skill, get_skill_library
+
+    action = args.skills_action
+
+    if action == "list":
+        names = list_skills()
+        _print_json({"count": len(names), "skills": names})
+    elif action == "search":
+        results = search_skills(args.query, top_k=args.top_k)
+        output = [
+            {
+                "name": s.name,
+                "description": s.description,
+                "tags": s.tags,
+                "version": s.version,
+            }
+            for s in results
+        ]
+        _print_json({"count": len(output), "results": output})
+    elif action == "show":
+        skill = load_skill(args.name)
+        if skill is None:
+            print(json.dumps({
+                "error": f"Skill '{args.name}' not found",
+                "code": "SKILL_NOT_FOUND",
+            }, ensure_ascii=False), file=sys.stderr)
+            sys.exit(1)
+        _print_json({
+            "name": skill.name,
+            "description": skill.description,
+            "tags": skill.tags,
+            "version": skill.version,
+            "validated": skill.validated,
+            "depends_on": skill.depends_on,
+            "code": skill.code[:500],
+        })
+    elif action == "remove":
+        try:
+            success = get_skill_library().remove(args.name, force=args.force)
+        except ValueError as e:
+            # 依赖错误：含依赖错误信息
+            print(json.dumps({
+                "error": str(e),
+                "code": "SKILL_HAS_DEPENDENTS",
+                "name": args.name,
+            }, ensure_ascii=False), file=sys.stderr)
+            sys.exit(1)
+        if success:
+            _print_json({"status": "success", "name": args.name, "force": args.force})
+        else:
+            print(json.dumps({
+                "error": f"Skill '{args.name}' not found",
+                "code": "SKILL_NOT_FOUND",
+            }, ensure_ascii=False), file=sys.stderr)
+            sys.exit(1)
+
+
+def _cmd_catalog(args):
+    """RFC-002 阶段 W：技术目录查询子命令。"""
+    import importlib
+    from .scenes import list_scenes, has_scene
+
+    action = args.catalog_action
+
+    if action == "list":
+        scene_filter = args.scene
+        if scene_filter is not None and not has_scene(scene_filter):
+            print(f"Scene '{scene_filter}' not registered", file=sys.stderr)
+            sys.exit(1)
+        scenes_to_query = [scene_filter] if scene_filter else list(list_scenes().keys())
+
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        total = 0
+        for scene_name in scenes_to_query:
+            # 直接导入场景的 catalog 模块（兼容延迟加载场景如 wifi_csi）
+            try:
+                mod = importlib.import_module(
+                    f".scenes.{scene_name}.catalog", package="senseframe"
+                )
+                catalog = getattr(mod, "CATALOG", None)
+            except (ImportError, AttributeError):
+                catalog = None
+            if not catalog:
+                continue
+            for entry in catalog:
+                cat = entry.get("category", "other")
+                grouped.setdefault(cat, []).append({
+                    "name": entry.get("name"),
+                    "description": entry.get("description", ""),
+                    "applicable": entry.get("applicable", []),
+                    "implemented": entry.get("implemented", False),
+                    "params": entry.get("params", {}),
+                    "scene": scene_name,
+                })
+                total += 1
+
+        if total == 0:
+            print("No catalog available", file=sys.stderr)
+            sys.exit(1)
+        _print_json({"count": total, "categories": grouped})
+    elif action in ("pipeline", "augment"):
+        scene_name = args.scene
+        dataset = args.dataset
+        if not has_scene(scene_name):
+            print(f"Scene '{scene_name}' not registered", file=sys.stderr)
+            sys.exit(1)
+        try:
+            mod = importlib.import_module(
+                f".scenes.{scene_name}.catalog", package="senseframe"
+            )
+            func_name = "suggest_pipeline" if action == "pipeline" else "suggest_augment"
+            func = getattr(mod, func_name)
+        except (ImportError, AttributeError):
+            print(f"No catalog available for scene '{scene_name}'", file=sys.stderr)
+            sys.exit(1)
+        result = func(dataset)
+        _print_json({"dataset": dataset, "scene": scene_name, action: result})
+
+
+def _cmd_create_scene(args):
+    """s3：创建场景包脚手架。
+
+    从 senseframe/scenes/_template/ 复制模板到目标目录，并替换占位符：
+        {SCENE_NAME}       → scene_name（snake_case，如 my_scene）
+        {SCENE_NAME_CLASS} → 类名（如 MyScene）
+    """
+    import shutil
+
+    scene_name = args.scene_name
+    # snake_case → PascalCase：my_scene -> MyScene
+    class_name = "".join(p.capitalize() for p in scene_name.split("_"))
+
+    # 模板目录
+    template_dir = Path(__file__).parent / "scenes" / "_template"
+    if not template_dir.exists():
+        print(f"Template directory not found: {template_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    # 目标目录（默认 scenes/<name>，可通过 --output 指定父目录）
+    if args.output:
+        target_dir = Path(args.output) / scene_name
+    else:
+        target_dir = Path("scenes") / scene_name
+    if target_dir.exists():
+        print(f"Scene directory already exists: {target_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    # 复制模板
+    shutil.copytree(template_dir, target_dir)
+
+    # 替换占位符：必须先替换长占位符 {SCENE_NAME_CLASS}，否则
+    # {SCENE_NAME} 会误伤 {SCENE_NAME_CLASS}（后者包含前者作为前缀）
+    replacements = [
+        ("{SCENE_NAME_CLASS}", class_name),
+        ("{SCENE_NAME}", scene_name),
+    ]
+    for py_file in target_dir.glob("*.py"):
+        content = py_file.read_text(encoding="utf-8")
+        for old, new in replacements:
+            content = content.replace(old, new)
+        py_file.write_text(content, encoding="utf-8")
+
+    print(f"Scene '{scene_name}' created at {target_dir}")
+    print(f"  Class: {class_name}Container")
+    print(f"  Next steps:")
+    print(f"    1. Implement load_dataset / build_model_for_dataset in {target_dir}/container.py")
+    print(f"    2. Add transforms to {target_dir}/transforms.py")
+    print(f"    3. Add catalog entries to {target_dir}/catalog.py")
+    print(f"    4. Register scene in senseframe/scenes/__init__.py")
+
+
+def main():
+    """CLI 主入口。"""
+    parser = argparse.ArgumentParser(
+        prog="senseframe",
+        description="SenseFrame: WiFi CSI 动作识别训练框架",
+    )
+    subparsers = parser.add_subparsers(dest="command", help="可用命令")
+
+    # probe
+    subparsers.add_parser("probe", help="探测硬件资源")
+
+    # list-models
+    p_models = subparsers.add_parser("list-models", help="列出可用模型")
+    p_models.add_argument("--dataset", type=str, help="按数据集过滤")
+    p_models.add_argument("--paradigm", type=str, help="按范式过滤")
+    p_models.add_argument("--all", action="store_true", help="包含未启用的模型")
+
+    # list-datasets
+    subparsers.add_parser("list-datasets", help="列出可用数据集")
+
+    # list-scenes
+    subparsers.add_parser("list-scenes", help="列出已注册的场景容器")
+
+    # paradigms
+    p_para = subparsers.add_parser("paradigms", help="列出 SOTA 范式")
+    p_para.add_argument("--category", type=str, help="按类别过滤")
+
+    # recommend
+    p_rec = subparsers.add_parser("recommend", help="根据资源推荐可用模型")
+    p_rec.add_argument("--dataset", type=str, required=True, help="目标数据集")
+    p_rec.add_argument("--priority", choices=["accuracy", "speed", "memory", "balanced"],
+                       default="balanced", help="推荐优先级")
+
+    # Phase 7.1：export 独立导出命令
+    p_export = subparsers.add_parser(
+        "export",
+        help="基于 metadata + checkpoint 导出多格式模型",
+    )
+    p_export.add_argument("--metadata", type=str, required=True,
+                          help="训练输出的 metadata.json 路径")
+    p_export.add_argument("--checkpoint", type=str, required=True,
+                          help="模型权重路径 (.pth)")
+    p_export.add_argument("--formats", type=str, default="onnx,torchscript,state_dict",
+                          help="导出格式，逗号分隔（默认 onnx,torchscript,state_dict）")
+    p_export.add_argument("--output-dir", type=str, default="exports",
+                          help="导出目录（默认 exports/）")
+    p_export.add_argument("--validate", action="store_true",
+                          help="Phase 8.4：导出后验证精度对齐（需 onnxruntime 验证 ONNX）")
+    # Phase 12.2：输出激活
+    p_export.add_argument(
+        "--output-activation", type=str, default=None,
+        choices=[None, "none", "softmax", "sigmoid", "tanh", "relu"],
+        help="Phase 12.2：输出激活包装（默认从 metadata.task_spec 推断）",
+    )
+
+    # Phase 8.3：predict 批量推理命令
+    p_predict = subparsers.add_parser(
+        "predict",
+        help="基于训练产物执行批量推理，输出 JSON 预测结果",
+    )
+    p_predict.add_argument("--model", type=str, required=True,
+                           help="模型权重路径 (.pth)")
+    p_predict.add_argument("--metadata", type=str, required=True,
+                           help="训练输出的 metadata.json 路径")
+    p_predict.add_argument("--samples", type=str, required=True,
+                           help="样本列表 JSON 文件路径（[{'path': '...'}, ...]）")
+    p_predict.add_argument("--output", type=str, default=None,
+                           help="输出 JSON 文件路径（默认 stdout）")
+    p_predict.add_argument("--device", type=str, default="cpu",
+                           choices=["cpu", "cuda"], help="推理设备")
+    p_predict.add_argument("--include-logits", action="store_true",
+                           help="在结果中包含原始 logits")
+
+    # experiment（声明式 YAML 配置入口）
+    p_exp = subparsers.add_parser(
+        "experiment",
+        help="执行声明式实验（YAML 配置 → ExperimentConfig）",
+    )
+    p_exp.add_argument("--config", type=str, required=True,
+                       help="YAML 配置文件路径")
+    # CLI 覆盖（可选）
+    p_exp.add_argument("--scene", type=str, help="覆盖 scene.name")
+    p_exp.add_argument("--dataset", type=str, help="覆盖 scene.dataset")
+    p_exp.add_argument("--model", type=str, help="覆盖 scene.model_id")
+    p_exp.add_argument("--epochs", type=int, help="覆盖 trainer.epochs")
+    p_exp.add_argument("--batch-size", type=int, help="覆盖 trainer.batch_size")
+    p_exp.add_argument("--learning-rate", type=float, help="覆盖 trainer.learning_rate")
+    p_exp.add_argument("--output-dir", type=str, help="覆盖 output_dir")
+    # Phase 6.3：预检模式（不实际训练，仅检查配置/资源/数据）
+    p_exp.add_argument("--dry-run", action="store_true",
+                       help="预检模式：仅校验配置/资源/数据，不执行训练")
+    # Phase 7.1：训练后多格式导出
+    p_exp.add_argument("--export-formats", type=str, default=None,
+                       help="训练后导出模型格式，逗号分隔，如 onnx,torchscript")
+    # Phase 7.2：自愈重试
+    p_exp.add_argument("--retry", action="store_true", default=False,
+                       help="启用自愈重试（OOM 自动降 batch_size，瞬时 IO 错误重试）")
+    p_exp.add_argument("--no-retry", action="store_true", default=False,
+                       help="显式禁用重试（覆盖配置文件中的 retry 设置）")
+    # HPO 选项
+    p_exp.add_argument("--hpo", action="store_true",
+                       help="启用超参搜索（覆盖 hpo.enabled=True）")
+    p_exp.add_argument("--hpo-trials", type=int, help="HPO trial 数量")
+    p_exp.add_argument("--hpo-metric", type=str, help="HPO 优化指标名")
+    p_exp.add_argument("--hpo-direction", type=str,
+                       choices=["minimize", "maximize"], help="HPO 优化方向")
+    # 日志控制
+    p_exp.add_argument("--log-level", type=str, default="INFO",
+                       choices=["DEBUG", "INFO", "WARN", "ERROR"], help="日志级别")
+    p_exp.add_argument("--log-file", type=str, help="日志文件路径")
+
+    # RFC-002 阶段 W：exploration 探索状态管理
+    p_explore = subparsers.add_parser("exploration", help="探索状态管理")
+    explore_sub = p_explore.add_subparsers(dest="explore_action", required=True)
+    explore_sub.add_parser("list", help="列出试验")
+    explore_sub.add_parser("recommend", help="推荐下一步")
+    explore_sub.add_parser("coverage", help="覆盖率统计")
+    explore_sub.add_parser("map", help="搜索空间地图")
+    explore_sub.add_parser("dashboard", help="可视化仪表盘")
+    p_explore.add_argument("--exploration-file", type=str, default=None,
+                           help="显式指定 exploration.json 路径（否则自动发现）")
+    p_explore.add_argument("--output-dir", type=str, default=".",
+                           help="自动发现 exploration.json 的搜索目录（默认当前目录）")
+    p_explore.add_argument("--task-type", type=str, default=None)
+    p_explore.add_argument("--top-k", type=int, default=5)
+    p_explore.add_argument("--status", type=str, default=None)
+    p_explore.add_argument("--dataset", type=str, default=None)
+    p_explore.add_argument("--format", choices=["text", "markdown", "html"], default="text")
+
+    # RFC-002 阶段 W：skills 技能库管理
+    p_skills = subparsers.add_parser("skills", help="技能库管理")
+    skills_sub = p_skills.add_subparsers(dest="skills_action", required=True)
+    skills_sub.add_parser("list", help="列出所有技能")
+    p_skills_search = skills_sub.add_parser("search", help="检索技能")
+    p_skills_search.add_argument("query", type=str, help="检索查询")
+    p_skills_search.add_argument("--top-k", type=int, default=5)
+    p_skills_show = skills_sub.add_parser("show", help="显示技能详情")
+    p_skills_show.add_argument("name", type=str, help="技能名")
+    p_skills_remove = skills_sub.add_parser("remove", help="移除技能")
+    p_skills_remove.add_argument("name", type=str, help="技能名")
+    p_skills_remove.add_argument("--force", action="store_true", help="强制移除")
+
+    # RFC-002 阶段 W：catalog 技术目录查询
+    p_catalog = subparsers.add_parser("catalog", help="技术目录查询")
+    catalog_sub = p_catalog.add_subparsers(dest="catalog_action", required=True)
+    p_catalog_list = catalog_sub.add_parser("list", help="列出技术目录")
+    p_catalog_list.add_argument("--scene", type=str, default=None)
+    p_catalog_pipeline = catalog_sub.add_parser("pipeline", help="推荐 pipeline")
+    p_catalog_pipeline.add_argument("--dataset", type=str, required=True)
+    p_catalog_pipeline.add_argument("--scene", type=str, default="wifi_csi")
+    p_catalog_augment = catalog_sub.add_parser("augment", help="推荐增强")
+    p_catalog_augment.add_argument("--dataset", type=str, required=True)
+    p_catalog_augment.add_argument("--scene", type=str, default="wifi_csi")
+
+    # P2：训练实时监控
+    p_monitor = subparsers.add_parser("monitor", help="训练实时监控")
+    p_monitor.add_argument("output_dir", type=str, help="训练输出目录")
+
+    # P3：推理服务
+    p_serve = subparsers.add_parser(
+        "serve",
+        help="启动推理服务（加载训练输出目录的模型，暴露 HTTP 推理 API）",
+    )
+    p_serve.add_argument("output_dir", type=str,
+                         help="训练输出目录（含 model.onnx 或 model.pth + metadata.json）")
+    p_serve.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")
+    p_serve.add_argument("--port", type=int, default=8000, help="监听端口")
+    p_serve.add_argument("--device", type=str, default="cpu",
+                         choices=["cpu", "cuda"], help="推理设备")
+
+    # s3：场景包脚手架
+    p_create = subparsers.add_parser(
+        "create-scene",
+        help="创建场景包脚手架（从模板生成场景包目录）",
+    )
+    p_create.add_argument("scene_name", type=str,
+                          help="场景名（snake_case，如 my_scene）")
+    p_create.add_argument("--output", type=str, default=None,
+                          help="输出父目录（默认 scenes/，目录名固定为 scene_name）")
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(1)
+
+    # 分发命令
+    cmd_map = {
+        "probe": _cmd_probe,
+        "list-models": _cmd_list_models,
+        "list-datasets": _cmd_list_datasets,
+        "list-scenes": _cmd_list_scenes,
+        "paradigms": _cmd_paradigms,
+        "recommend": _cmd_recommend,
+        "export": _cmd_export,
+        "predict": _cmd_predict,
+        "experiment": _cmd_experiment,
+        # RFC-002 阶段 W：新能力子命令
+        "exploration": _cmd_exploration,
+        "skills": _cmd_skills,
+        "catalog": _cmd_catalog,
+        # P2：训练实时监控
+        "monitor": _cmd_monitor,
+        # P3：推理服务
+        "serve": _cmd_serve,
+        # s3：场景包脚手架
+        "create-scene": _cmd_create_scene,
+    }
+
+    handler = cmd_map.get(args.command)
+    if handler is None:
+        print(json.dumps({"error": f"Unknown command: {args.command}", "code": "UNKNOWN_COMMAND"}))
+        sys.exit(1)
+
+    try:
+        handler(args)
+    except Exception as e:
+        # A4: 错误上下文（traceback 落盘 + JSON 摘要）
+        tb = traceback.format_exc()
+        print(json.dumps({
+            "error": str(e),
+            "code": type(e).__name__,
+            "traceback": tb,
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
