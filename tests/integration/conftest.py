@@ -12,9 +12,13 @@ _TestableGenericContainer 从 params.data_root 提取 root，使 generic 场景�
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# bootstrap：senseframe 可导入前的必要本地推导
+_BOOTSTRAP_ROOT = Path(__file__).resolve().parents[2]
+if str(_BOOTSTRAP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BOOTSTRAP_ROOT))
+
+# 单一数据源：bootstrap 后从 senseframe.common.paths 导入 PROJECT_ROOT
+from senseframe.common.paths import PROJECT_ROOT  # noqa: E402
 
 import csv as _csv
 import random as _random

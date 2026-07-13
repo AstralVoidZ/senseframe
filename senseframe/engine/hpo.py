@@ -397,11 +397,11 @@ def _default_objective(trial, config: ExperimentConfig,
 
     # P2: 成功 trial 写入 tracker
     if tracker is not None:
-        # 从 result 提取 feedback（若 pipeline 已生成）
-        feedback = None
-        if hasattr(result, 'training') and result.training:
-            # HPO 路径走 run_pipeline，feedback 存储在 PipelineContext.extra 中
-            # 此处用 success 状态作为默认 feedback（方案 2 将 feedback 提升为 TrainOutput 字段后可直读）
+        # P4-5：从 TrainOutput.feedback 读取 pipeline 实际生成的 feedback。
+        # 旧代码硬编码 {"status": "success"}，忽略 pipeline 中 analyze_training_result
+        # 的实际判定（如 underfitting/overfitting），导致探索-反馈回路断裂。
+        feedback = result.feedback
+        if feedback is None:
             feedback = {"status": "success", "diagnosis": "HPO trial succeeded", "suggestions": []}
         tracker.add_trial(
             strategy=params,

@@ -338,9 +338,10 @@ class TestIntermediateMetricLogger:
         """回调应将指标写入 intermediate_values dict。"""
         iv: Dict[int, float] = {}
         cb = IntermediateMetricLogger(metric="val_accuracy", intermediate_values=iv)
-        # 模拟 trainer
+        # 模拟 trainer（P0-3: sanity_checking=False 才会写入）
         trainer = MagicMock()
         trainer.current_epoch = 0
+        trainer.sanity_checking = False
         trainer.callback_metrics = {"val_accuracy": 0.85}
         cb.on_validation_epoch_end(trainer, None)
         assert iv == {0: 0.85}
@@ -352,6 +353,7 @@ class TestIntermediateMetricLogger:
         for epoch, val in [(0, 0.5), (1, 0.6), (2, 0.7)]:
             trainer = MagicMock()
             trainer.current_epoch = epoch
+            trainer.sanity_checking = False
             trainer.callback_metrics = {"val_accuracy": val}
             cb.on_validation_epoch_end(trainer, None)
         assert iv == {0: 0.5, 1: 0.6, 2: 0.7}
@@ -361,6 +363,7 @@ class TestIntermediateMetricLogger:
         cb = IntermediateMetricLogger(metric="val_accuracy", intermediate_values=None)
         trainer = MagicMock()
         trainer.current_epoch = 0
+        trainer.sanity_checking = False
         trainer.callback_metrics = {"val_accuracy": 0.85}
         # 不应抛异常
         cb.on_validation_epoch_end(trainer, None)
@@ -371,6 +374,7 @@ class TestIntermediateMetricLogger:
         cb = IntermediateMetricLogger(metric="val_accuracy", intermediate_values=iv)
         trainer = MagicMock()
         trainer.current_epoch = 0
+        trainer.sanity_checking = False
         trainer.callback_metrics = {"val_loss": 0.5}  # 没有 val_accuracy
         cb.on_validation_epoch_end(trainer, None)
         assert iv == {}
@@ -385,6 +389,7 @@ class TestIntermediateMetricLogger:
         cb = IntermediateMetricLogger(metric="val_accuracy", intermediate_values=iv)
         trainer = MagicMock()
         trainer.current_epoch = 0
+        trainer.sanity_checking = False
         trainer.callback_metrics = {"val_accuracy": torch.tensor(0.85)}
         cb.on_validation_epoch_end(trainer, None)
         # float32 精度容差（torch.tensor(0.85).item() = 0.8500000238418579）
@@ -398,10 +403,41 @@ class TestIntermediateMetricLogger:
         cb = IntermediateMetricLogger(metric="val_accuracy", intermediate_values=iv)
         trainer = MagicMock()
         trainer.current_epoch = 0
+        trainer.sanity_checking = False
         trainer.callback_metrics = {"val_accuracy": 0.85}
         cb.on_validation_epoch_end(trainer, None)
         assert iv == {0: 0.85}
         assert isinstance(iv[0], float)
+
+    def test_skips_sanity_check(self):
+        """P0-3: sanity_check 阶段不应写入 intermediate_values。"""
+        iv: Dict[int, float] = {}
+        cb = IntermediateMetricLogger(metric="val_accuracy", intermediate_values=iv)
+        trainer = MagicMock()
+        trainer.current_epoch = 0
+        trainer.sanity_checking = True  # 模拟 sanity_check 阶段
+        trainer.callback_metrics = {"val_accuracy": 0.85}
+        cb.on_validation_epoch_end(trainer, None)
+        assert iv == {}  # 应被跳过
+
+    def test_inactive_in_eval_stage(self):
+        """P0-1: stage_eval 中 callback 应被 set_active('eval') 置为 inactive。"""
+        iv: Dict[int, float] = {}
+        cb = IntermediateMetricLogger(metric="val_accuracy", intermediate_values=iv)
+        cb.set_active("eval")  # 模拟 stage_eval 入口
+        trainer = MagicMock()
+        trainer.current_epoch = 0
+        trainer.sanity_checking = False
+        trainer.callback_metrics = {"val_accuracy": 0.85}
+        cb.on_validation_epoch_end(trainer, None)
+        assert iv == {}  # 应被 is_active() 跳过
+
+    def test_frozen_dict_raises_on_write(self):
+        """P0-1: FrozenDict 写入应抛 RuntimeError（防御性兜底）。"""
+        from senseframe.engine.runner.callbacks import FrozenDict
+        fd = FrozenDict({0: 0.85})
+        with pytest.raises(RuntimeError, match="frozen after stage_train"):
+            fd[1] = 0.90
 
 
 # ============================================================

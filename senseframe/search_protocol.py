@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+
+import numpy as np
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import (
@@ -208,7 +210,6 @@ class RandomSampler:
     name = "random"
 
     def __init__(self, seed: Optional[int] = None):
-        import numpy as np
         self._rng = np.random.default_rng(seed)
 
     def sample(self, search_space: SearchSpace, history: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -217,7 +218,10 @@ class RandomSampler:
             if p.type == "float":
                 if p.log and p.low and p.high:
                     # log-uniform 采样
-                    params[p.name] = float(self._rng.loguniform(p.low, p.high))
+                    # numpy 2.x 的 Generator 无 loguniform 方法，用 exp(uniform(log)) 等价实现
+                    params[p.name] = float(
+                        np.exp(self._rng.uniform(np.log(p.low), np.log(p.high)))
+                    )
                 else:
                     params[p.name] = float(self._rng.uniform(p.low or 0, p.high or 1))
             elif p.type == "int":

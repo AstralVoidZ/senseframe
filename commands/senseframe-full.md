@@ -47,8 +47,12 @@ F. 多格式模型导出
 
 - 工作目录: `.`（已部署 SenseFrame）
 - SKILL `senseframe` 已加载
-- 数据集: `CSI_DATASETS/`（如未部署，可改 `--data-root` 或软链；命令中所有路径均可替换为实际数据根）
+- 数据集: `resource/CSI_DATASETS/`（如未部署，可改 `--data-root` 或软链；命令中所有路径均可替换为实际数据根）
 - GPU: 8GB 显存，自监督 batch_size 建议 32
+- **报告输出目录**: `report/`（不存在时自动创建）
+- **报告命名格式**: `report/full_<dataset>_<YYYYMMDD_HHMMSS>.md`
+  - 例：`report/full_NTU-Fi_HAR_20260706_143025.md`
+  - 时间戳取测试开始时刻，避免重名覆盖
 
 **架构重点审视项**（发现任一问题标记 [严重]）:
 1. 统一执行路径：run_experiment / Pipeline.run / reconcile 是否真正统一？
@@ -61,6 +65,29 @@ F. 多格式模型导出
 8. **产物溯源（方案 G）**：每次运行是否生成 `manifest.json`？`verify_artifacts()` 是否全部通过？
 
 ## Execution Protocol
+
+### Step 0: 首次部署检查
+
+**目的**：确保 SenseFi 代码库路径和数据集目录就绪，避免到训练阶段才暴露 ImportError 或 data_root 为空。
+
+**Do**:
+```bash
+# 1. 检查 SenseFi 路径（wifi_csi 场景硬性依赖）
+echo "SENSEFRAME_SENSEFI_PATH=${SENSEFRAME_SENSEFI_PATH:-NOT_SET}"
+
+# 2. 检查数据集目录是否存在
+ls resource/CSI_DATASETS/ 2>/dev/null || echo "CSI_DATASETS_NOT_FOUND"
+```
+
+**自动发现规则**：
+- 若 `SENSEFRAME_SENSEFI_PATH` 已设置且路径存在 → 跳过，无需用户干预
+- 若未设置，但当前目录下存在 `resource/SenseFi/` 或 `resource/WiFi-CSI-Sensing-Benchmark-main/` → **自动设为该路径**（`export SENSEFRAME_SENSEFI_PATH=$(pwd)/resource/<found_dir>`），继续执行
+- 若未设置且找不到 → **停止并询问用户**：请提供 SenseFi 代码库路径
+
+- 若 `resource/CSI_DATASETS/` 存在且含 `$1` 子目录 → 自动填入 `data_root: resource/CSI_DATASETS` 到配置
+- 若不存在 → **停止并询问用户**：请提供数据集根路径
+
+**Gate**: SenseFi 路径已设置 + data_root 非空 + 数据集目录存在
 
 ### 阶段 A: 数据画像驱动
 
@@ -75,7 +102,7 @@ import senseframe as sf
 sf.activate_lazy_scenes()
 
 scene = sf.get_scene("wifi_csi")
-bundle = scene.load_dataset("$1", root="CSI_DATASETS/...",
+bundle = scene.load_dataset("$1", root="resource/CSI_DATASETS/...",
                             learning_mode="self_supervised")
 
 profiler = sf.DataProfiler(max_samples=500)
@@ -102,26 +129,46 @@ print(f"class_distribution: {profile.class_distribution}")
 
 **Do**:
 ```python
-from senseframe.engine.config import ExperimentConfig
+from senseframe.engine.config import (
+    ExperimentConfig, SceneConfig, InputFeature, OutputFeature, TrainerConfig
+)
 
 # B1: 自监督预训练
-# 注意：trainer 仅覆盖 max_epochs/seed，其余字段（weight_decay/early_stopping/
+# 注意：trainer 仅覆盖 epochs/seed，其余字段（weight_decay/early_stopping/
 # scheduler/early_stopping_min_delta）使用 TrainerConfig 默认值（方案 E 默认最佳实践）
-config_pretrain = ExperimentConfig(
-    scene="wifi_csi", dataset="$1", model_id="ResNet18",
-    learning_mode="self_supervised",
-    trainer={"max_epochs": 5, "seed": 42},
-)
+# 修复（文档契约）：ExperimentConfig 推荐用 from_dict(yaml_dict) + validate() 构造，
+# 自动解析嵌套 dict 为 dataclass 实例并做基本校验。
+# 旧文档把 scene 字段平铺到顶层、漏 input_features/output_features、用 max_epochs
+# 而非 epochs，全部与代码契约不符。
+config_pretrain_dict = {
+    "scene": {
+        "name": "wifi_csi", "dataset": "$1", "model_id": "ResNet18",
+        "learning_mode": "self_supervised",
+        "data_root": "$SENSEFRAME_DATA_ROOT",  # 必填：YAML/CLI/env 三选一
+    },
+    "input_features": [{"name": "csi", "type": "csi", "shape": [1, 250, 90]}],
+    "output_features": [{"name": "label", "type": "category", "num_classes": 7}],
+    "trainer": {"epochs": 5, "seed": 42},
+}
+config_pretrain = ExperimentConfig.from_dict(config_pretrain_dict)
+config_pretrain.validate()
 output_pretrain = sf.run_experiment(config_pretrain)
 # 字段契约（方案 C）：final_eval 使用 val_ 前缀
 print(f"pretrain val_loss: {output_pretrain.final_eval.get('val_loss')}")
 
 # B2: 监督微调（加载预训练权重）
-config_finetune = ExperimentConfig(
-    scene="wifi_csi", dataset="$1", model_id="ResNet18",
-    learning_mode="supervised",
-    trainer={"max_epochs": 10, "seed": 42},
-)
+config_finetune_dict = {
+    "scene": {
+        "name": "wifi_csi", "dataset": "$1", "model_id": "ResNet18",
+        "learning_mode": "supervised",
+        "data_root": "$SENSEFRAME_DATA_ROOT",  # 必填：YAML/CLI/env 三选一
+    },
+    "input_features": [{"name": "csi", "type": "csi", "shape": [1, 250, 90]}],
+    "output_features": [{"name": "label", "type": "category", "num_classes": 7}],
+    "trainer": {"epochs": 10, "seed": 42},
+}
+config_finetune = ExperimentConfig.from_dict(config_finetune_dict)
+config_finetune.validate()
 output_finetune = sf.run_experiment(config_finetune)
 # 字段契约（方案 C）：读 val_accuracy 而非 accuracy
 print(f"finetune val_accuracy: {output_finetune.final_eval.get('val_accuracy')}")
@@ -191,7 +238,7 @@ result = pipeline.run(ctx)
 
 ### 阶段 D: 断点续跑
 
-**Do**: 模拟 stage_train 失败，然后用 Pipeline.resume 恢复。
+**Do**: 模拟 train stage 失败，然后用 Pipeline.resume 恢复。
 
 **⚠️ 关键约束（RFC-004 方案 F）**：Pipeline.run() 的 finally 块会调用
 `ctx.release_resources()`，把 `trainer`/`module`/`model`/`datamodule`/`bundle`
@@ -229,14 +276,20 @@ print(f"已完成 stages: {completed}")
 
 ctx2 = sf.PipelineContext(config=config_finetune)
 ctx2.completed_stages = completed
-ctx2.stage_checkpoint_path = str(ctx.output_dir) + "/pipeline_checkpoint.json"
+# 修复（文档契约）：stage_checkpoint_path 字段类型是 Path，不是 str。
+# 旧文档赋 str 会在 ctx.stage_checkpoint_path.exists() 调用时 AttributeError。
+# 同时 output_dir 也是 Path 类型，应用 Path 拼接而非字符串拼接。
+from pathlib import Path
+ctx2.stage_checkpoint_path = Path(ctx.output_dir) / "pipeline_checkpoint.json"
 
 # 关键：completed_stages 含 load/build 时，Pipeline 会跳过它们，
 # 但 ctx2 的大对象为 None（新构造）。因此续跑前需手动重建，
 # 或清除 completed_stages 中 load/build 让 Pipeline 重跑。
 # 推荐做法：清除 load/build，仅保留 validate/preflight/resolve
+# 修复（文档契约）：stage 名不带 "stage_" 前缀（实际是 "load"/"build" 而非
+# "stage_load"/"stage_build"），旧文档用前缀过滤会失效，load/build 仍会被跳过。
 ctx2.completed_stages = [s for s in completed
-                         if s not in ("stage_load", "stage_build")]
+                         if s not in ("load", "build")]
 
 # 恢复原始 train
 for name, fn in pipeline2.stages:
@@ -368,15 +421,25 @@ if missing_or_mismatch:
 
 ## Output Contract
 
+执行完毕后，**必须**将报告写入 `report/full_<dataset>_<YYYYMMDD_HHMMSS>.md`，
+并在 stdout 输出报告路径。报告内容必须包含以下章节，**禁止省略**任何章节。
+
 ```markdown
 # SenseFrame 测试报告：完整闭环压力测试
 
-## 执行摘要
-- 环境: <Python/torch/CUDA>
-- 数据集: <$1>
-- 状态: <成功/失败/部分成功> | 耗时: <min>
+## 报告元数据
+- 报告路径: `report/full_<dataset>_<YYYYMMDD_HHMMSS>.md`
+- 生成时间: <ISO8601>
+- 测试命令: `/senseframe-full <dataset>`
+- 框架版本: <senseframe.__version__>
 
-## 阶段执行表
+## 执行摘要
+- 环境: Python <version> | torch <version> | CUDA <available/version>
+- 硬件: <CPU/GPU 型号 + 显存>
+- 数据集: <$1>
+- 状态: <成功/失败/部分成功> | 总耗时: <min>
+
+## 阶段执行总览
 | 阶段 | 状态 | 耗时 | 关键产出 |
 |------|------|------|---------|
 | A. 数据画像 | ok/fail | <s> | <profile 字段摘要> |
@@ -386,67 +449,181 @@ if missing_or_mismatch:
 | E. 自省协议 | ok/fail | <s> | <7 项 API 验证结果> |
 | F. 模型导出 | ok/fail | <s> | <onnx/torchscript/state_dict> |
 
-## 自监督收益分析
-- 无预训练 val_accuracy: <值>（如执行了对比）
+## 阶段 A: 数据画像详情
+- 数据集 bundle 字段: <列出 train/test/val 样本数 + 形状>
+- DataProfiler 输出（必须列实际值）:
+  - recommended_task_type: <值>
+  - recommended_loss: <值>
+  - recommended_normalization: <值>
+  - input_shape: <值>
+  - n_classes: <值>
+  - class_distribution: <dict>
+  - modality: <值>（如 image 须标记 [疑似误判]）
+  - is_temporal: <值>
+  - is_spatial: <值>
+- profile.save/load 是否可用: <yes/no + 路径>
+
+## 阶段 B: 自监督训练详情
+### B1 预训练
+- config_pretrain: epochs=<>, seed=<>, weight_decay=<>, early_stopping=<>, scheduler=<>
+- output_pretrain.output_dir: <path>
+- output_pretrain.final_eval: <列出全部 val_* 字段>
+- 预训练耗时: <s>
+- EntLoss 是否正常执行: <yes/no + 日志片段>
+
+### B2 微调
+- config_finetune: epochs=<>, seed=<>, weight_decay=<>, early_stopping=<>, scheduler=<>
+- output_finetune.output_dir: <path>
+- output_finetune.final_eval:
+  - val_accuracy: <值>
+  - val_loss: <值>
+  - val_macro_f1: <值>
+- 微调耗时: <s>
+
+### 自监督收益分析
+- 无预训练 val_accuracy: <值>（如执行了对比；未执行标 N/A）
 - 有预训练 val_accuracy: <值>
-- 提升: <+x.x%>
+- 提升: <+x.x%> 或 <N/A>
+- 早停是否两阶段都生效: <yes/no + 详情>
 
-## 断点续跑验证
-- 模拟失败 stage: <name>
-- ctx.failed_stage: <值>
-- ctx.failed_error: <值>
-- resume 返回 completed_stages: <list>
+## 阶段 C: Pipeline 自定义编排详情
+### C1 stage 契约
+- stages_with_spec 返回（全部 stage）:
+  | stage | reads | writes |
+  |-------|-------|--------|
+  | validate | <list> | <list> |
+  | preflight | | |
+  | ... | | |
+
+### C2-C4 自定义操作验证
+| 操作 | 类型 | 是否生效 | 证据（日志片段） |
+|------|------|---------|----------------|
+| replace_stage("eval", my_custom_eval) | replace | yes/no | <日志输出证明自定义 eval 执行> |
+| before("train", data_check_hook) | hook | yes/no | <日志输出 "数据形状: ..."> |
+| after("train", log_metrics_hook) | hook | yes/no | <日志输出 "训练时长: ..."> |
+| skip("export") | skip | yes/no | <日志证明 export 跳过> |
+
+### C5 自定义 pipeline 执行
+- pipeline.run 结果: <success/fail>
+- ctx.first-class 字段可读性:
+  - training_duration_s: <值>
+  - best_model_path: <值>
+- stage 失败时（如有）:
+  - ctx.failed_stage: <值>
+  - ctx.failed_error: <值>
+
+## 阶段 D: 断点续跑详情
+### D1 模拟失败
+- 失败 stage: train
+- ctx.failed_stage: <实际值>
+- ctx.failed_error: <实际异常信息>
+- 方案 F 验证:
+  - ctx.trainer is None: <yes/no>
+  - ctx.module is None: <yes/no>
+  - ctx.model is None: <yes/no>
+  - ctx.bundle is None: <yes/no>
+- 失败时日志片段: <粘贴 3-5 行>
+
+### D2 续跑
+- Pipeline.resume 返回 completed_stages: <list>
+- ctx2.completed_stages 调整后: <list>
 - 续跑结果: <成功/失败>
+- 续跑耗时: <s>（对比首次 D1 耗时）
+- 是否真正跳过已完成 stage: <yes/no + 耗时对比证据>
+- checkpoint 文件路径: <path>
+- 续跑重建验证: ctx2.bundle is None: <yes/no（应为 no，已重建）>
 
-## 自省协议验证表
-| API | 调用成功 | 输出准确 | 与实际一致 |
-|-----|---------|---------|-----------|
-| schema() | yes/no | yes/no | yes/no |
-| filled_at() | yes/no | yes/no | yes/no |
-| completed_fields() | yes/no | yes/no | yes/no |
-| stage_io() | yes/no | yes/no | yes/no |
-| pipeline_graph() | yes/no | yes/no | yes/no |
-| check_readiness() | yes/no | yes/no | yes/no |
-| validate_graph() | yes/no | yes/no | yes/no |
+## 阶段 E: 自省协议详情
+| API | 调用成功 | 输出准确 | 与实际一致 | 备注 |
+|-----|---------|---------|-----------|------|
+| schema() | yes/no | yes/no | yes/no | <字段数 + 是否含 fill_stage> |
+| filled_at("stage_load") | yes/no | yes/no | yes/no | <返回值> |
+| completed_fields() | yes/no | yes/no | yes/no | <字段数> |
+| stage_io("train") | yes/no | yes/no | yes/no | <reads/writes 列表> |
+| pipeline_graph() | yes/no | yes/no | yes/no | <DAG 描述> |
+| check_readiness(ctx, "train") | yes/no | yes/no | yes/no | <available + missing_reads> |
+| validate_graph() | yes/no | yes/no | yes/no | <dangling list> |
+
+- Agent 能否仅凭自省 API 组装 pipeline: <yes/no + 说明>
+
+## 阶段 F: 模型导出 + 产物溯源详情
+### F1 多格式导出
+| 格式 | 导出成功 | 文件路径 | 大小 | 验证 |
+|------|---------|---------|------|------|
+| onnx | yes/no | <path> | <bytes> | <onnx.checker 通过/失败> |
+| torchscript | yes/no | <path> | <bytes> | <加载测试> |
+| state_dict | yes/no | <path> | <bytes> | <加载测试> |
+
+### F2 产物溯源
+- manifest.json 路径: <path>
+- run_id: <uuid>
+- artifacts 总数: <N>
+- verify_artifacts 结果:
+  | 产物名 | kind | producer_stage | content_hash(前8位) | 校验结果 |
+  |--------|------|---------------|-------------------|---------|
+  | model_weights | model | stage_export | <hash> | ✓/✗ |
+  | ... | | | | |
+  - verified/total: <N/M>
+- 失败产物详情（如有）: <list + 原因>
 
 ## Pipeline DAG（文字版）
-<stage 依赖关系>
-
-## 自省评分矩阵
-| 阶段 | AI/Agent | ML | AutoML | CSI | 平均 |
-|------|----------|----|--------|-----|------|
-| A. 画像 | x | x | x | x | x.x |
-| B. 自监督 | x | x | x | x | x.x |
-| C. 编排 | x | x | x | x | x.x |
-| D. 续跑 | x | x | x | x | x.x |
-| E. 自省 | x | x | x | x | x.x |
-| F. 导出 | x | x | x | x | x.x |
+<stage 依赖关系，从 validate → export>
 
 ## 架构级问题检查
-| 检查项 | 状态 | 证据 |
-|--------|------|------|
-| 统一执行路径 | pass/fail | <证据> |
-| extra 纪律化 | pass/fail | <证据> |
-| 异常层级 | pass/fail | <证据> |
-| CQS 合规 | pass/fail | <证据> |
-| DSP-3 就绪度 | pass/fail | <证据> |
-| 输出契约分离（方案 D） | pass/fail | <证据> |
-| 资源生命周期（方案 F） | pass/fail | <证据> |
-| 产物溯源（方案 G） | pass/fail | <证据> |
-| 入口点激活（方案 B） | pass/fail | <证据> |
-| 字段契约对齐（方案 C） | pass/fail | <证据> |
-| 默认最佳实践（方案 E） | pass/fail | <证据> |
+| 检查项 | 状态 | 证据（粘贴日志/字段值） |
+|--------|------|----------------------|
+| 统一执行路径 | pass/fail | <如"run_experiment 与 Pipeline.run 输出一致"> |
+| extra 纪律化 | pass/fail | <如"框架代码向 ctx.extra 写入 0 次"> |
+| 异常层级 | pass/fail | <如"error_code 结构化，含 stage + code"> |
+| CQS 合规 | pass/fail | <如"getter 无副作用"> |
+| DSP-3 就绪度 | pass/fail | <如"check_readiness 正确检测缺失字段"> |
+| 输出契约分离（方案 D） | pass/fail | <如"dry-run 输出 route_config + lightning_params"> |
+| 资源生命周期（方案 F） | pass/fail | <如"Pipeline.run 后 trainer is None"> |
+| 产物溯源（方案 G） | pass/fail | <如"manifest.json 生成 + verify_artifacts 全通过"> |
+| 入口点激活（方案 B） | pass/fail | <如"activate_lazy_scenes 后 list_models 含 wifi_csi"> |
+| 字段契约对齐（方案 C） | pass/fail | <如"final_eval 含 val_accuracy 而非 accuracy"> |
+| 默认最佳实践（方案 E） | pass/fail | <如"trainer 含 weight_decay/early_stopping/scheduler"> |
+
+## 自省评分矩阵
+| 阶段 | AI/Agent | ML | AutoML | CSI | 平均 | 关键扣分原因 |
+|------|----------|----|--------|-----|------|------------|
+| A. 画像 | x | x | x | x | x.x | <如"CSI 误判为 image"> |
+| B. 自监督 | x | x | x | x | x.x | <如"权重传递未验证"> |
+| C. 编排 | x | x | x | x | x.x | <如"skip 不彻底"> |
+| D. 续跑 | x | x | x | x | x.x | <如"重建机制复杂"> |
+| E. 自省 | x | x | x | x | x.x | <如"stage_io 不准"> |
+| F. 导出 | x | x | x | x | x.x | <如"onnx 导出失败"> |
 
 ## 关键发现（按严重度排序）
-1. [严重/中等/轻微] <问题 + 复现步骤 + 影响>
+每个发现必须包含：复现命令 + 实际输出 + 期望输出 + 影响范围 + 严重度
+
+1. **[严重]** <问题标题>
+   - 复现命令: `<完整命令>`
+   - 实际输出: `<粘贴实际输出>`
+   - 期望输出: `<应该是什么>`
+   - 根因分析: <代码位置 + 逻辑错误>
+   - 影响: <对哪些功能/用户/场景有影响>
+   - 建议修复: <具体修复方向>
+
+2. **[中等/轻微]** <问题标题>
+   - ...（同上格式）
 
 ## 改进建议（按优先级排序）
-1. [P0/P1/P2] <具体建议 + 影响范围 + 预期收益>
+每条建议必须含：优先级 + 具体修改点 + 影响文件/模块 + 预期收益
+
+1. **[P0]** <建议>
+   - 修改文件: `<file:line>`
+   - 修改内容: <具体改什么>
+   - 预期收益: <修复后效果>
+
+2. **[P1/P2]** <建议>
+   - ...
 
 ## 结论
 - 综合评分: <x.x / 5.0>
 - 推荐度: <推荐/谨慎推荐/不推荐>
 - 一句话总结: <...>
+- 下一步建议: <如"修复架构级问题后重新压测">
 ```
 
 ## Constraints
@@ -455,4 +632,6 @@ if missing_or_mismatch:
 - 禁止伪造失败（断点续跑的失败必须真实模拟）
 - 禁止跳过自省 API（每阶段必须用自省 API 查询契约）
 - 禁止掩盖问题（架构级问题必须标记 [严重]）
-- 禁止全 5 分（评分必须有区分度）
+- 禁止全 5 分（评分必须有区分度，扣分必须填"关键扣分原因"）
+- 禁止省略章节：报告必须含全部章节，无内容时填"无"并说明原因
+- 报告必须落盘到 `report/` 目录，禁止仅输出到 stdout

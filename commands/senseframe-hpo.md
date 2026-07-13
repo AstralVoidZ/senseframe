@@ -38,8 +38,12 @@ $2 = trial 数 (默认 5)
 
 - 工作目录: `.`（已部署 SenseFrame）
 - SKILL `senseframe` 已加载
-- 数据集: `CSI_DATASETS/`（如未部署，可改 `--data-root` 或软链；NTU-Fi-HAR / UT-HAR / Widar3.0）
+- 数据集: `resource/CSI_DATASETS/`（如未部署，可改 `--data-root` 或软链；NTU-Fi-HAR / UT-HAR / Widar3.0）
 - GPU: 8GB 显存，HPO 必须串行（不得并发 trial）
+- **报告输出目录**: `report/`（不存在时自动创建）
+- **报告命名格式**: `report/hpo_<dataset>_<trials>_<YYYYMMDD_HHMMSS>.md`
+  - 例：`report/hpo_NTU-Fi_HAR_5_20260706_143025.md`
+  - 时间戳取 HPO 开始时刻，避免重名覆盖
 
 ## Execution Protocol
 
@@ -132,7 +136,7 @@ for i in range($2):
     output = sf.run_experiment(config)
     val_acc = output.final_eval.get("val_accuracy", 0.0)
     sm.tell(trial.trial_id, value=val_acc)
-    tracker.record_trial(trial_id=trial.trial_id, strategy=trial.params, result=val_acc)
+    tracker.record_trial(trial_id=trial.trial_id, strategy=trial.params, result={"val_accuracy": val_acc})
 
 # 4. 查看最优
 best = sm.best_trial(study_id)
@@ -176,8 +180,8 @@ history = tracker.history
 print(f"Total trials: {len(history)}")
 
 # 测试 recommend_next
-recommendation = tracker.recommend_next()
-print(f"Recommendation: {recommendation}")
+recommendations = tracker.recommend_next()
+print(f"Recommendations: {recommendations}")
 
 # 测试 parent_trial_id 回溯
 if len(history) > 1:
@@ -247,49 +251,137 @@ skill = sf.load_skill("hpo_best")
 
 ## Output Contract
 
+执行完毕后，**必须**将报告写入 `report/hpo_<dataset>_<trials>_<YYYYMMDD_HHMMSS>.md`，
+并在 stdout 输出报告路径。报告内容必须包含以下章节，**禁止省略**任何章节。
+
 ```markdown
 # SenseFrame 测试报告：HPO 超参搜索
 
+## 报告元数据
+- 报告路径: `report/hpo_<dataset>_<trials>_<YYYYMMDD_HHMMSS>.md`
+- 生成时间: <ISO8601>
+- 测试命令: `/senseframe-hpo <dataset> <trials>`
+- 框架版本: <senseframe.__version__>
+
 ## 执行摘要
-- 环境: <Python/torch/CUDA>
-- 数据集: <$1> | trials: <$2>
-- 状态: <成功/失败> | 耗时: <min>
+- 环境: Python <version> | torch <version> | CUDA <available/version>
+- 硬件: <CPU/GPU 型号 + 显存>
+- 数据集: <$1> | trials: <$2> | 候选模型: <列表>
+- 搜索空间: lr=[low, high], batch_size=[low, high, step], optimizer=<choices>
+- 状态: <成功/失败/部分成功> | 总耗时: <min>
 
-## HPO 结果表
-| Trial | lr | batch_size | optimizer | val_accuracy | 耗时(s) | 状态 |
-|-------|----|-----------|-----------|-------------|---------|------|
-| 1 | ... | ... | ... | ... | ... | ok/fail |
-| ... | | | | | | |
+## 资源路由与模型清单（Step 1 产物）
+- probe 输出: <device/CPU 核数/显存>
+- list-models 返回（数据集 <$1> 下的全部模型）:
+  | model_id | paradigm | default_epochs | enabled |
+  |----------|----------|---------------|---------|
+  | <name>   | <type>   | <N>           | ✓/✗     |
+- recommend 输出: <推荐模型 + 路由级别 + 理由>
+- GPU vs CPU 路由对比（如执行）: <差异说明>
 
-## 多模型对比表
-| 模型 | 最优 val_accuracy | 平均耗时 | 备注 |
-|------|-------------------|---------|------|
-| ResNet18 | ... | ... | ... |
-| <其他> | ... | ... | ... |
+## 字段契约查询（Step 2 产物）
+- context_schema 关键字段: <列出 5-10 个关键字段 + fill_stage + type>
+- stage_io("train") reads: <list>, writes: <list>
+- stage_io("eval") reads: <list>, writes: <list>
+- pipeline_graph: <stage 依赖关系文字版>
+- data_bundle_schema: <字段列表>
+- data_profile_schema: <字段列表>
+- 自省 API 调用是否全部成功: <yes/no + 失败列表>
 
-## 探索历史
-<trial 序列 + parent_trial_id 关系>
+## HPO 结果详情（Step 3 产物）
+### 完整 trial 结果表
+| Trial | model | lr | batch_size | optimizer | val_accuracy | val_macro_f1 | val_loss | 耗时(s) | epochs | 早停 | 状态 | output_dir |
+|-------|-------|----|-----------|-----------|-------------|--------------|----------|---------|--------|------|------|-----------|
+| 1 | ResNet18 | <val> | <val> | <val> | <val> | <val> | <val> | <val> | <N> | <yes/no> | ok/fail | <path> |
+| 2 | <其他> | ... | | | | | | | | | | |
+| ... | | | | | | | | | | | | |
+
+### 最优 trial
+- best_trial: trial_idx=<N>, value=<val_accuracy>, params=<dict>
+- study_id: <id>
+- 完整搜索历史: <N> 个 trial（<success> 成功 / <fail> 失败）
+
+### Trial 失败详情（如有失败）
+| Trial | 失败原因 | error_msg | output_dir |
+|-------|---------|-----------|-----------|
+| <N> | <异常类型> | <完整错误信息> | <path> |
+
+### 资源监控
+- 串行 trial 间内存稳定性: <stable/growing>（如 growing 给出 delta 值）
+- WSL2 内存回收提示: <yes/no + 次数>
+- 方案 F 验证: trainer/module/model 释放: <yes/no>
+
+## 产物溯源校验（Step 3 方案 G）
+每个 trial 的 manifest 校验结果：
+| Trial | output_dir | artifacts 总数 | verified 数 | 失败产物 |
+|-------|-----------|---------------|------------|---------|
+| 1 | <path> | <N> | <N> | <list or 无> |
+| 2 | | | | |
+| ... | | | | |
+
+## ExplorationTracker 验证（Step 4 产物）
+- 历史记录数: <N>
+- 历史记录示例（最近 3 条）:
+  | trial_id | strategy | result | parent_trial_id |
+  |----------|----------|--------|-----------------|
+  | <id> | <params> | <val_acc> | <parent or None> |
+- recommend_next 输出: <recommendation>
+- 持久化路径: <如 .senseframe/exploration.json>
+
+## 技能库测试（Step 5 产物）
+- 保存技能: name=<>, version=<>, 存储路径=<>
+- 检索结果: query="HPO", 匹配数=<N>, 匹配项=<list>
+- 加载技能: name=<>, 加载是否成功=<yes/no>
+- 技能库存储位置: <如 .senseframe/skills/>
+
+## 多模型对比（Step 6 产物）
+| 模型 | 最优 val_accuracy | 最优 trial params | 平均耗时(s) | 平均 epochs | 备注 |
+|------|-------------------|------------------|------------|------------|------|
+| ResNet18 | <val> | <lr=X, bs=Y> | <val> | <N> | <如"收敛稳定"> |
+| <其他> | <val> | | | | <如"早期过拟合"> |
+
+对比结论: <哪个模型在该数据集表现更好 + 原因分析>
 
 ## 自省评分矩阵
-| 阶段 | AI/Agent | ML | AutoML | CSI | 平均 |
-|------|----------|----|--------|-----|------|
-| 资源路由 | x | x | x | x | x.x |
-| 自省API | x | x | x | x | x.x |
-| HPO执行 | x | x | x | x | x.x |
-| ExplorationTracker | x | x | x | x | x.x |
-| 技能库 | x | x | x | x | x.x |
-| 多模型 | x | x | x | x | x.x |
+| 阶段 | AI/Agent | ML | AutoML | CSI | 平均 | 关键扣分原因 |
+|------|----------|----|--------|-----|------|------------|
+| 资源路由 | x | x | x | x | x.x | <如"recommend 固定推荐"> |
+| 自省API | x | x | x | x | x.x | <如"stage_io 不准"> |
+| HPO执行 | x | x | x | x | x.x | <如"Sampler 不可插拔"> |
+| ExplorationTracker | x | x | x | x | x.x | <如"recommend_next 空"> |
+| 技能库 | x | x | x | x | x.x | <如"search 质量差"> |
+| 多模型 | x | x | x | x | x.x | <如"输入形状未自动适配"> |
 
-## 关键发现
-1. [严重/中等/轻微] <问题 + 复现步骤 + 影响>
+## 关键发现（按严重度排序）
+每个发现必须包含：复现命令 + 实际输出 + 期望输出 + 影响范围 + 严重度
 
-## 改进建议
-1. [P0/P1/P2] <具体建议>
+1. **[严重]** <问题标题>
+   - 复现命令: `<完整命令>`
+   - 实际输出: `<粘贴实际输出>`
+   - 期望输出: `<应该是什么>`
+   - 根因分析: <代码位置 + 逻辑错误>
+   - 影响: <对哪些功能/用户/场景有影响>
+   - 建议修复: <具体修复方向>
+
+2. **[中等/轻微]** <问题标题>
+   - ...（同上格式）
+
+## 改进建议（按优先级排序）
+每条建议必须含：优先级 + 具体修改点 + 影响文件/模块 + 预期收益
+
+1. **[P0]** <建议>
+   - 修改文件: `<file:line>`
+   - 修改内容: <具体改什么>
+   - 预期收益: <修复后效果>
+
+2. **[P1/P2]** <建议>
+   - ...
 
 ## 结论
 - 综合评分: <x.x / 5.0>
 - 推荐度: <推荐/谨慎推荐/不推荐>
 - 一句话总结: <...>
+- 下一步建议: <如"扩展搜索空间到 weight_decay / 切换 Bayesian sampler">
 ```
 
 ## Constraints
@@ -297,5 +389,7 @@ skill = sf.load_skill("hpo_best")
 - 禁止伪造 trial：每个 trial 必须真实训练
 - 禁止跳过自省 API：编码前必须查询字段契约
 - 禁止掩盖失败：trial 失败必须记录
-- 禁止全 5 分：评分必须有区分度
+- 禁止全 5 分：评分必须有区分度，扣分必须填"关键扣分原因"
+- 禁止省略章节：报告必须含全部章节，无内容时填"无"并说明原因
+- 报告必须落盘到 `report/` 目录，禁止仅输出到 stdout
 - GPU 8GB 限制：HPO 必须串行，不得并发 trial

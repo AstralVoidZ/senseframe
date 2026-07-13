@@ -1,6 +1,6 @@
 """端到端集成测试：完整 run_pipeline 流程。
 
-验证 validate→preflight→resolve→load→build→train→eval→export 8 个 stage
+验证 validate→preflight→resolve→load→build→probe_vram→train→eval→export 9 个 stage
 能跑通一个最小数据集。
 
 标记 @pytest.mark.e2e，默认跳过，使用 -m e2e 显式启用。
@@ -35,7 +35,7 @@ class TestFullPipeline:
         ctx = PipelineContext(config=config)
         ctx.record_trial(strategy={"loss": "cross_entropy", "learning_rate": 0.001})
 
-        # 运行 pipeline（8 个 stage 依次执行）
+        # 运行 pipeline（9 个 stage 依次执行）
         result = pipeline.run(ctx)
         ctx = result.context
 

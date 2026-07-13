@@ -1008,6 +1008,17 @@ def _cmd_export(args):
         )
         _print_json(result.to_dict())
         if result.errors:
+            # P4-3：导出错误（如 onnx 包缺失）输出顶层 error JSON 到 stderr，
+            # 与其他错误路径（metadata/checkpoint/format 不存在）的输出格式一致。
+            # 旧代码仅 exit(1) 无额外输出，自动化测试无法区分"成功但有部分错误"
+            # 与"完全失败"，且错误埋在 result.errors 子字段中不易发现。
+            import sys as _sys
+            error_msg = "; ".join(f"{k}: {v}" for k, v in result.errors.items())
+            print(json.dumps({
+                "error": f"Export completed with errors: {error_msg}",
+                "code": "EXPORT_DEP_MISSING",
+                "format_errors": result.errors,
+            }, ensure_ascii=False), file=_sys.stderr)
             sys.exit(1)
     except Exception as e:
         print(json.dumps({

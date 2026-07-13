@@ -497,19 +497,20 @@ class TestEpsilon4OPProtocol:
     CloudEvent 序列化、Orchestrator 完整生命周期与 retry 流程。
     """
 
-    def test_pipeline_def_default_has_8_stages(self):
-        """验证 PipelineDef.default() 生成 8 个 stage。
+    def test_pipeline_def_default_has_9_stages(self):
+        """验证 PipelineDef.default() 生成 9 个 stage。
 
         P0.7：stage 顺序与 Pipeline.default() 对齐（load 在 resolve 前）。
+        方案 B：新增 probe_vram stage（build 和 train 之间）。
         """
         from senseframe.orchestration import PipelineDef
         pdef = PipelineDef.default(name="test_pipeline")
         assert pdef.name == "test_pipeline"
-        assert len(pdef.stages) == 8
+        assert len(pdef.stages) == 9
         names = [s.name for s in pdef.stages]
         assert names == [
             "validate", "preflight", "load", "resolve",
-            "build", "train", "eval", "export",
+            "build", "probe_vram", "train", "eval", "export",
         ]
 
     def test_state_machine_pending_to_running(self):
@@ -782,7 +783,7 @@ class TestEpsilon5FullClosedLoop:
         pdef = PipelineDef.default(name="automl_closed_loop")
         pipeline_id = orch.create_pipeline(pdef)
         assert pipeline_id == "automl_closed_loop"
-        assert len(pdef.stages) == 8
+        assert len(pdef.stages) == 9
 
         # 2. subscribe("*") 订阅所有事件
         events = []
@@ -841,8 +842,8 @@ class TestEpsilon5FullClosedLoop:
         assert event_types[-1] == EVENT_PIPELINE_SUCCEEDED, \
             f"末位事件应为 PIPELINE_SUCCEEDED，实际: {event_types[-1]}"
         # 应包含多个 STAGE_STARTED / STAGE_SUCCEEDED
-        assert event_types.count(EVENT_STAGE_STARTED) == 8
-        assert event_types.count(EVENT_STAGE_SUCCEEDED) == 8
+        assert event_types.count(EVENT_STAGE_STARTED) == 9
+        assert event_types.count(EVENT_STAGE_SUCCEEDED) == 9
 
         # 9. 验证 PipelineRun.phase == "succeeded"
         run = orch.get_run(run_id)
@@ -1166,7 +1167,7 @@ class TestP0ProtocolFoundationAcceptance:
 
         # 3. 反假绿：实际验证 stage 函数带 _stage_spec 属性（不是占位 None）
         specs = pipeline.stages_with_spec()
-        assert len(specs) == 8, f"应有 8 个 stage spec，实际: {len(specs)}"
+        assert len(specs) == 9, f"应有 9 个 stage spec，实际: {len(specs)}"
         # 至少 train stage 应有非空 writes（验证 _stage_spec 被正确附加）
         # StageSpec.writes 是 List[FieldSpec]，提取 name 字段
         train_spec = next((s for s in specs if s.name == "train"), None)

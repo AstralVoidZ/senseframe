@@ -1,18 +1,34 @@
 # 数据集与模型支持表
 
+## 环境变量（必填）
+
+WiFi CSI 场景依赖外部 SenseFi 代码库，框架不猜测路径，调用者必须显式提供：
+
+| 环境变量 | 用途 | 示例 |
+|----------|------|------|
+| `SENSEFRAME_DATA_ROOT` | 数据集根目录（含 UT_HAR/、NTU-Fi_HAR/ 等子目录） | `/path/to/CSI_DATASETS` |
+| `SENSEFRAME_SENSEFI_PATH` | SenseFi 代码库根目录（含 UT_HAR_model.py 等） | `/path/to/WiFi-CSI-Sensing-Benchmark` |
+
+未设置时：`SENSEFRAME_DATA_ROOT` → 训练启动报错；`SENSEFRAME_SENSEFI_PATH` → 场景激活报 ImportError。
+
 ## WiFi CSI 场景支持的数据集
 
-| 数据集名 | 目录名 | 类别数 | 输入形状 | loader | 用途 |
-|----------|--------|--------|----------|--------|------|
-| `UT_HAR_data` | UT_HAR | 7 | (1, 250, 90) | npy (tensor) | 监督训练 |
-| `NTU-Fi-HumanID` | NTU-Fi-HumanID | 14 | (3, 114, 500) | mat (csi_mat) | 监督训练 / 自监督微调 |
-| `NTU-Fi_HAR` | NTU-Fi_HAR | 6 | (3, 114, 500) | mat (csi_mat) | 自监督预训练（无监督数据） |
-| `Widar` | Widardata / Widar | 22 | (22, 20, 20) | csv (csv_folder) | 监督训练 |
+| 数据集名 | 目录名 | 类别数 | 输入形状 | loader | layout | 用途 |
+|----------|--------|--------|----------|--------|--------|------|
+| `UT_HAR_data` | UT_HAR | 7 | (1, 250, 90) | npy (tensor) | flat | 监督训练 |
+| `NTU-Fi-HumanID` | NTU-Fi-HumanID | 14 | (3, 114, 500) | mat (csi_mat) | flat | 监督训练 / 自监督微调 |
+| `NTU-Fi_HAR` | NTU-Fi_HAR | 6 | (3, 114, 500) | mat (csi_mat) | nested | 自监督预训练（无监督数据） |
+| `Widar` | Widardata / Widar | 22 | (22, 20, 20) | csv (csv_folder) | nested | 监督训练 |
 
 **字段说明**：
 - `类别数`：监督训练时的分类数；自监督预训练阶段（NTU-Fi_HAR）无监督标签，类别数仅用于元信息
 - `loader`：数据加载器类型，决定文件格式与解析方式
+- `layout`：目录结构声明（`nested`=类别子目录 / `flat`=扁平结构），loader 按 spec 声明 glob，不探测不 fallback
 - `输入形状`：不含 batch 维；runner 自动补 batch 维
+
+**数据集部署注意事项**：
+- `UT_HAR_data`：原始发布文件扩展名为 `.csv` 但内容实为 NumPy 二进制（`.npy`）。部署时需将 `UT_HAR/data/*.csv` 和 `UT_HAR/label/*.csv` 重命名为 `.npy`，与 `DatasetSpec.file_format="npy"` 声明一致。preflight 阶段（含 `--dry-run`）会基于 `file_format + layout` 递归 glob 检查声明一致性，扩展名不匹配时直接报错。
+- 框架不探测实际文件格式、不 fallback 到其他扩展名——数据集部署是调用者职责，框架按 `DatasetSpec` 声明工作。
 
 **归一化常数**：
 - `NTU-Fi_HAR` / `NTU-Fi-HumanID`：mean=42.3199, std=4.9802
@@ -22,7 +38,7 @@
 **自监督模式约束**：
 - `dataset` 必须为 `NTU-Fi_HAR`（Stage 1 无监督预训练数据源）
 - Stage 2 微调自动使用 `NTU-Fi-HumanID`（14 类），由 `DatasetSpec.supervised_source` 声明
-- `output_features.num_classes` 声明 14（schema 校验要求 >= 2，框架内部硬编码覆盖）
+- `output_features.num_classes` 必须与 `DatasetSpec.supervised_source` 派生的类别数一致（不再硬编码覆盖）
 
 ## 支持的模型
 

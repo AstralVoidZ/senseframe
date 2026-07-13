@@ -15,16 +15,24 @@ pytest 配置与 fixtures（R-fix 重构后骨架）。
 - requires_data: 依赖真实数据目录
 """
 
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
-PROJECT_ROOT = Path(__file__).parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# bootstrap：senseframe 可导入前的必要本地推导
+_BOOTSTRAP_ROOT = Path(__file__).resolve().parents[1]
+if str(_BOOTSTRAP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BOOTSTRAP_ROOT))
 
-DATA_ROOT = PROJECT_ROOT / "CSI_DATASETS" / "Data"
+# 单一数据源：bootstrap 后从 senseframe.common.paths 导入 PROJECT_ROOT
+from senseframe.common.paths import PROJECT_ROOT  # noqa: E402
+
+# data_root 从 SENSEFRAME_DATA_ROOT env 读（框架不猜测路径）。
+# 未设置 env 时 DATA_ROOT=None，requires_data 测试自动跳过。
+_env_data_root = os.environ.get("SENSEFRAME_DATA_ROOT")
+DATA_ROOT = Path(_env_data_root) if _env_data_root else None
 
 
 def pytest_configure(config):
@@ -37,7 +45,7 @@ def pytest_configure(config):
 def pytest_collection_modifyitems(config, items):
     """默认跳过 e2e / slow / requires_data，使用 -m 显式启用。"""
     selected = config.getoption("-m") or ""
-    has_data = DATA_ROOT.exists()
+    has_data = DATA_ROOT is not None and DATA_ROOT.exists()
 
     skip_e2e = pytest.mark.skip(reason="e2e 测试，使用 -m e2e 显式启用")
     skip_slow = pytest.mark.skip(reason="slow 测试，使用 -m slow 显式启用")
@@ -60,6 +68,8 @@ def project_root() -> Path:
 
 
 @pytest.fixture
-def data_root(project_root) -> Path:
-    """数据集根目录。"""
-    return project_root / "CSI_DATASETS" / "Data"
+def data_root() -> Path:
+    """数据集根目录（从 SENSEFRAME_DATA_ROOT env 读，未设置则 raise）。"""
+    if DATA_ROOT is None:
+        pytest.skip("SENSEFRAME_DATA_ROOT 未设置，跳过依赖数据的测试")
+    return DATA_ROOT

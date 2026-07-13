@@ -2214,6 +2214,7 @@ def analyze_training_result(
     early_stopped: bool,
     task_type: str = "classification",
     best_epoch: Optional[int] = None,
+    n_classes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """分析训练结果，输出结构化反馈（RFC-002 阶段 L）。
 
@@ -2294,20 +2295,41 @@ def analyze_training_result(
             if last_train_acc is not None and last_val_acc is not None:
                 break
 
-    val_acc = final_eval.get("val_accuracy") or final_eval.get("accuracy") or last_val_acc
+    # P4-5：val_acc 提取改为显式 is not None 检查链。
+    # 旧代码用 or 链，当 val_accuracy=0.0（falsy）时会错误跳到 accuracy 或 last_val_acc，
+    # 导致 underfitting 检查被静默跳过。
+    val_acc = None
+    for _key in ("val_accuracy", "accuracy"):
+        _v = final_eval.get(_key)
+        if _v is not None:
+            val_acc = _v
+            break
+    if val_acc is None:
+        val_acc = last_val_acc
 
     # 3. 欠拟合：验证准确率过低
-    if val_acc is not None and val_acc < 0.5 and task_type == "classification":
-        return {
-            "status": "underfitting",
-            "diagnosis": f"验证准确率 {val_acc:.3f} 偏低，模型欠拟合",
-            "suggestions": [
-                "增大模型容量（更多层/更宽）",
-                "增加训练轮数 (epochs)",
-                "降低正则化强度 (weight_decay)",
-                "尝试更丰富的特征工程 pipeline",
-            ],
-        }
+    # P4-5：阈值动态化，基于 n_classes 计算随机猜测基线。
+    # 旧代码硬编码 0.5，对多分类（如 7 类，随机基线≈0.143）过宽松。
+    # 新阈值 = max(2/n_classes, 0.3)，即随机基线的 2 倍与 0.3 取较大值。
+    if val_acc is not None and task_type == "classification":
+        if n_classes is not None and n_classes > 1:
+            underfit_threshold = max(2.0 / n_classes, 0.3)
+        else:
+            underfit_threshold = 0.5
+        if val_acc < underfit_threshold:
+            return {
+                "status": "underfitting",
+                "diagnosis": (
+                    f"验证准确率 {val_acc:.3f} 低于阈值 {underfit_threshold:.3f}"
+                    f"（n_classes={n_classes}, 随机基线≈{1.0/(n_classes or 2):.3f}），模型欠拟合"
+                ),
+                "suggestions": [
+                    "增大模型容量（更多层/更宽）",
+                    "增加训练轮数 (epochs)",
+                    "降低正则化强度 (weight_decay)",
+                    "尝试更丰富的特征工程 pipeline",
+                ],
+            }
 
     # 4. 过拟合：train-val gap 过大
     if last_train_acc is not None and last_val_acc is not None:
@@ -2381,6 +2403,13 @@ def stage_eval(ctx: PipelineContext) -> PipelineContext:
     """Stage 7: 评估。
 
     RFC-002 阶段 L：输出结构化反馈（失败分类 + 改进建议），闭合探索-反馈回路。
+
+    P4-2 文档澄清：本 stage 内部调用 ctx.trainer.validate()，Lightning Trainer
+    会对每个 validation batch 调用 LightningModule.validation_step（约 N 次，
+    N = validation batch 数）。这是 Lightning 的固有行为，与 replace_stage 无关。
+
+    replace_stage("eval", fn) 的语义是完全取代 stage 函数，原 stage_eval 不执行。
+    若需"eval 后钩子"，应使用 after("eval", hook) 且 hook 内部不调用 trainer.validate()。
     """
     is_self_supervised = (ctx.learning_mode == "self_supervised")
 
@@ -2441,6 +2470,7 @@ def stage_eval(ctx: PipelineContext) -> PipelineContext:
     ctx.feedback = analyze_training_result(
         final_eval, training_log, early_stopped, task_type=task_type,
         best_epoch=ctx.best_epoch,
+        n_classes=ctx.num_classes,
     )
 
     # RFC-002 阶段 R：feedback 回写到最近一次探索试验，闭合"训练→反馈→推荐"回路
@@ -2682,7 +2712,14 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
             )
             if ctx.output:
                 ctx.output.export = export_result.to_dict()
+            # P4-3：导出有 errors（如 onnx 包缺失）时记录 warning，不再静默。
+            if export_result.errors:
+                _logger.warning(
+                    "Export completed with errors: %s", export_result.errors
+                )
         except Exception as e:
+            # P4-3：导出异常不再静默吞没，记录 warning 供排查。
+            _logger.warning("Export failed: %s", e)
             if ctx.output:
                 ctx.output.export = {"error": str(e)}
 
@@ -3376,6 +3413,13 @@ class Pipeline:
             # RFC-004 方案 F：确定性资源释放（成功/失败/异常路径均执行）
             # 幂等：release_resources 内部对已 None 字段安全
             ctx.release_resources()
+            # P4-4：资源释放后刷新 checkpoint，持久化 resources_released=True。
+            # 旧代码 finally 块内无 checkpoint 刷新，导致 checkpoint 永远记录释放前的状态
+            #（resources_released=False），跨进程无法验证资源是否已释放。
+            try:
+                self._write_checkpoint(ctx)
+            except Exception as e:
+                _logger.warning(f"Failed to write post-release checkpoint: {e}")
 
     def _write_checkpoint(self, ctx: PipelineContext, failed_stage: Optional[str] = None) -> None:
         """P1：写 stage checkpoint 到 output_dir/pipeline_checkpoint.json。
@@ -3398,6 +3442,11 @@ class Pipeline:
             "timestamp": datetime.now().isoformat(),
             # P0.8：stage 输出快照（仅可序列化字段），作为 OP-4 唯一真源
             "stage_outputs": self._serialize_stage_outputs(ctx),
+            # P4-4：资源释放状态（方案 F 持久化）。
+            # finally 块的 release_resources() 后会追加一次 checkpoint 刷新，
+            # 此时 trainer/module 已置 None，resources_released=True。
+            # 若 checkpoint 在 try 块内写入（stage 执行后），此值为 False（尚未释放）。
+            "resources_released": ctx.trainer is None and ctx.module is None,
         }
         if failed_stage:
             data["failed_stage"] = failed_stage
@@ -3574,6 +3623,11 @@ def run_pipeline(config: ExperimentConfig, pipeline: Optional[Pipeline] = None) 
             dataset=config.scene.dataset,
             learning_mode=config.scene.learning_mode,
         )
+        # P4-5：从 ctx 复制 feedback 到 TrainOutput，供 HPO tracker 消费。
+        # 旧代码未复制，导致 hpo.py 硬编码 feedback={"status":"success"}，
+        # 探索-反馈回路断裂（underfitting trial 被误标为 success）。
+        if ctx.feedback is not None:
+            ctx.output.feedback = ctx.feedback
         if result.error:
             ctx.output.error = str(result.error)
 

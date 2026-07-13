@@ -214,6 +214,8 @@ def main():
         default_epochs = args.epochs
 
     # P1-3 修复：解析 data_root（优先级：CLI > env > 默认路径探测）
+    # P4-6 修复：探测到的路径转为相对路径写入 YAML，提升配置可移植性。
+    # 训练期的 resolve_data_root 会将相对路径 .resolve() 为绝对路径，功能不受影响。
     import os
     if args.data_root is not None:
         data_root = args.data_root
@@ -223,11 +225,11 @@ def main():
         # 探测默认路径 resource/CSI_DATASETS（相对于 cwd 或项目根）
         _candidate = Path.cwd() / "resource" / "CSI_DATASETS"
         if _candidate.exists():
-            data_root = str(_candidate)
+            data_root = os.path.relpath(_candidate, Path.cwd())
         else:
             _candidate = _PROJECT_ROOT / "resource" / "CSI_DATASETS"
             if _candidate.exists():
-                data_root = str(_candidate)
+                data_root = os.path.relpath(_candidate, Path.cwd())
             else:
                 data_root = ""
 

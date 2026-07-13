@@ -220,9 +220,9 @@ trainer:
 - `cosine`：`T_max` 动态取 `max_epochs`（经路由 cap 后的实际 epochs），无 `max_epochs` 时回退 50
 - `step`：`step_size` 动态取 `max(1, max_epochs // 3)`，无 `max_epochs` 时回退 30，`gamma=0.1`
 
-**max_epochs 来源**：`config.trainer.epochs` 与路由表 `RESOURCE_ROUTES[route_level]["max_epochs"]` 的较小值：
-- `cpu_minimal`：max_epochs=50
-- `cpu_standard`：max_epochs=200
+**epochs 实际值来源**：`config.trainer.epochs` 与路由表 `RESOURCE_ROUTES[route_level]["max_epochs"]`（路由层内部字段名，非 TrainerConfig 字段）的较小值：
+- `cpu_minimal`：cap 至 50 epochs
+- `cpu_standard`：cap 至 200 epochs
 - `gpu_*`：无上限（使用配置值）
 
 **向后兼容**：通过 `scene.params.scheduler` 透传的旧配置仍可工作，但推荐迁移到 `trainer.scheduler`。

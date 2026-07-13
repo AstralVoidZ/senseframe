@@ -401,6 +401,23 @@ class ResourceRouter:
         # route_level
         resolved["route_level"] = ResourceRouter.route(report)
 
+        # P4-1：透传非路由字段（如 self_supervised_epochs/metrics 等 scene.params 透传值）。
+        # 路由层只负责 device/batch_size/precision 等路由相关字段的覆盖，
+        # 非路由字段应由上游 experiment_config_to_dict 透传到下游 stage 消费。
+        # 旧实现是白名单模式（只复制路由字段），导致 self_supervised_epochs/metrics 被丢弃。
+        _ROUTE_OWNED_FIELDS = {
+            "device", "batch_size", "num_workers", "pin_memory",
+            "persistent_workers", "precision", "learning_rate",
+            "optimizer", "weight_decay", "scheduler", "early_stopping",
+            "gradient_clip_val", "gradient_clip_algorithm",
+            "accumulate_grad_batches", "logger", "devices", "strategy",
+            "num_nodes", "sync_batchnorm", "num_processes", "route_level",
+            "mixed_precision",  # 已被 precision 消费
+        }
+        for k, v in yaml_config.items():
+            if k not in _ROUTE_OWNED_FIELDS and k not in resolved:
+                resolved[k] = v
+
         return resolved
 
     @staticmethod

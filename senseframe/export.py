@@ -83,9 +83,10 @@ def _check_optional_dep(format_name: str) -> Optional[str]:
         __import__(import_name)
         return None
     except ImportError:
+        # P4-3：统一英文提示（与 inference.py 风格一致），便于自动化测试匹配
         return (
-            f"格式 '{format_name}' 需要可选依赖 '{pip_name}'，"
-            f"请 `pip install {pip_name}` 后重试。"
+            f"Format '{format_name}' requires optional dependency '{pip_name}'. "
+            f"Install with: pip install {pip_name}"
         )
 
 

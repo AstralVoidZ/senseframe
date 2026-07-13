@@ -89,7 +89,7 @@ class TestStageIO:
     def test_list_all_stages(self):
         result = stage_io()
         assert "stages" in result
-        assert len(result["stages"]) == 8
+        assert len(result["stages"]) == 9
 
     def test_get_single_stage(self):
         result = stage_io("validate")
@@ -120,9 +120,9 @@ class TestStageIO:
 
 
 class TestListStages:
-    def test_returns_8_stages(self):
+    def test_returns_9_stages(self):
         stages = list_stages()
-        assert len(stages) == 8
+        assert len(stages) == 9
         assert "validate" in stages
         assert "export" in stages
 
