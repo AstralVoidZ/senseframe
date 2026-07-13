@@ -47,7 +47,7 @@ F. 多格式模型导出
 
 - 工作目录: `.`（已部署 SenseFrame）
 - SKILL `senseframe` 已加载
-- 数据集: `CSI_DATASETS/`
+- 数据集: `CSI_DATASETS/`（如未部署，可改 `--data-root` 或软链；命令中所有路径均可替换为实际数据根）
 - GPU: 8GB 显存，自监督 batch_size 建议 32
 
 **架构重点审视项**（发现任一问题标记 [严重]）:
@@ -278,14 +278,15 @@ completed = ctx.completed_fields()
 desc = ctx.describe()
 
 # E4: stage_io
-io_train = sf.stage_io("stage_train")    # reads / writes
+# 注意：stage 名不带 "stage_" 前缀（如 "train"），带前缀会返回 not found
+io_train = sf.stage_io("train")    # reads / writes
 
 # E5: pipeline_graph
 graph = sf.pipeline_graph()              # DAG
 
 # E6: check_readiness（DSP-3）
 pipeline = sf.Pipeline.default()
-report = pipeline.check_readiness(ctx, "stage_train")
+report = pipeline.check_readiness(ctx, "train")
 # ReadinessReport(available=bool, missing_reads=list)
 
 # E7: validate_graph（编译期 dangling ref）
@@ -322,7 +323,7 @@ import senseframe as sf
 from pathlib import Path
 
 # 1. 加载本次运行的 manifest
-manifest = sf.load_manifest(Path("runs/<实验目录>/manifest.json"))
+manifest = sf.load_manifest(Path("runs/<实验目录>"))
 print(f"run_id: {manifest.run_id}")
 print(f"artifacts: {len(manifest.artifacts)}")
 
@@ -332,10 +333,14 @@ for kind in ("model", "metrics", "config", "log", "metadata"):
     print(f"  {kind}: {len(items)} 个")
 
 # 3. 校验所有产物完整性（hash + 存在性）
-report = sf.verify_artifacts(manifest)
-print(f"verified: {report['verified']}/{report['total']}")
-if report["missing"] or report["hash_mismatch"]:
-    print(f"MISMATCH: {report}")
+# verify_artifacts 接受 output_dir（含 manifest.json），返回 {产物名: hash 是否匹配}
+report = sf.verify_artifacts(Path("runs/<实验目录>"))
+verified = sum(1 for ok in report.values() if ok)
+total = len(report)
+print(f"verified: {verified}/{total}")
+missing_or_mismatch = [name for name, ok in report.items() if not ok]
+if missing_or_mismatch:
+    print(f"MISMATCH: {missing_or_mismatch}")
 ```
 
 **Output**: 多格式导出产物 + manifest 校验报告

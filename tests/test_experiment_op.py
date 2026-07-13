@@ -375,6 +375,73 @@ class TestMethodRunnerOpPath:
         finally:
             orch.shutdown()
 
+    def test_use_op_true_complete_failure_does_not_propagate(self):
+        """资源泄露修复：orch.complete 抛异常不应传播给调用方。
+
+        场景：run_pipeline 成功，但 orch.complete 因状态机/I/O 异常失败。
+        不保护时：异常会传播，调用方看到非预期错误，OP run 卡 PHASE_RUNNING。
+        修复后：异常仅记录日志，run() 返回 SUCCESS TrialResult。
+        """
+        config = _make_method_config()
+        sm = StudyManager()
+        study_id = sm.create_study(
+            "test", direction="maximize",
+            search_space=config.search_space, sampler="random",
+        )
+        orch = Orchestrator()
+        try:
+            runner = MethodRunner(
+                config=config, study_id=study_id, study_manager=sm,
+                use_op=True, orchestrator=orch,
+            )
+
+            with patch("senseframe.experiment.method.run_pipeline") as mock_pipeline, \
+                 patch.object(orch, "complete", side_effect=RuntimeError("OP I/O failed")):
+                mock_pipeline.return_value = _make_mock_train_output("success")
+                # 不应抛异常（OP complete 失败被隔离）
+                result = runner.run("synthetic", "MLP", 0)
+
+            # 训练本身成功 → TrialResult 仍应标记 SUCCESS
+            assert result.status == TrialStatus.SUCCESS
+        finally:
+            orch.shutdown()
+
+    def test_use_op_true_fail_failure_does_not_mask_original_error(self):
+        """资源泄露修复：orch.fail 抛异常不应掩盖原 run_pipeline 异常。
+
+        场景：run_pipeline 抛 RuntimeError("training crashed")，随后
+        orch.fail 又因 I/O 异常失败。不保护时：调用方看到 OP I/O 异常
+        而非原始 training crashed 异常，调试困难。修复后：仍抛原始异常。
+        """
+        config = _make_method_config()
+        sm = StudyManager()
+        study_id = sm.create_study(
+            "test", direction="maximize",
+            search_space=config.search_space, sampler="random",
+        )
+        orch = Orchestrator()
+        try:
+            runner = MethodRunner(
+                config=config, study_id=study_id, study_manager=sm,
+                use_op=True, orchestrator=orch,
+            )
+
+            original_error = RuntimeError("training crashed")
+            with patch("senseframe.experiment.method.run_pipeline") as mock_pipeline, \
+                 patch.object(orch, "fail", side_effect=RuntimeError("OP I/O failed")):
+                mock_pipeline.side_effect = original_error
+                # MethodRunner.run() 内部捕获异常并返回 FAILED TrialResult
+                # （见 method.py run() 方法的 try/except 块）
+                result = runner.run("synthetic", "MLP", 0)
+
+            # 应标记 FAILED，且 error_msg 含原始异常信息
+            assert result.status == TrialStatus.FAILED
+            assert "training crashed" in (result.error_msg or "")
+            # OP I/O 异常信息不应出现在 error_msg 中（被隔离）
+            assert "OP I/O failed" not in (result.error_msg or "")
+        finally:
+            orch.shutdown()
+
 
 # ============================================================
 # P2.13: ExperimentRunner 事件驱动聚合

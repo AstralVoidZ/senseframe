@@ -13,7 +13,12 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    # 仅用于类型注解，避免运行时循环导入
+    from .orchestration_store import OrchestrationStore
 
 
 # ============================================================
@@ -145,6 +150,22 @@ class StageStatus:
         return {"name": self.name, "phase": self.phase, "started_at": self.started_at,
                 "finished_at": self.finished_at, "checkpoint_uri": self.checkpoint_uri, "error": self.error}
 
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "StageStatus":
+        """从 dict 构造 StageStatus（P3.4.1，反序列化）。
+
+        缺失字段使用默认值（与 dataclass 默认值对齐），
+        保证旧版序列化数据可向后兼容加载。
+        """
+        return cls(
+            name=d.get("name", ""),
+            phase=d.get("phase", "pending"),
+            started_at=d.get("started_at", ""),
+            finished_at=d.get("finished_at", ""),
+            checkpoint_uri=d.get("checkpoint_uri", ""),
+            error=d.get("error", ""),
+        )
+
 
 # OP-3: PipelineRun 状态机 phase 常量
 PHASE_PENDING = "pending"
@@ -196,6 +217,33 @@ class PipelineRun:
                 "retry_count": self.retry_count,
             },
         }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "PipelineRun":
+        """从 dict 构造 PipelineRun（P3.4.1，反序列化）。
+
+        递归调用 StageStatus.from_dict 构造 stages 列表。
+        缺失字段使用默认值，保证旧版序列化数据可向后兼容加载。
+
+        to_dict 将 status 字段（phase/stages/started_at/finished_at/output_uri/error/retry_count）
+        嵌套在 "status" key 下，from_dict 从该 key 解包。
+        """
+        status = d.get("status", {}) or {}
+        stages_data = status.get("stages", []) or []
+        return cls(
+            run_id=d.get("run_id", ""),
+            pipeline_ref=d.get("pipeline_ref", ""),
+            owner_reference=d.get("owner_reference", None),
+            params=d.get("params", {}) or {},
+            checkpoint_uri=d.get("checkpoint_uri", ""),
+            phase=status.get("phase", PHASE_PENDING),
+            stages=[StageStatus.from_dict(s) for s in stages_data],
+            started_at=status.get("started_at", ""),
+            finished_at=status.get("finished_at", ""),
+            output_uri=status.get("output_uri", ""),
+            error=status.get("error", ""),
+            retry_count=status.get("retry_count", 0),
+        )
 
     def transition(self, new_phase: str) -> None:
         """状态转换（OP-3）。非法转换抛 ValueError。"""
@@ -283,6 +331,133 @@ def make_event(event_type: str, run_id: str, data: Dict[str, Any]) -> CloudEvent
 
 
 # ============================================================
+# P3.4.3: CloudEvent 外部 sink
+# ============================================================
+
+@runtime_checkable
+class EventSink(Protocol):
+    """CloudEvent 外部 sink 协议（P3.4.3）。
+
+    任何含 ``emit(event: CloudEvent) -> None`` 方法的对象均满足此协议。
+    Orchestrator._event_sink 接受任何 EventSink 实现（FileEventSink / Kafka / Webhook 等）。
+    """
+
+    def emit(self, event: CloudEvent) -> None: ...
+
+
+class FileEventSink:
+    """CloudEvent 文件 sink（P3 默认实现，P3.4.3）。
+
+    将 CloudEvent 以 JSONL 格式追加写入日志文件（每行一个 event JSON）。
+    sink 异常不影响主流程（Orchestrator._emit_event 中 try/except 兜底）。
+    """
+
+    def __init__(self, log_path: Any):
+        """Args:
+            log_path: 日志文件路径（str / Path）。父目录自动创建。
+        """
+        self.log_path = Path(log_path)
+        # 父目录自动创建（与 FileOrchestrationStore 行为一致）
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def emit(self, event: CloudEvent) -> None:
+        """将 CloudEvent 追加写入 JSONL 日志（每行一个 event JSON）。"""
+        with self.log_path.open("a", encoding="utf-8") as f:
+            f.write(event.to_json() + "\n")
+
+
+# ============================================================
+# P3.4.4: K8s Operator 适配层（接口准备，P4 真实实现）
+# ============================================================
+
+class K8sOperatorAdapter:
+    """K8s Operator 适配层（P3 接口准备，P4 真实实现）。
+
+    将 OP PipelineRun 映射为 K8s Custom Resource（CRD: senseframe.io/v1 PipelineRun）。
+    P3 仅提供 to_cr_manifest / from_cr_manifest 双向序列化方法，
+    真实 Operator 驱动（reconciliation loop、CR watch、status subresource 回写）
+    推迟到 P4（需 kopf/argo 依赖 + K8s 集群验证）。
+
+    CR manifest 结构对齐 K8s CRD 规范：
+        apiVersion: senseframe.io/v1
+        kind: PipelineRun
+        metadata:
+          name: <run_id>
+          ownerReferences: [...]  # 仅当 run.owner_reference 非 None
+        spec:
+          pipelineRef / params / checkpointUri
+        status:
+          phase / stages / startedAt / finishedAt / outputUri / error / retryCount
+    """
+
+    API_VERSION = "senseframe.io/v1"
+    KIND = "PipelineRun"
+    OWNER_API_VERSION = "senseframe.io/v1"
+    OWNER_KIND = "PipelineDef"
+
+    def to_cr_manifest(self, run: PipelineRun) -> Dict[str, Any]:
+        """PipelineRun → K8s Custom Resource manifest（P3.4.4）。
+
+        ownerReferences 仅在 run.owner_reference 非 None 时包含（K8s CRD 语义）。
+        """
+        manifest: Dict[str, Any] = {
+            "apiVersion": self.API_VERSION,
+            "kind": self.KIND,
+            "metadata": {
+                "name": run.run_id,
+            },
+            "spec": {
+                "pipelineRef": run.pipeline_ref,
+                "params": run.params,
+                "checkpointUri": run.checkpoint_uri,
+            },
+            "status": {
+                "phase": run.phase,
+                "startedAt": run.started_at,
+                "finishedAt": run.finished_at,
+                "outputUri": run.output_uri,
+                "error": run.error,
+                "retryCount": run.retry_count,
+                "stages": [s.to_dict() for s in run.stages],
+            },
+        }
+        if run.owner_reference:
+            manifest["metadata"]["ownerReferences"] = [{
+                "apiVersion": self.OWNER_API_VERSION,
+                "kind": self.OWNER_KIND,
+                "name": run.owner_reference,
+            }]
+        return manifest
+
+    def from_cr_manifest(self, manifest: Dict[str, Any]) -> PipelineRun:
+        """K8s Custom Resource → PipelineRun（P3.4.4）。
+
+        支持最小 manifest（仅 metadata.name + spec.pipelineRef），
+        缺失字段使用默认值（与 PipelineRun.from_dict 行为一致）。
+        """
+        meta = manifest.get("metadata", {}) or {}
+        spec = manifest.get("spec", {}) or {}
+        status = manifest.get("status", {}) or {}
+        stages_data = status.get("stages", []) or []
+        owner_refs = meta.get("ownerReferences", []) or []
+        owner_reference = owner_refs[0].get("name") if owner_refs else None
+        return PipelineRun(
+            run_id=meta.get("name", ""),
+            pipeline_ref=spec.get("pipelineRef", ""),
+            owner_reference=owner_reference,
+            params=spec.get("params", {}) or {},
+            checkpoint_uri=spec.get("checkpointUri", ""),
+            phase=status.get("phase", PHASE_PENDING),
+            stages=[StageStatus.from_dict(s) for s in stages_data],
+            started_at=status.get("startedAt", ""),
+            finished_at=status.get("finishedAt", ""),
+            output_uri=status.get("outputUri", ""),
+            error=status.get("error", ""),
+            retry_count=status.get("retryCount", 0),
+        )
+
+
+# ============================================================
 # OP-6: 编排器接口
 # ============================================================
 
@@ -292,9 +467,15 @@ class Orchestrator:
     供 AutoML 主控调用，管理 Pipeline 生命周期。
     对齐 K8s Controller reconciliation loop。
     P0.1: reconcile() 桥接 Pipeline 执行器，实现「观察状态 → 驱动 stage → 回写状态」闭环。
+
+    P3.4 扩展：
+    - ``store`` 参数（可选）：OrchestrationStore 持久化后端，None 时退化为纯内存（向后兼容）。
+    - ``event_sink`` 参数（可选）：CloudEvent 外部 sink，None 时不写外部日志（向后兼容）。
+    - ``recover()`` 方法：从 store 加载所有 run，重启后恢复状态。
     """
 
-    def __init__(self):
+    def __init__(self, store: Optional["OrchestrationStore"] = None,
+                 event_sink: Optional[EventSink] = None):
         self._pipelines: Dict[str, PipelineDef] = {}  # name -> PipelineDef
         self._runs: Dict[str, PipelineRun] = {}  # run_id -> PipelineRun
         self._checkpoints: Dict[str, List[CheckpointSpec]] = {}  # run_id -> checkpoints
@@ -308,6 +489,24 @@ class Orchestrator:
         self._executor: Optional[ThreadPoolExecutor] = None
         self._run_futures: Dict[str, Future] = {}
         self._async_lock = threading.Lock()  # 保护 _run_futures
+        # P3.4.2: 持久化后端（None 时退化为纯内存，向后兼容）
+        self._store: Optional["OrchestrationStore"] = store
+        # P3.4.3: CloudEvent 外部 sink（None 时不写外部日志，向后兼容）
+        self._event_sink: Optional[EventSink] = event_sink
+
+    def _persist_run(self, run: PipelineRun) -> None:
+        """持久化单个 run 到 store（P3.4.2 内部辅助）。
+
+        store 为 None 时 no-op（向后兼容）。store 异常不影响主流程
+        （捕获后吞掉，避免持久化失败阻断编排——K8s Controller 同样语义：
+        status subresource 回写失败不应阻断 reconciliation）。
+        """
+        if self._store is None:
+            return
+        try:
+            self._store.save_run(run)
+        except Exception:
+            pass  # 持久化失败不阻断主流程
 
     def create_pipeline(self, pipeline_def: PipelineDef) -> str:
         """注册 Pipeline 定义（OP-1/6）。"""
@@ -332,6 +531,8 @@ class Orchestrator:
             self._runs[run_id] = run
             self._checkpoints[run_id] = []
             self._contexts[run_id] = None  # P0.1: 待绑定 PipelineContext
+        # P3.4.2: 持久化（store 为 None 时 no-op）
+        self._persist_run(run)
         return run_id
 
     def start(self, run_id: str) -> None:
@@ -339,18 +540,21 @@ class Orchestrator:
         run = self._get_run(run_id)
         run.transition(PHASE_RUNNING)
         self._emit_event(EVENT_PIPELINE_STARTED, run_id, {"phase": run.phase})
+        self._persist_run(run)
 
     def pause(self, run_id: str) -> None:
         """暂停 PipelineRun（OP-6）。"""
         run = self._get_run(run_id)
         run.transition(PHASE_PAUSED)
         self._emit_event(EVENT_PIPELINE_PAUSED, run_id, {"phase": run.phase})
+        self._persist_run(run)
 
     def resume(self, run_id: str) -> None:
         """恢复 PipelineRun（OP-6）。"""
         run = self._get_run(run_id)
         run.transition(PHASE_RUNNING)
         self._emit_event(EVENT_PIPELINE_RESUMED, run_id, {"phase": run.phase})
+        self._persist_run(run)
 
     def retry(self, run_id: str) -> None:
         """重试 PipelineRun（OP-6）。"""
@@ -358,6 +562,7 @@ class Orchestrator:
         run.transition(PHASE_RUNNING)
         run.retry_count += 1
         self._emit_event(EVENT_PIPELINE_STARTED, run_id, {"phase": run.phase, "retry": run.retry_count})
+        self._persist_run(run)
 
     def stop(self, run_id: str) -> None:
         """停止 PipelineRun（OP-6）。"""
@@ -365,6 +570,7 @@ class Orchestrator:
         run.transition(PHASE_FAILED)
         run.error = "Stopped by orchestrator"
         self._emit_event(EVENT_PIPELINE_FAILED, run_id, {"phase": run.phase, "error": run.error})
+        self._persist_run(run)
 
     def complete(self, run_id: str, output_uri: str = "") -> None:
         """标记 PipelineRun 成功完成（OP-6）。"""
@@ -372,6 +578,7 @@ class Orchestrator:
         run.transition(PHASE_SUCCEEDED)
         run.output_uri = output_uri
         self._emit_event(EVENT_PIPELINE_SUCCEEDED, run_id, {"phase": run.phase, "output_uri": output_uri})
+        self._persist_run(run)
 
     def fail(self, run_id: str, error: str, stage_name: str = "") -> None:
         """标记 PipelineRun 失败（OP-6）。"""
@@ -385,6 +592,7 @@ class Orchestrator:
                     s.error = error
                     break
         self._emit_event(EVENT_PIPELINE_FAILED, run_id, {"phase": run.phase, "error": error, "stage": stage_name})
+        self._persist_run(run)
 
     def update_stage(self, run_id: str, stage_name: str, phase: str,
                      checkpoint_uri: str = "", error: str = "") -> None:
@@ -481,6 +689,35 @@ class Orchestrator:
         if filter_phase:
             runs = [r for r in runs if r.phase == filter_phase]
         return runs
+
+    def recover(self) -> List[str]:
+        """从持久化存储恢复所有 run（P3.4.2，重启后调用）。
+
+        从 store 加载所有 PipelineRun 到 ``_runs``，并初始化对应的
+        ``_checkpoints`` / ``_contexts`` 占位。PipelineContext 不可序列化，
+        需 Agent 在恢复后重新绑定（``bind_context``）。
+
+        Returns:
+            恢复的 run_id 列表（按 store.list_runs() 顺序）
+
+        Note:
+            store 为 None 时返回空 list（向后兼容，纯内存模式无可恢复数据）。
+            store 异常不抛出（捕获后视为无 run 可恢复）。
+        """
+        if self._store is None:
+            return []
+        try:
+            runs = self._store.list_runs()
+        except Exception:
+            return []
+        recovered: List[str] = []
+        for run in runs:
+            with self._lock:
+                self._runs[run.run_id] = run
+                self._checkpoints.setdefault(run.run_id, [])
+                self._contexts.setdefault(run.run_id, None)
+            recovered.append(run.run_id)
+        return recovered
 
     def subscribe(self, event_type: str, callback: Callable[[CloudEvent], None]) -> Callable[[], None]:
         """订阅事件（OP-5/6）。
@@ -604,15 +841,22 @@ class Orchestrator:
         return run
 
     def _emit_event(self, event_type: str, run_id: str, data: Dict[str, Any]) -> None:
-        """发射 CloudEvent（OP-5）。"""
+        """发射 CloudEvent（OP-5 + P3.4.3 外部 sink）。"""
         event = make_event(event_type, run_id, data)
-        # 通知订阅者
+        # 通知进程内订阅者（原有逻辑）
         callbacks = self._subscribers.get(event_type, []) + self._subscribers.get("*", [])
         for cb in callbacks:
             try:
                 cb(event)
             except Exception:
                 pass  # 订阅者异常不影响主流程
+        # P3.4.3: 外部 sink（FileEventSink / Kafka / Webhook 等）
+        # sink 异常不影响主流程（与订阅者同语义）
+        if self._event_sink is not None:
+            try:
+                self._event_sink.emit(event)
+            except Exception:
+                pass  # sink 异常不阻断主流程
 
     # ============================================================
     # P2.11: 异步执行（reconcile 真循环 + wait_for_completion）
@@ -777,4 +1021,8 @@ __all__ = [
     "EVENT_TRIAL_COMPLETED", "EVENT_INFERENCE_SERVED",
     # OP-6
     "Orchestrator", "get_orchestrator",
+    # P3.4.3: CloudEvent 外部 sink
+    "EventSink", "FileEventSink",
+    # P3.4.4: K8s Operator 适配层
+    "K8sOperatorAdapter",
 ]

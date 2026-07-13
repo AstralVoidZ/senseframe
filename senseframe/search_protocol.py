@@ -9,9 +9,23 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    runtime_checkable,
+)
 
 from .exploration import ExplorationTracker
+
+if TYPE_CHECKING:
+    # P3.2.4：避免循环导入，HistoryStore 类型注解用 TYPE_CHECKING
+    from .exploration import HistoryStore  # noqa: F401
 
 
 @dataclass
@@ -114,11 +128,19 @@ class TrialResult:
 
 @runtime_checkable
 class Sampler(Protocol):
-    """Sampler 契约（SP-3，P0.5 新增）。
+    """Sampler 契约（SP-3，P0.5 新增；P3.2.1 扩展 warm_start）。
 
     所有 Sampler 必须满足此 Protocol：拥有 `name` 类属性与 `sample` 方法。
     `@runtime_checkable` 使 `isinstance(sampler, Sampler)` 可用，
     仅校验属性/方法存在性，不校验签名。
+
+    P3.2.1 新增：可选 `warm_start` 方法（非强制，不实现则 no-op）。
+    由于 `@runtime_checkable` Protocol 不强制实现所有方法，现有
+    RandomSampler/GridSampler/EvolutionarySampler/AutoAugmentSampler/
+    ASHASampler/HyperbandSampler 无需修改即可继续通过
+    `isinstance(x, Sampler)` 检查。EvolutionarySampler 和
+    AutoAugmentSampler 实现 warm_start 作为元学习受益示例（用源数据集
+    成功策略作为初始 population 的种子）。
     """
     name: str  # 类属性（采样策略名）
 
@@ -127,6 +149,12 @@ class Sampler(Protocol):
         search_space: "SearchSpace",
         history: List[Dict[str, Any]],
     ) -> Dict[str, Any]: ...
+
+    # P3.2.1 新增：可选 warm_start 方法（非强制，不实现则 no-op）
+    def warm_start(
+        self,
+        source_history: List[Dict[str, Any]],
+    ) -> None: ...
 
 
 _SAMPLERS: Dict[str, type] = {}
@@ -167,6 +195,15 @@ class RandomSampler:
                 params[p.name] = random.choice(p.choices)
         return params
 
+    def warm_start(self, source_history: List[Dict[str, Any]]) -> None:
+        """P3.2.1 ε4 元学习：no-op（RandomSampler 不从 warm-start 受益）。
+
+        保留此方法仅为满足 Python 3.12+ @runtime_checkable Protocol
+        的 isinstance 检查（要求所有 Protocol 方法存在）。RandomSampler
+        是无状态采样器，不从源数据集历史偏向中受益。
+        """
+        return None
+
 
 class GridSampler:
     """网格采样器（SP-3 内置）。"""
@@ -194,6 +231,14 @@ class GridSampler:
         idx = len(history) % len(all_combos)
         combo = all_combos[idx]
         return {p.name: v for p, v in zip(search_space.parameters, combo)}
+
+    def warm_start(self, source_history: List[Dict[str, Any]]) -> None:
+        """P3.2.1 ε4 元学习：no-op（GridSampler 按 grid 顺序采样，不受 history 影响）。
+
+        保留此方法仅为满足 Python 3.12+ @runtime_checkable Protocol
+        的 isinstance 检查。
+        """
+        return None
 
 
 # 注册内置 Sampler
@@ -363,6 +408,14 @@ class ASHASampler:
 
         return trial_id not in kept_ids
 
+    def warm_start(self, source_history: List[Dict[str, Any]]) -> None:
+        """P3.2.1 ε4 元学习：no-op（ASHA 采样与 RandomSampler 等价，区别仅在 should_prune）。
+
+        保留此方法仅为满足 Python 3.12+ @runtime_checkable Protocol
+        的 isinstance 检查。
+        """
+        return None
+
 
 class HyperbandSampler:
     """Hyperband Sampler + Pruner（P2.2）。
@@ -456,6 +509,14 @@ class HyperbandSampler:
 
         return trial_id not in kept_ids
 
+    def warm_start(self, source_history: List[Dict[str, Any]]) -> None:
+        """P3.2.1 ε4 元学习：no-op（Hyperband 采样与 RandomSampler 等价，区别仅在 should_prune）。
+
+        保留此方法仅为满足 Python 3.12+ @runtime_checkable Protocol
+        的 isinstance 检查。
+        """
+        return None
+
 
 # 注册为 Sampler + Pruner（同时具备采样与早停能力）
 register_sampler("asha", ASHASampler)
@@ -486,8 +547,24 @@ class StudyManager:
         direction: str = "maximize",
         search_space: Optional[SearchSpace] = None,
         sampler: str = "random",
+        warm_start_from: Optional[str] = None,
+        history_store: Optional["HistoryStore"] = None,
     ) -> str:
-        """创建 Study（SP-1）。"""
+        """创建 Study（SP-1；P3.2.4 扩展 warm-start）。
+
+        Args:
+            name: Study 名称
+            direction: 优化方向，"maximize" 或 "minimize"
+            search_space: 搜索空间（None 时使用空 SearchSpace）
+            sampler: 采样器名（注册到 SP Sampler 注册表）
+            warm_start_from: P3.2.4 新增——源数据集名（如 "UT_HAR_data"），
+                用于从该数据集历史 warm-start 当前 study。None 表示不 warm-start。
+            history_store: P3.2.4 新增——HistoryStore 实例，用于加载源数据集历史。
+                与 warm_start_from 配合使用；若 warm_start_from 为 None 则忽略。
+
+        Returns:
+            study_id
+        """
         study_id = f"study_{uuid.uuid4().hex[:8]}"
         study = StudySpec(
             study_id=study_id, name=name, direction=direction,
@@ -497,6 +574,13 @@ class StudyManager:
         with self._lock:
             self._studies[study_id] = study
             self._trackers[study_id] = ExplorationTracker()
+
+        # P3.2.4: warm-start 注入（延迟导入 MetaLearner 避免循环）
+        if warm_start_from and history_store is not None:
+            from .automl.meta_learner import MetaLearner
+            meta_learner = MetaLearner(self, history_store)
+            meta_learner.warm_start(study_id, warm_start_from)
+
         return study_id
 
     def get_study(self, study_id: str) -> Optional[StudySpec]:

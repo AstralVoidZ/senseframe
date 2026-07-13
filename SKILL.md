@@ -1,11 +1,13 @@
 ---
 name: "senseframe"
-description: "AI Agent 驱动的 AutoML 训练框架。Invoke when user wants to train/evaluate/export models, register custom strategies (loss/metric/task_type/model/scene/normalization), profile data, compose stage pipelines, inject factories, load extensions, run HPO, use self-supervised paradigm, introspect pipeline contracts, verify artifact integrity, release training resources, handle structured SenseFrameError exceptions via error_code, activate lazy scenes, resume failed pipelines, or manage exploration history and skills."
+description: "AI Agent 驱动的 AutoML 训练框架（RFC-003 五层协议栈）。Invoke when user wants to train/evaluate/export models, register custom strategies (loss/metric/task_type/model/scene/normalization), profile data, compose stage pipelines, inject factories, load extensions, run HPO, use self-supervised paradigm, run NAS (DARTS/ENAS), AutoAugment search, meta-learning warm-start, orchestrate pipelines via OP (Orchestrator), run ε6 comparison experiments (Method/Baseline/ExperimentRunner), use multi-fidelity early pruning (ASHA/Hyperband), persist OP runs to store, introspect pipeline contracts, verify artifact integrity, release training resources, handle structured SenseFrameError exceptions via error_code, activate lazy scenes, resume failed pipelines, or manage exploration history and skills."
 ---
 
 # SenseFrame
 
 Agent 驱动的 AutoML 训练框架。提供可编程原语库 + 执行底座 + 安全护栏，Agent 持有训练流程控制权。
+
+**RFC-003 五层协议栈**：DSP（数据交换）/ SP（搜索协议 Ask-Tell）/ IP（自省协议）/ OBP（观测性）/ OP（编排协议）。所有高级能力（HPO / NAS / AutoAugment / 元学习 / 对比实验）均通过 SP+OP 编排，可被 Agent 程序化驱动。
 
 ## 何时调用
 
@@ -24,6 +26,12 @@ Agent 驱动的 AutoML 训练框架。提供可编程原语库 + 执行底座 + 
 - 查询 pipeline / context / 数据契约（自省 API）
 - 管理探索历史与技能库（策略复用）
 - 从失败 stage 断点续跑 pipeline
+- **P3 — 神经架构搜索**：DARTS（可微）/ ENAS（权重共享）/ Evolutionary
+- **P3 — AutoAugment 数据增强搜索**：搜索最优增强策略组合
+- **P3 — 元学习 warm-start**：用源数据集成功策略 warm-start 目标数据集 SP Study
+- **P3 — Multi-fidelity 早停**：ASHA / Hyperband pruner 剪枝差 trial
+- **P3 — OP 编排（Orchestrator）**：create_run + start + reconcile + complete/fail + 事件订阅 + 持久化
+- **P3 — ε6 对比实验**：MethodRunner（SP 驱动）/ BaselineRunner（固定参数）/ ExperimentRunner（编排聚合）/ ComparisonReport
 
 ## 前置条件
 
@@ -408,6 +416,265 @@ ctx2.stage_checkpoint_path = ctx.output_dir / "pipeline_checkpoint.json"
 result = pipeline.run(ctx2)
 ```
 
+## RFC-003 SP：搜索协议（Ask-Tell 标准化接口）
+
+所有搜索驱动能力（HPO / NAS / AutoAugment / ε6 Method / 元学习）均通过 SP ask/tell 接口驱动。对齐 Optuna Study/Trial/Sampler 范式 + Google Vizier RPC 思想。
+
+```python
+import senseframe as sf
+from senseframe.search_protocol import (
+    ParameterSpec, SearchSpace, StudyManager, get_study_manager,
+    RandomSampler, GridSampler, register_sampler, list_samplers,
+    register_pruner, list_pruners, Pruner,
+)
+
+# 1. 构造搜索空间
+space = SearchSpace(parameters=[
+    ParameterSpec(name="lr", type="float", low=1e-4, high=1e-2, log=True),
+    ParameterSpec(name="batch_size", type="int", low=8, high=64, step=8),
+    ParameterSpec(name="optimizer", type="categorical",
+                  choices=["adam", "sgd", "adamw"]),
+])
+
+# 2. 创建 Study（可选指定 sampler / pruner / warm_start_from / history_store）
+sm = StudyManager()  # 或 get_study_manager() 全局单例
+study_id = sm.create_study(
+    name="hpo_run", direction="maximize",
+    search_space=space, sampler="random",
+)
+
+# 3. Ask-Tell 循环
+for _ in range(n_trials):
+    trial = sm.ask(study_id)               # SP 采样参数
+    config = apply_params(base_config, trial.params)
+    output = sf.run_experiment(config)
+    val_acc = output.final_eval.get("val_accuracy", 0.0)
+    sm.tell(trial.trial_id, value=val_acc)  # SP 记录结果
+
+# 4. 查询最优
+best = sm.best_trial(study_id)
+trials = sm.list_trials(study_id)
+```
+
+| API | 说明 |
+|-----|------|
+| `StudyManager()` / `get_study_manager()` | Study 管理器（实例 / 全局单例） |
+| `sm.create_study(name, direction, search_space, sampler, pruner?, warm_start_from?, history_store?)` | 创建 Study |
+| `sm.ask(study_id)` | 采样一次 trial（返回 `TrialSpec`） |
+| `sm.tell(trial_id, value, intermediate_values?, state?, feedback?)` | 报告 trial 结果 |
+| `sm.best_trial(study_id)` | 查询最优 trial |
+| `sm.list_trials(study_id)` | 列出全部 trial |
+| `register_sampler(name, cls)` / `list_samplers()` | Sampler 注册表 |
+| `register_pruner(name, cls)` / `list_pruners()` | Pruner 注册表 |
+
+内置 Sampler（`senseframe.search_protocol` 注册表）：
+- 默认可用：`random` / `grid` / `tpe`（random_fallback）/ `asha` / `hyperband`
+- 显式 import 子模块后可用：`darts`（`from senseframe.nas import DARTSSampler`）/ `enas` / `evolutionary`（`from senseframe.nas.sampler import ENASSampler, EvolutionarySampler`）/ `autoaugment`（`from senseframe.autoaugment import AutoAugmentSampler`）
+
+内置 Pruner：`asha` / `hyperband`（同时实现 Sampler + Pruner Protocol，可作 sampler 创建即获得早停能力）
+
+## RFC-003 ε1：损失函数搜索
+
+通过 SP ask/tell 驱动损失函数组合搜索（loss + label_smoothing），验证协议栈可行性。
+
+```python
+import senseframe as sf
+from senseframe.automl import build_loss_search_space, run_loss_search, LossSearchResult
+
+space = build_loss_search_space(include_label_smoothing=True)
+result = run_loss_search(config, n_trials=10, direction="maximize",
+                         metric="val_accuracy", sampler="random")
+print(f"best: {result.best_params} -> {result.best_value}")
+```
+
+## RFC-003 ε6：对比实验（Method / Baseline / Experiment）
+
+ε6 是 RFC-003 协议栈的"应用落地形态"：Method 组走 SP 驱动搜索，Baseline 组用固定参数作基准，ExperimentRunner 编排聚合 + 输出 ComparisonReport（DSP 合规）。
+
+```python
+import senseframe as sf
+from senseframe.experiment import (
+    MethodConfig, BaselineConfig, ExperimentDesign, ExperimentBudget,
+    MethodRunner, BaselineRunner, ExperimentRunner, ComparisonReport,
+    TrialGroup, TrialStatus,
+)
+
+# 1. Method 组：SP 驱动搜索
+method_config = MethodConfig(
+    name="hpo_method", base_config=base_config,
+    search_space=space, metric="val_accuracy", direction="maximize",
+)
+sm = sf.StudyManager()
+study_id = sm.create_study(name="exp", direction="maximize",
+                           search_space=space, sampler="random")
+method_runner = MethodRunner(config=method_config, study_id=study_id,
+                             study_manager=sm, experiment_id="exp_001")
+
+# 2. Baseline 组：固定参数（不走 SP）
+baseline_config = BaselineConfig(
+    name="paper_baseline", base_config=base_config,
+    group=TrialGroup.BASELINE_PAPER, reported_metrics={"val_accuracy": 0.85},
+)
+baseline_runner = BaselineRunner(config=baseline_config, experiment_id="exp_001")
+
+# 3. ExperimentRunner：编排聚合
+design = ExperimentDesign(
+    name="exp", datasets=["UT_HAR_data"], models=["ResNet18"],
+    method=method_config, baselines=[baseline_config],
+    budget=ExperimentBudget(max_trials_per_group=5, n_repeats=1),
+)
+exp_runner = ExperimentRunner(design=design, experiment_id="exp_001")
+report = exp_runner.run()  # 自动驱动 Method + Baseline，聚合为 ComparisonReport
+report.save("reports/exp_001.json")
+```
+
+| Runner | 驱动方式 | 用途 |
+|--------|----------|------|
+| `MethodRunner` | SP ask/tell | 搜索驱动试验（HPO / NAS / ε1 loss） |
+| `BaselineRunner` | 固定参数 / 论文报告值 | 对比基准（BASELINE_REPRO / BASELINE_PAPER） |
+| `ExperimentRunner` | 编排 Method + Baseline | 端到端对比实验，输出 ComparisonReport |
+
+**P2.12 OP 迁移**：MethodRunner 支持 `use_op=True` 通过 Orchestrator 编排 run_pipeline（create_run + start + complete/fail + CloudEvent 发射），ExperimentRunner 可订阅 OP 事件实现事件驱动聚合。
+
+## P3：神经架构搜索（NAS）
+
+DARTS（可微 NAS）+ ENAS（权重共享）+ Evolutionary Sampler，全部注册到 SP Sampler 注册表。
+
+```python
+from senseframe.nas import DARTSSampler, DARTSPipelineRun, ENASSampler
+from senseframe.nas.search_space import NASSearchSpace
+
+# 方式 A：注册到 SP，用 ask/tell 驱动
+sf.register_sampler("darts", DARTSSampler)  # 已内置注册
+
+# 方式 B：直接运行 DARTSPipelineRun（含 supernet 训练 + arch 搜索）
+from senseframe.nas.darts import DARTSPipelineRun
+run = DARTSPipelineRun(
+    supernet=supernet, search_space=nas_space,
+    train_loader=train_loader, val_loader=val_loader,
+    n_epochs=50, lr_arch=3e-4, lr_w=1e-3,
+)
+result = run.run(train_loader, val_loader)
+# result = {"best_arch": ..., "final_alpha": ..., "history": [...]}
+```
+
+**资源泄露修复（RFC-005）**：DARTSPipelineRun.run() 用 try/finally 显式释放 supernet / optimizer / iterator；DARTSSampler.update() 用 `.detach().clone()` 切断计算图引用 + `zero_grad(set_to_none=True)` 释放 grad tensor；`_InfiniteLoader` 实现 close() + context manager 关闭 DataLoader worker 进程。
+
+## P3：AutoAugment 数据增强搜索
+
+搜索最优数据增强策略组合（基于 SP ask/tell）。
+
+```python
+from senseframe.autoaugment import (
+    AutoAugmentSampler, AutoAugmentPolicyBuilder, AugmentationSearchSpace,
+    make_autoaugment_datamodule_factory,
+)
+
+# 1. 构造增强搜索空间
+aug_space = AugmentationSearchSpace.build_default()
+
+# 2. 创建 SP Study
+sm = sf.StudyManager()
+study_id = sm.create_study(name="autoaug", direction="maximize",
+                           search_space=aug_space.to_sp_search_space(),
+                           sampler="autoaugment")
+
+# 3. Ask-Tell 循环（每次 trial 是一组增强策略）
+trial = sm.ask(study_id)
+policy = AutoAugmentPolicyBuilder().from_params(trial.params).build()
+# 用 policy 训练，把 val_accuracy 回报给 sm.tell(...)
+```
+
+## P3：元学习 warm-start
+
+用源数据集成功策略 warm-start 目标数据集 SP Study（迁移学习对搜索空间的偏向）。
+
+```python
+from senseframe.automl.meta_learner import MetaLearner
+
+learner = MetaLearner()
+# 从源数据集历史中提取成功策略
+learner.warm_start(study_id=target_study_id,
+                   source_dataset="UT_HAR_data",
+                   success_threshold=0.7)
+
+# 或在 create_study 时直接指定 warm_start_from
+study_id = sm.create_study(
+    name="target", direction="maximize", search_space=space,
+    sampler="random",
+    warm_start_from=source_history,  # List[Dict]：源数据集 trial 历史
+)
+```
+
+**Sampler warm_start 契约**：`Sampler` Protocol 的 `warm_start(source_history)` 方法是可选的（`@runtime_checkable` 不强制实现）。`EvolutionarySampler` / `AutoAugmentSampler` 实现 warm_start 作为元学习受益示例（用源数据集成功策略作为初始 population 种子）。`RandomSampler` / `GridSampler` / `ASHASampler` / `HyperbandSampler` 的 warm_start 是 no-op（无状态采样器，不从 history 受益），保留方法仅为满足 Python 3.12+ `@runtime_checkable` Protocol 的 isinstance 检查。
+
+## P3：Multi-fidelity 早停（ASHA / Hyperband）
+
+```python
+from senseframe.search_protocol import ASHASampler, HyperbandSampler
+
+# ASHA 同时是 Sampler + Pruner（采样=随机，剪枝=Successive Halving）
+pruner = ASHASampler(max_resource=81, eta=3, direction="maximize")
+
+# 在 MethodRunner 中注入 pruner
+runner = MethodRunner(config=method_config, study_id=study_id,
+                      study_manager=sm, pruner=pruner, experiment_id="exp")
+result = runner.run(dataset="UT_HAR_data", model_id="ResNet18", run_idx=0)
+# 训练后 MethodRunner 自动检查 should_prune，True 则标记 trial 为 pruned
+```
+
+## P3：OP 编排（Orchestrator）
+
+OP（Orchestration Protocol）提供 PipelineRun 状态机 + CloudEvent 发射 + 持久化 + 异步执行能力。
+
+```python
+from senseframe.orchestration import (
+    Orchestrator, PipelineDef, PipelineRun, get_orchestrator,
+    PHASE_PENDING, PHASE_RUNNING, PHASE_SUCCEEDED, PHASE_FAILED, PHASE_PAUSED,
+    EVENT_PIPELINE_STARTED, EVENT_PIPELINE_SUCCEEDED, EVENT_PIPELINE_FAILED,
+)
+
+orch = Orchestrator()  # 或 get_orchestrator() 全局单例
+try:
+    pdef = PipelineDef(name="my_pipeline")
+    pipeline_id = orch.create_pipeline(pdef)
+    run_id = orch.create_run(pipeline_id, params={"lr": 0.001})
+
+    # 同步路径：start → run_pipeline → complete/fail
+    orch.start(run_id)  # → PHASE_RUNNING + emit EVENT_PIPELINE_STARTED
+    try:
+        output = sf.run_pipeline(config)
+        orch.complete(run_id, output_uri=str(output.output_dir))
+    except Exception as e:
+        orch.fail(run_id, error=str(e))
+        raise
+
+    # 异步路径：start_and_execute → Future + wait_for_completion
+    future = orch.start_and_execute(run_id, pipeline=my_pipeline)
+    orch.wait_for_completion(run_id, timeout=600)
+finally:
+    orch.shutdown()  # 关闭 ThreadPoolExecutor + 置 None
+```
+
+| API | 说明 |
+|-----|------|
+| `Orchestrator()` / `get_orchestrator()` | 编排器（实例 / 全局单例） |
+| `orch.create_pipeline(pdef)` | 创建 Pipeline 定义 |
+| `orch.create_run(pipeline_id, params)` | 创建 PipelineRun（PHASE_PENDING） |
+| `orch.start(run_id)` / `pause` / `resume` / `retry` / `stop` | 状态机转移 |
+| `orch.complete(run_id, output_uri)` | 标记成功（PHASE_SUCCEEDED） |
+| `orch.fail(run_id, error, stage_name)` | 标记失败（PHASE_FAILED） |
+| `orch.reconcile(run_id, pipeline)` | 同步驱动 Pipeline 执行（含 stage 包装 + checkpoint + 事件） |
+| `orch.start_and_execute(run_id, pipeline)` | 异步执行，返回 `Future` |
+| `orch.wait_for_completion(run_id, timeout)` | 阻塞等待 run 完成 |
+| `orch.subscribe(event_type, callback)` | 订阅 CloudEvent，返回 unsubscribe 函数 |
+| `orch.list_runs()` / `orch.get_run(run_id)` | 查询 run |
+| `orch.shutdown()` | 关闭 ThreadPoolExecutor（必调用，避免泄露） |
+
+**P3.4 OP 持久化**：`Orchestrator(store=FileOrchestrationStore(...))` 把 PipelineRun + 事件持久化到磁盘，支持跨进程恢复（K8s Operator 适配）。`store=None` 时仅内存（默认）。
+
+**事件订阅资源管理（RFC-005）**：`subscribe` 返回 unsubscribe 函数；ExperimentRunner 用 try/finally + `_unsubscribe_all()` 确保异常路径也释放订阅。`shutdown(wait=False)` 关闭 ThreadPool + 置 None，避免进程退出后线程残留。
+
 ## 自监督训练
 
 两阶段训练：EntLoss 无监督预训练 + CrossEntropyLoss 监督微调。仅支持 NTU-Fi_HAR 数据集。
@@ -458,10 +725,14 @@ class MyScene(SceneContainer):
 - **自愈重试**：无人值守训练启用 `--retry`
 - **错误码驱动**：基于 `error_code` 做程序化决策，捕获 `SenseFrameError` 子类
 - **资源释放**：长任务/HPO 后调 `release_resources()`，避免泄露
-- **产物溯源**：训练后用 `verify_artifacts()` 校验产物完整性
+- **产物溯源**：训练后用 `verify_artifacts(output_dir)` 校验产物完整性（接受目录路径，返回 `{产物名: bool}`）
 - **内省优先**：组装 pipeline 前用 `sf.context_schema()` / `sf.stage_io()` 查询字段契约，避免读源码
-- **探索闭环**：每次试验后记录 `record_trial`，成功策略 `save_skill` 落库复用
+- **探索闭环**：每次试验后记录 `record_trial`（或 `add_trial`），成功策略 `save_skill` 落库复用
 - **断点续跑**：长 pipeline 失败后用 `Pipeline.resume(output_dir)` 从失败 stage 恢复
+- **SP 驱动搜索**：HPO/NAS/AutoAugment/ε6 Method 统一走 SP ask/tell，不要绕过协议栈
+- **OP 编排必释放**：`Orchestrator` 用完必调 `shutdown()`，避免 ThreadPool 泄露；`subscribe` 返回的 unsubscribe 函数用 try/finally 确保调用
+- **stage 名不带前缀**：调用 `sf.stage_io()` / `pipeline.check_readiness()` 时用 `"train"`/`"eval"`（无 `stage_` 前缀）；`ctx.filled_at()` 用带前缀名 `"stage_load"`
+- **NAS 资源管理**：DARTSPipelineRun 用 try/finally 释放 supernet/optimizer/iterator；DARTSSampler 用 `.detach().clone()` 切断计算图引用
 
 ## 参考资源
 

@@ -81,6 +81,10 @@ class ExplorationTracker:
             self.history.append(entry)
             return trial_id
 
+    # 别名：commands/*.md 与类 docstring 使用 record_trial 名称，保持向后兼容
+    # 签名兼容：record_trial(trial_id=..., strategy=..., result=...) 与 add_trial 关键字顺序不同但均可关键字调用
+    record_trial = add_trial
+
     def list_trials(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         """列出试验（可按状态过滤）。
 
@@ -406,6 +410,84 @@ class ExplorationTracker:
             return [self.get_trial(tid) for tid in trial_ids]
 
 
+# ============================================================
+# HistoryStore：跨 Study 历史持久化（P3.2.2，ε4 元学习）
+# ============================================================
+class HistoryStore:
+    """跨 Study 历史持久化（按 dataset 索引）。
+
+    P3.2.2 ε4 元学习的持久化层：将 ExplorationTracker 的 history
+    序列化为 JSON 文件，按 dataset 分目录存储，使新 Study 可通过
+    MetaLearner 加载源数据集历史进行 warm-start。
+
+    存储路径：``{base_dir}/{dataset}/history.json``
+
+    Usage:
+        from senseframe.exploration import HistoryStore, ExplorationTracker
+
+        store = HistoryStore(base_dir=Path("/tmp/sf_history"))
+        store.save_history("UT_HAR_data", tracker)
+        history = store.load_history("UT_HAR_data")  # 加载成功则返回 list
+        history = store.load_history("nonexistent")  # 不存在则返回空 list
+    """
+
+    def __init__(self, base_dir):
+        """初始化 HistoryStore。
+
+        Args:
+            base_dir: 历史存储根目录（Path 或 str）
+        """
+        self.base_dir = Path(base_dir)
+
+    def save_history(self, dataset: str, tracker: "ExplorationTracker") -> None:
+        """保存 Study 历史到 ``{base_dir}/{dataset}/history.json``。
+
+        Args:
+            dataset: 数据集名（作为子目录名）
+            tracker: ExplorationTracker 实例（序列化其 history 字段）
+        """
+        target_dir = self.base_dir / dataset
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / "history.json"
+        target_path.write_text(
+            json.dumps(tracker.history, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def load_history(self, dataset: str) -> List[Dict[str, Any]]:
+        """加载指定数据集的历史。
+
+        Args:
+            dataset: 数据集名
+
+        Returns:
+            历史条目列表；数据集不存在时返回空 list（不抛异常）
+        """
+        target_path = self.base_dir / dataset / "history.json"
+        if not target_path.exists():
+            return []
+        try:
+            data = json.loads(target_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return data
+
+    def list_datasets(self) -> List[str]:
+        """列出已存储的数据集。
+
+        Returns:
+            数据集名列表（按字母序）；空目录返回空 list
+        """
+        if not self.base_dir.exists():
+            return []
+        return sorted(
+            p.name for p in self.base_dir.iterdir()
+            if p.is_dir() and (p / "history.json").exists()
+        )
+
+
 def _strategy_key(strategy: Dict[str, Any]) -> str:
     """生成策略的规范化键（用于去重比较）。"""
     return json.dumps(strategy, sort_keys=True, ensure_ascii=False)
@@ -675,4 +757,4 @@ class SearchSpaceMap:
         }
 
 
-__all__ = ["ExplorationTracker", "SearchSpaceMap"]
+__all__ = ["ExplorationTracker", "SearchSpaceMap", "HistoryStore"]

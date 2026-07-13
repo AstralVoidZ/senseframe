@@ -163,14 +163,30 @@ class MethodRunner:
         except Exception as e:
             error = e
 
-        # 根据 train_output 状态回写 OP 状态
+        # 资源泄露修复：OP 状态回写保护
+        # orch.complete / orch.fail 可能抛异常（状态机 transition 校验失败、
+        # _persist_run I/O 失败等），若不保护会导致 OP 状态永远卡 PHASE_RUNNING，
+        # 且会掩盖原 run_pipeline 异常。此处用 try/except 隔离 OP 回写失败，
+        # 仅记录日志，不影响主流程异常传播。
         if train_output is not None and train_output.status == "success" and error is None:
-            orch.complete(run_id, output_uri=str(train_output.output_dir or ""))
+            try:
+                orch.complete(run_id, output_uri=str(train_output.output_dir or ""))
+            except Exception as orch_err:
+                logger.warning(
+                    "OP complete failed for run_id=%s (state may be stuck): %s",
+                    run_id, orch_err,
+                )
         else:
             err_msg = str(error) if error is not None else (
                 train_output.error if train_output is not None else "unknown error"
             )
-            orch.fail(run_id, error=err_msg)
+            try:
+                orch.fail(run_id, error=err_msg)
+            except Exception as orch_err:
+                logger.warning(
+                    "OP fail failed for run_id=%s (state may be stuck): %s",
+                    run_id, orch_err,
+                )
 
         # 若有异常，重新抛出（保持与直接 run_pipeline 一致的异常语义）
         if error is not None:

@@ -1,23 +1,26 @@
-"""RFC-003 ε2 NAS：神经架构搜索（P2.6-P2.9）。
+"""RFC-003 ε2 NAS：神经架构搜索（P2.6-P2.9 + P3.3 DARTS/ENAS）。
 
 P2 范围（按规划文档第 336 行约束）：
 - ArchitectureSearchSpace：NAS 搜索空间数据结构（DSP 合规）
-- ArchitectureBuilder：架构参数 → nn.Module（仅 conv1d + rnn，attention 推迟到 P3）
+- ArchitectureBuilder：架构参数 → nn.Module（conv1d + rnn + hybrid）
 - EvolutionarySampler：进化算法搜索（变异 + 交叉 + 选择），满足 Sampler Protocol
 - NAS 集成：通过 module_factory 注入 Pipeline（make_nas_module_factory）
 
-P3 路线（推迟）：
-- DARTS / ENAS Sampler
-- attention cell_type
-- 可微架构搜索
+P3.3 范围（按规划文档第 429-432 行约束）：
+- AttentionNet + ArchitectureBuilder._build_attention：Transformer 风格架构
+- DARTSSampler：可微架构搜索（梯度-based，双优化）
+- DARTSPipelineRun：DARTS 特殊 PipelineRun（内部双优化）
+- ENASSampler：权重共享 NAS（controller-based）
+- ArchitectureSearchSpace 扩展 attention cell_type
 """
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
 from .search_space import ArchitectureSearchSpace, ArchitectureParameterSpec
-from .builder import ArchitectureBuilder
-from .sampler import EvolutionarySampler
+from .builder import ArchitectureBuilder, AttentionNet
+from .sampler import EvolutionarySampler, ENASSampler
+from .darts import DARTSSampler, DARTSPipelineRun
 
 
 def make_nas_module_factory(
@@ -68,6 +71,10 @@ __all__ = [
     "ArchitectureSearchSpace",
     "ArchitectureParameterSpec",
     "ArchitectureBuilder",
+    "AttentionNet",
     "EvolutionarySampler",
+    "ENASSampler",
+    "DARTSSampler",
+    "DARTSPipelineRun",
     "make_nas_module_factory",
 ]

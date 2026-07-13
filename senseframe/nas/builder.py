@@ -1,4 +1,4 @@
-"""RFC-003 ε2 NAS：架构构建器（P2.7）。
+"""RFC-003 ε2 NAS：架构构建器（P2.7，P3.3.1 扩展 attention）。
 
 将架构参数 dict 翻译为 nn.Module。
 
@@ -7,12 +7,13 @@ P2 支持：
 - rnn：循环神经网络（LSTM / GRU，可选双向）
 - hybrid：conv1d + rnn 级联
 
-P3 推迟：
-- attention：Transformer 风格架构
+P3.3.1 新增：
+- attention：Transformer 风格架构（Multi-head attention + FFN 堆叠 + 分类头）
 
 输入约定：
 - conv1d / hybrid：input_shape = (channels, length)，模型 flatten 后接 Linear(num_classes)
 - rnn：input_shape = (channels, length)，按 length 转置为 (length, channels) 输入 RNN
+- attention：input_shape = (channels, length)，channels 作为 embedding_dim，length 作为序列长度
 """
 from __future__ import annotations
 
@@ -230,14 +231,71 @@ class HybridNet(nn.Module):
         return self.classifier(self.act(last))
 
 
+class AttentionNet(nn.Module):
+    """Transformer 风格架构（P3.3.1 新增）。
+
+    Multi-head attention + FFN 堆叠 + 分类头。
+
+    输入：(*, channels, length) → 转置为 (*, length, channels) 作为 token 序列
+    输出：(*, num_classes)
+
+    Args:
+        input_shape: (channels, length)，channels 作为 embedding_dim，length 作为序列长度
+        num_classes: 输出类别数
+        n_layers: Transformer encoder 层数
+        d_model: embedding 维度（应等于 channels 或通过线性投影）
+        n_heads: 多头注意力头数
+        dropout: dropout 比率
+        activation: FFN 激活函数（gelu/relu）
+    """
+
+    def __init__(
+        self,
+        input_shape: Tuple[int, ...],
+        num_classes: int,
+        n_layers: int = 4,
+        d_model: int = 64,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+    ):
+        super().__init__()
+        if len(input_shape) < 1:
+            raise ValueError(f"input_shape too short for AttentionNet: {input_shape}")
+        in_channels = int(input_shape[0])
+        # 若 in_channels != d_model，添加投影层
+        self.input_proj = (
+            nn.Linear(in_channels, d_model) if in_channels != d_model else nn.Identity()
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            activation=activation,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.classifier = nn.Linear(d_model, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (*, channels, length) → (*, length, channels)
+        x = x.transpose(-1, -2)
+        x = self.input_proj(x)
+        x = self.encoder(x)
+        # 取 mean pooling 作为序列表示
+        x = x.mean(dim=1)
+        return self.classifier(x)
+
+
 class ArchitectureBuilder:
-    """架构构建器：将 arch_params 翻译为 nn.Module（P2.7）。
+    """架构构建器：将 arch_params 翻译为 nn.Module（P2.7，P3.3.1 扩展 attention）。
 
     根据 cell_type 分发到具体实现：
     - conv1d → Conv1dNet
     - rnn → RNNNet
     - hybrid → HybridNet
-    - attention → P3 推迟
+    - attention → AttentionNet（P3.3.1 新增）
 
     Args:
         arch_params: 架构参数 dict（由 SP Sampler 采样得到）
@@ -279,10 +337,12 @@ class ArchitectureBuilder:
             return self._build_rnn(arch_params, input_shape, num_classes)
         elif cell_type == "hybrid":
             return self._build_hybrid(arch_params, input_shape, num_classes)
+        elif cell_type == "attention":
+            return self._build_attention(arch_params, input_shape, num_classes)
         else:
             raise ValueError(
-                f"Unsupported cell_type '{cell_type}' in P2 "
-                f"(supported: conv1d, rnn, hybrid; attention 推迟到 P3)"
+                f"Unsupported cell_type '{cell_type}' "
+                f"(supported: conv1d, rnn, hybrid, attention)"
             )
 
     def _build_conv1d(
@@ -339,10 +399,28 @@ class ArchitectureBuilder:
             dropout=float(arch_params.get("dropout", 0.1)),
         )
 
+    def _build_attention(
+        self,
+        arch_params: Dict[str, Any],
+        input_shape: Tuple[int, ...],
+        num_classes: int,
+    ) -> AttentionNet:
+        """构建 AttentionNet（P3.3.1 新增）。"""
+        return AttentionNet(
+            input_shape=input_shape,
+            num_classes=num_classes,
+            n_layers=int(arch_params.get("n_layers", 4)),
+            d_model=int(arch_params.get("d_model", 64)),
+            n_heads=int(arch_params.get("n_heads", 4)),
+            dropout=float(arch_params.get("dropout", 0.1)),
+            activation=arch_params.get("activation", "gelu"),
+        )
+
 
 __all__ = [
     "ArchitectureBuilder",
     "Conv1dNet",
     "RNNNet",
     "HybridNet",
+    "AttentionNet",
 ]

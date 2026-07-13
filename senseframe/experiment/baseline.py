@@ -69,7 +69,11 @@ class BaselineRunner:
             )
 
         # BASELINE_REPRO: 跑 run_pipeline（固定参数，不走 SP）
-        modified_config = self.config.base_config
+        # 资源泄露修复：深拷贝 config，避免多个 baseline run 共享同一 base_config
+        # 导致后一个 run 看到前一个 run 修改的 dataset/model_id（跨试验污染）
+        # 对齐 MethodRunner.run() 用 apply_params 做 deepcopy 的语义
+        import copy as _copy
+        modified_config = _copy.deepcopy(self.config.base_config)
         modified_config.scene.dataset = dataset
         modified_config.scene.model_id = model_id
 

@@ -38,7 +38,7 @@ $ARGUMENTS = 原始参数字符串
 
 - 工作目录: `.`（已部署 SenseFrame 的测试目录）
 - SKILL `senseframe` 已加载，API 文档在 `.opencode/skills/senseframe/SKILL.md`
-- 数据集根: `CSI_DATASETS/`
+- 数据集根: `CSI_DATASETS/`（如未部署，可改 `--data-root` 或软链；命令中所有路径均可替换为实际数据根）
 - Python 环境: 已 `pip install -r requirements.txt`
 
 ## Execution Protocol
@@ -105,12 +105,15 @@ python -m senseframe.cli experiment --config configs/test.yaml
 import senseframe as sf
 from pathlib import Path
 
-# 加载 manifest 并校验产物完整性
-manifest = sf.load_manifest(Path("runs/<实验目录>/manifest.json"))
-print(f"artifacts: {len(manifest.artifacts)}")
-report = sf.verify_artifacts(manifest)
-assert report["verified"] == report["total"], f"产物校验失败: {report}"
-print(f"全部 {report['total']} 个产物校验通过")
+# verify_artifacts 接受 output_dir（含 manifest.json），返回 {产物名: hash 是否匹配}
+# 注意：传入目录路径，不是 manifest 对象
+output_dir = Path("runs/<实验目录>")
+report = sf.verify_artifacts(output_dir)
+total = len(report)
+verified = sum(1 for ok in report.values() if ok)
+print(f"产物校验: {verified}/{total} verified")
+assert verified == total, f"产物校验失败: {report}"
+print(f"全部 {total} 个产物校验通过")
 ```
 
 **Introspect — stage by stage**:
@@ -129,7 +132,8 @@ print(f"全部 {report['total']} 个产物校验通过")
 
 **Do**:
 ```bash
-python scripts/postprocess.py --output-dir runs/<实验目录> --models-dir models --result-dir result --eval-script eval.py
+# postprocess.py 会自动生成 eval.py 推理脚本（--eval-script 指定输出路径，默认项目根 eval.py）
+python scripts/postprocess.py --output-dir runs/<实验目录> --models-dir models --result-dir result
 ```
 
 **Output**: 最终交付物（模型权重 + 推理脚本 + manifest）

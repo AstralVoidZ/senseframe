@@ -1,6 +1,9 @@
-"""RFC-003 ε2 NAS：进化算法采样器 + ENAS 采样器（P2.8 + P3.3.3）。
+"""RFC-003 ε3 AutoAugment：进化搜索采样器（P3.1.2）。
 
-EvolutionarySampler 满足 SP Sampler Protocol（@runtime_checkable）。
+AutoAugmentSampler 满足 SP Sampler Protocol（@runtime_checkable）。
+
+P3 实现策略：进化搜索（复用 EvolutionarySampler 思路），
+RL 推迟到后续（需训练 RL controller，实现复杂度高）。
 
 算法（简化进化策略）：
 1. 初始化阶段（population 未满）：随机生成个体
@@ -12,16 +15,7 @@ EvolutionarySampler 满足 SP Sampler Protocol（@runtime_checkable）。
 fitness 来源：从 history 中提取每个 trial 的 value（SP Tell 上报的指标）。
 
 注册：
-- 注册到 SP Sampler 注册表（register_sampler("evolutionary", EvolutionarySampler)）
-- 不注册为 Pruner（EvolutionarySampler 不是早停策略）
-
-P3.3.3 新增 ENASSampler：
-- ENAS（Efficient NAS）：权重共享 NAS（一次训练，多次采样架构）
-- 与 DARTS 区别：ENAS 训练一个超网 controller，评估时共享权重，降低 NAS 评估成本
-- 通过 controller（LSTM）采样架构，所有架构共享同一组权重
-- 简化决策：完整 ENAS controller 是 autoregressive LSTM（逐个决策采样）；
-  本模块实现"简化 ENAS"——controller 是一个简单 MLP/LSTM，一次性输出所有架构决策
-- fallback 路径（无 controller 时）用随机采样
+- 注册到 SP Sampler 注册表（register_sampler("autoaugment", AutoAugmentSampler)）
 """
 from __future__ import annotations
 
@@ -29,9 +23,6 @@ import logging
 import math
 import random
 from typing import Any, Dict, List, Optional, Tuple
-
-import torch
-import torch.nn as nn
 
 from ..search_protocol import (
     Sampler,
@@ -42,11 +33,16 @@ from ..search_protocol import (
 logger = logging.getLogger(__name__)
 
 
-class EvolutionarySampler:
-    """进化算法采样器（P2.8）。
+class AutoAugmentSampler:
+    """AutoAugment 进化搜索采样器（P3.1.2）。
 
     满足 SP Sampler Protocol（name + sample 方法）。
-    通过 register_sampler("evolutionary", EvolutionarySampler) 注册到 SP。
+    通过 register_sampler("autoaugment", AutoAugmentSampler) 注册到 SP。
+
+    与 EvolutionarySampler 的区别：
+    - EvolutionarySampler 用于通用 NAS/HPO 搜索
+    - AutoAugmentSampler 专用于增强策略搜索，默认 mutation_rate 更高（增强策略更激进）
+    - 两者算法相同（进化策略），可独立配置参数
 
     Args:
         population_size: 种群大小（达到后开始进化）
@@ -55,12 +51,12 @@ class EvolutionarySampler:
         direction: 优化方向，"maximize" 或 "minimize"
         seed: 随机种子（None 时不固定）
     """
-    name = "evolutionary"
+    name = "autoaugment"
 
     def __init__(
         self,
         population_size: int = 20,
-        mutation_rate: float = 0.3,
+        mutation_rate: float = 0.4,
         tournament_size: int = 3,
         direction: str = "maximize",
         seed: Optional[int] = None,
@@ -128,11 +124,8 @@ class EvolutionarySampler:
         使后续 sample() 调用跳过初始化阶段，直接进入进化阶段（锦标赛选择
         + 变异），加速收敛。
 
-        与 MetaLearner 的关系：MetaLearner 主要通过将成功策略注入
-        tracker.history 实现 warm-start（sampler.sample 会从 history
-        中读取）。本方法提供额外的实例级 warm-start 机制，用于：
-        - 在 StudyManager.ask 之前预填充 population
-        - 在测试中验证 warm-start 逻辑
+        与 EvolutionarySampler.warm_start 等价（两者算法相同，仅
+        mutation_rate 默认值不同）。
 
         Args:
             source_history: 源数据集的历史（list of dict，含 "strategy"/
@@ -168,8 +161,6 @@ class EvolutionarySampler:
         - entry["result"]["value"]：fitness 值
         - entry["status"]：trial 状态
         """
-        # 用 trial_id / params 哈希去重（避免重复添加）
-        # 简化：用 params 的 frozenset 作为标识
         seen = set()
         for params, fitness in self._population:
             if fitness is not None:
@@ -304,200 +295,7 @@ class EvolutionarySampler:
 
 
 # 注册到 SP Sampler 注册表
-register_sampler("evolutionary", EvolutionarySampler)
+register_sampler("autoaugment", AutoAugmentSampler)
 
 
-# ============================================================
-# P3.3.3: ENASSampler（权重共享 NAS）
-# ============================================================
-class ENASSampler:
-    """ENAS：权重共享 NAS（一次训练，多次采样架构）。
-
-    与 DARTS 区别：ENAS 训练一个超网 controller，
-    评估时共享权重，降低 NAS 评估成本。
-
-    ENAS 通过 controller（LSTM）采样架构，所有架构共享同一组权重。
-
-    简化决策：
-    - 完整 ENAS controller 是 autoregressive LSTM（逐个决策采样，每个决策依赖前一个）
-    - 本模块实现"简化 ENAS"——controller 是一个简单 MLP/LSTM，一次性输出所有架构决策
-    - fallback 路径（无 controller 时）用随机采样
-
-    满足 SP Sampler Protocol（name + sample + warm_start）。
-
-    Args:
-        controller: LSTM controller（nn.Module），None 时延迟构造 + 用随机采样 fallback
-        shared_weights: 共享权重 dict，None 时延迟初始化
-        controller_hidden: controller LSTM hidden dim
-        seed: 随机种子
-    """
-    name = "enas"
-
-    def __init__(
-        self,
-        controller: Optional[nn.Module] = None,
-        shared_weights: Optional[Dict[str, Any]] = None,
-        controller_hidden: int = 64,
-        seed: Optional[int] = None,
-    ):
-        """初始化 ENASSampler。
-
-        Args:
-            controller: LSTM controller（nn.Module），None 时延迟构造
-            shared_weights: 共享权重 dict，None 时延迟初始化
-            controller_hidden: controller LSTM hidden dim
-            seed: 随机种子
-        """
-        self.controller = controller
-        self.shared_weights = shared_weights
-        self.controller_hidden = controller_hidden
-        self._rng = random.Random(seed)
-        # 保留 search_space 引用，用于 controller 构造
-        self._search_space: Optional[SearchSpace] = None
-
-    # ============================================================
-    # SP Sampler Protocol 实现
-    # ============================================================
-    def sample(
-        self,
-        search_space: SearchSpace,
-        history: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """controller 采样架构。
-
-        若 controller 未初始化，则从 search_space 随机采样作为 fallback。
-
-        Args:
-            search_space: SP SearchSpace（含参数规格）
-            history: 已完成 trial 的历史（ENAS 不依赖 history，忽略）
-
-        Returns:
-            采样参数 dict
-        """
-        self._search_space = search_space
-
-        if self.controller is None:
-            # Fallback：随机采样（无 controller 时）
-            return self._random_sample(search_space)
-        # controller forward → 架构决策序列 → arch_params dict
-        return self._controller_sample(search_space)
-
-    def warm_start(self, source_history: List[Dict[str, Any]]) -> None:
-        """P3.2.1 ε4 元学习兼容：no-op（ENAS 通过 controller 训练，不从历史偏向）。
-
-        保留此方法满足 SP Sampler Protocol（@runtime_checkable 要求所有方法存在）。
-        """
-        return None
-
-    # ============================================================
-    # 内部方法
-    # ============================================================
-    def _random_sample(self, search_space: SearchSpace) -> Dict[str, Any]:
-        """随机采样（controller 未初始化时的 fallback）。"""
-        params: Dict[str, Any] = {}
-        for p in search_space.parameters:
-            if p.type == "float":
-                if p.log and p.low is not None and p.high is not None:
-                    params[p.name] = math.exp(
-                        self._rng.uniform(math.log(p.low), math.log(p.high))
-                    )
-                else:
-                    params[p.name] = self._rng.uniform(p.low or 0.0, p.high or 1.0)
-            elif p.type == "int":
-                params[p.name] = self._rng.randint(int(p.low or 0), int(p.high or 100))
-            elif p.type == "categorical" and p.choices:
-                params[p.name] = self._rng.choice(p.choices)
-        return params
-
-    def _controller_sample(self, search_space: SearchSpace) -> Dict[str, Any]:
-        """controller 采样（LSTM forward 得到架构决策）。
-
-        简化实现：
-        - controller 是一个简单 MLP/LSTM，一次性输出所有架构决策
-        - 真实 ENAS controller 是 autoregressive LSTM（逐个决策采样，依赖前一个）
-        - 此处简化为：对每个参数，controller 输出 logits → softmax → 采样
-
-        Args:
-            search_space: SP SearchSpace
-
-        Returns:
-            采样参数 dict
-        """
-        params: Dict[str, Any] = {}
-        # 构造一个 dummy 输入（用于 controller forward）
-        # 用 controller_hidden 维向量作为初始 hidden state
-        # 简化：用 controller forward 一次得到所有决策
-        dummy_input = torch.zeros(1, 1, self.controller_hidden)
-
-        with torch.no_grad():
-            try:
-                output = self.controller(dummy_input)
-                # output 应该是 (1, seq_len, hidden) 或 (1, hidden)
-                if output.dim() == 3:
-                    output = output.squeeze(0).squeeze(0)  # (hidden,)
-                elif output.dim() == 2:
-                    output = output.squeeze(0)  # (hidden,)
-                else:
-                    output = output.flatten()
-            except Exception:
-                # controller forward 失败时 fallback 到随机采样
-                return self._random_sample(search_space)
-
-        # 为每个参数从 output 投影到 choices 空间并采样
-        idx = 0
-        for p in search_space.parameters:
-            if p.type == "categorical" and p.choices:
-                n_choices = len(p.choices)
-                # 从 output 取 n_choices 维作为 logits
-                if output.numel() >= idx + n_choices:
-                    logits = output[idx: idx + n_choices]
-                    probs = torch.softmax(logits, dim=-1)
-                    choice_idx = int(torch.multinomial(probs, 1).item())
-                    params[p.name] = p.choices[choice_idx]
-                    idx += n_choices
-                else:
-                    # output 不足，回退到随机
-                    params[p.name] = self._rng.choice(p.choices)
-            elif p.type == "int":
-                # 用 output 投影到 [low, high] 区间
-                low = int(p.low or 0)
-                high = int(p.high or 100)
-                if output.numel() > idx:
-                    # 用 sigmoid 映射到 [low, high]
-                    val = int(torch.sigmoid(output[idx]).item() * (high - low) + low)
-                    params[p.name] = max(low, min(high, val))
-                    idx += 1
-                else:
-                    params[p.name] = self._rng.randint(low, high)
-            elif p.type == "float":
-                low = float(p.low or 0.0)
-                high = float(p.high or 1.0)
-                if p.log and p.low is not None and p.high is not None:
-                    if output.numel() > idx:
-                        val = math.exp(
-                            torch.sigmoid(output[idx]).item()
-                            * (math.log(p.high) - math.log(p.low))
-                            + math.log(p.low)
-                        )
-                        params[p.name] = val
-                        idx += 1
-                    else:
-                        params[p.name] = math.exp(
-                            self._rng.uniform(math.log(p.low), math.log(p.high))
-                        )
-                else:
-                    if output.numel() > idx:
-                        val = float(torch.sigmoid(output[idx]).item() * (high - low) + low)
-                        params[p.name] = val
-                        idx += 1
-                    else:
-                        params[p.name] = self._rng.uniform(low, high)
-
-        return params
-
-
-# 注册到 SP Sampler 注册表
-register_sampler("enas", ENASSampler)
-
-
-__all__ = ["EvolutionarySampler", "ENASSampler"]
+__all__ = ["AutoAugmentSampler"]

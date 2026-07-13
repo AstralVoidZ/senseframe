@@ -38,7 +38,7 @@ $2 = trial 数 (默认 5)
 
 - 工作目录: `.`（已部署 SenseFrame）
 - SKILL `senseframe` 已加载
-- 数据集: `CSI_DATASETS/`（NTU-Fi-HAR / UT-HAR / Widar3.0）
+- 数据集: `CSI_DATASETS/`（如未部署，可改 `--data-root` 或软链；NTU-Fi-HAR / UT-HAR / Widar3.0）
 - GPU: 8GB 显存，HPO 必须串行（不得并发 trial）
 
 ## Execution Protocol
@@ -80,8 +80,9 @@ sf.activate_lazy_scenes()
 sf.context_schema()
 
 # 查询 stage IO
-sf.stage_io("stage_train")
-sf.stage_io("stage_eval")
+# 注意：stage 名不带 "stage_" 前缀（如 "train"/"eval"），带前缀会返回 not found
+sf.stage_io("train")
+sf.stage_io("eval")
 
 # 查询 pipeline DAG
 sf.pipeline_graph()
@@ -143,9 +144,10 @@ for i in range($2):
     trial_dir = Path(f"runs/trial_{i}")  # 按实际 output_dir 调整
     manifest_path = trial_dir / "manifest.json"
     if manifest_path.exists():
-        m = sf.load_manifest(manifest_path)
-        report = sf.verify_artifacts(m)
-        print(f"trial_{i}: {report['verified']}/{report['total']} verified")
+        # verify_artifacts 接受 output_dir（含 manifest.json），返回 {产物名: hash 是否匹配}
+        report = sf.verify_artifacts(trial_dir)
+        verified = sum(1 for ok in report.values() if ok)
+        print(f"trial_{i}: {verified}/{len(report)} verified")
 ```
 
 **关键要求**:

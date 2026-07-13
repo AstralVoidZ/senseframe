@@ -112,6 +112,11 @@ from .skills import (
 # RFC-002 阶段 L/P：探索状态管理 + 搜索空间地图
 from .exploration import ExplorationTracker, SearchSpaceMap
 
+# RFC-003 场景入口点（方案 B）：顶层暴露 activate_lazy_scenes / get_scene
+# CQS 合规：getter 不再有自动注册副作用，调用方需显式激活延迟场景
+# 命令文件（commands/*.md）与文档均按 sf.activate_lazy_scenes() / sf.get_scene() 心智模型编写
+from .scenes import activate_lazy_scenes, get_scene, list_scenes, has_scene, register_scene
+
 # RFC-003 SP：搜索协议 — Ask-Tell 标准化接口（P0.5 顶层导出）
 from .search_protocol import (
     ParameterSpec,

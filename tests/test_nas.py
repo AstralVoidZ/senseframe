@@ -33,6 +33,10 @@ from senseframe.nas import (
     ArchitectureBuilder,
     ArchitectureParameterSpec,
     ArchitectureSearchSpace,
+    AttentionNet,
+    DARTSPipelineRun,
+    DARTSSampler,
+    ENASSampler,
     EvolutionarySampler,
     make_nas_module_factory,
 )
@@ -104,6 +108,20 @@ def _hybrid_params(**overrides):
         "rnn_type": "lstm",
         "bidirectional": False,
         "dropout": 0.1,
+    }
+    params.update(overrides)
+    return params
+
+
+def _attention_params(**overrides):
+    """构造 attention 架构参数（P3.3.1 新增）。"""
+    params = {
+        "cell_type": "attention",
+        "n_layers": 2,
+        "d_model": 32,
+        "n_heads": 4,
+        "dropout": 0.1,
+        "activation": "gelu",
     }
     params.update(overrides)
     return params
@@ -188,9 +206,9 @@ class TestArchitectureSearchSpace:
         assert set(cell_type_param.choices) == {"conv1d", "rnn"}
 
     def test_unsupported_cell_type_raises(self):
-        """attention cell_type 应在 P2 抛异常（推迟到 P3）。"""
-        with pytest.raises(ValueError, match="Unsupported cell_type 'attention'"):
-            ArchitectureSearchSpace(cell_types=["attention"])
+        """不支持的 cell_type 应抛异常（P3.3.1 后 attention 已支持，改用真正未支持的类型）。"""
+        with pytest.raises(ValueError, match="Unsupported cell_type 'transformer'"):
+            ArchitectureSearchSpace(cell_types=["transformer"])
 
     def test_hybrid_cell_type_supported(self):
         """hybrid cell_type 应支持。"""
@@ -347,10 +365,10 @@ class TestArchitectureBuilder:
             assert out.shape == (2, 7)
 
     def test_build_unsupported_cell_type_raises(self):
-        """不支持的 cell_type 应抛异常。"""
+        """不支持的 cell_type 应抛异常（P3.3.1 后 attention 已支持，改用真正未支持的类型）。"""
         builder = ArchitectureBuilder()
         with pytest.raises(ValueError, match="Unsupported cell_type"):
-            builder.build({"cell_type": "attention"}, (30, 100), 7)
+            builder.build({"cell_type": "transformer"}, (30, 100), 7)
 
     def test_build_missing_cell_type_raises(self):
         """缺少 cell_type 应抛异常。"""
@@ -716,3 +734,720 @@ class TestGrepEvidence:
             "stage_build 应检查 module_factory 非空"
         assert _grep_source(path, "ctx.config.module_factory("), \
             "stage_build 应调用 module_factory"
+
+
+# ============================================================
+# P3.3.1: AttentionNet
+# ============================================================
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
+class TestAttentionNet:
+    """AttentionNet 行为验证（P3.3.1）。"""
+
+    def test_attention_net_construction(self):
+        """AttentionNet 可构造。"""
+        net = AttentionNet(
+            input_shape=(30, 100), num_classes=7,
+            n_layers=2, d_model=32, n_heads=4,
+        )
+        assert isinstance(net, nn.Module)
+
+    def test_attention_net_forward_output_shape(self):
+        """forward 输出形状应为 (batch, num_classes)。"""
+        net = AttentionNet(
+            input_shape=(30, 100), num_classes=7,
+            n_layers=2, d_model=32, n_heads=4,
+        )
+        x = torch.randn(2, 30, 100)
+        out = net(x)
+        assert out.shape == (2, 7)
+
+    def test_attention_net_input_proj_when_channels_mismatch(self):
+        """in_channels != d_model 时应构造投影层（nn.Linear）。"""
+        net = AttentionNet(
+            input_shape=(30, 100), num_classes=7,
+            n_layers=2, d_model=32, n_heads=4,  # 30 != 32
+        )
+        assert isinstance(net.input_proj, nn.Linear)
+
+    def test_attention_net_input_identity_when_channels_match(self):
+        """in_channels == d_model 时应用 nn.Identity。"""
+        net = AttentionNet(
+            input_shape=(32, 100), num_classes=7,
+            n_layers=2, d_model=32, n_heads=4,  # 32 == 32
+        )
+        assert isinstance(net.input_proj, nn.Identity)
+
+    def test_attention_net_backward(self):
+        """可反向传播（梯度可流到 input_proj 与 encoder 参数）。"""
+        net = AttentionNet(
+            input_shape=(30, 100), num_classes=7,
+            n_layers=2, d_model=32, n_heads=4,
+        )
+        x = torch.randn(2, 30, 100)
+        y = torch.randint(0, 7, (2,))
+        out = net(x)
+        loss = nn.functional.cross_entropy(out, y)
+        loss.backward()
+        # input_proj 应有梯度（要么 Linear，要么 Identity 无参数）
+        if isinstance(net.input_proj, nn.Linear):
+            assert net.input_proj.weight.grad is not None
+        # classifier 应有梯度
+        assert net.classifier.weight.grad is not None
+
+    def test_attention_net_with_different_n_heads(self):
+        """不同 n_heads (2/4/8) 都可工作。"""
+        for n_heads in [2, 4, 8]:
+            net = AttentionNet(
+                input_shape=(32, 50), num_classes=5,
+                n_layers=1, d_model=32, n_heads=n_heads,
+            )
+            x = torch.randn(2, 32, 50)
+            out = net(x)
+            assert out.shape == (2, 5)
+
+    def test_attention_net_with_different_activation(self):
+        """gelu / relu 都可工作。"""
+        for act in ["gelu", "relu"]:
+            net = AttentionNet(
+                input_shape=(32, 50), num_classes=5,
+                n_layers=1, d_model=32, n_heads=4,
+                activation=act,
+            )
+            x = torch.randn(2, 32, 50)
+            out = net(x)
+            assert out.shape == (2, 5)
+
+    def test_attention_net_parameter_count(self):
+        """参数量应 > 0。"""
+        net = AttentionNet(
+            input_shape=(30, 100), num_classes=7,
+            n_layers=2, d_model=32, n_heads=4,
+        )
+        n_params = sum(p.numel() for p in net.parameters())
+        assert n_params > 0
+
+
+# ============================================================
+# P3.3.1: ArchitectureBuilder attention 分支
+# ============================================================
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
+class TestArchitectureBuilderAttention:
+    """ArchitectureBuilder attention cell_type 行为验证（P3.3.1）。"""
+
+    def test_build_attention_returns_module(self):
+        """build({"cell_type": "attention", ...}) 应返回 nn.Module。"""
+        builder = ArchitectureBuilder()
+        model = builder.build(_attention_params(), input_shape=(30, 100), num_classes=7)
+        assert isinstance(model, nn.Module)
+        assert isinstance(model, AttentionNet)
+
+    def test_build_attention_default_params(self):
+        """默认参数构造成功（不传 n_layers/d_model/n_heads）。"""
+        builder = ArchitectureBuilder()
+        model = builder.build(
+            {"cell_type": "attention"}, input_shape=(32, 100), num_classes=7,
+        )
+        x = torch.randn(2, 32, 100)
+        out = model(x)
+        assert out.shape == (2, 7)
+
+    def test_build_attention_custom_params(self):
+        """自定义 n_layers/d_model/n_heads 生效。"""
+        builder = ArchitectureBuilder()
+        model = builder.build(
+            _attention_params(n_layers=3, d_model=64, n_heads=8),
+            input_shape=(30, 100), num_classes=7,
+        )
+        # d_model=64, in_channels=30 → 应有 input_proj Linear
+        assert isinstance(model.input_proj, nn.Linear)
+        # encoder 应有 3 层
+        assert model.encoder.num_layers == 3
+
+    def test_build_attention_with_real_input_shape(self):
+        """真实 input_shape=(30, 100) 可工作。"""
+        builder = ArchitectureBuilder()
+        model = builder.build(_attention_params(), input_shape=(30, 100), num_classes=7)
+        x = torch.randn(4, 30, 100)
+        out = model(x)
+        assert out.shape == (4, 7)
+
+    def test_build_attention_supported_cell_type(self):
+        """SUPPORTED_CELL_TYPES 应含 'attention'（P3.3.1 新增）。"""
+        assert "attention" in SUPPORTED_CELL_TYPES
+
+
+# ============================================================
+# P3.3.1: ArchitectureSearchSpace attention 扩展
+# ============================================================
+class TestArchitectureSearchSpaceAttention:
+    """ArchitectureSearchSpace attention cell_type 验证（P3.3.1）。"""
+
+    def test_search_space_with_attention_cell_type(self):
+        """ArchitectureSearchSpace(cell_types=["attention"]) 可构造。"""
+        ss = ArchitectureSearchSpace(cell_types=["attention"])
+        assert ss.cell_types == ["attention"]
+        # 应有 attention 特化参数
+        names = [p.name for p in ss.parameters]
+        assert "cell_type" in names
+        assert "n_layers" in names
+        assert "d_model" in names
+        assert "n_heads" in names
+
+    def test_search_space_attention_to_sp(self):
+        """to_sp_search_space 转换成功（attention 参数可转 SP ParameterSpec）。"""
+        ss = ArchitectureSearchSpace(cell_types=["attention"])
+        sp_ss = ss.to_sp_search_space()
+        assert isinstance(sp_ss, SearchSpace)
+        assert len(sp_ss.parameters) == len(ss.parameters)
+        for p in sp_ss.parameters:
+            assert isinstance(p, ParameterSpec)
+
+    def test_search_space_attention_validate_params(self):
+        """validate_params 通过（合法 attention 参数）。"""
+        ss = ArchitectureSearchSpace(cell_types=["attention"])
+        valid_params = {p.name: p.default for p in ss.parameters if p.default is not None}
+        errors = ss.validate_params(valid_params)
+        assert errors == [], f"合法 attention 参数应通过验证, got errors: {errors}"
+
+    def test_search_space_attention_with_other_cell_types(self):
+        """attention 与 conv1d/rnn 联合构造（参数合并）。"""
+        ss = ArchitectureSearchSpace(cell_types=["conv1d", "rnn", "attention"])
+        assert "attention" in ss.cell_types
+        names = [p.name for p in ss.parameters]
+        # attention 特化参数应存在
+        assert "d_model" in names
+        assert "n_heads" in names
+
+
+# ============================================================
+# P3.3.2: DARTSSampler
+# ============================================================
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
+class TestDARTSSampler:
+    """DARTSSampler 行为验证（P3.3.2）。"""
+
+    def test_darts_sampler_name(self):
+        """sampler.name 应为 'darts'。"""
+        sampler = DARTSSampler()
+        assert sampler.name == "darts"
+
+    def test_darts_sampler_satisfies_protocol(self):
+        """DARTSSampler 应满足 Sampler Protocol。"""
+        sampler = DARTSSampler()
+        assert isinstance(sampler, Sampler)
+
+    def test_darts_sampler_sample_returns_dict(self):
+        """sample() 应返回 dict。"""
+        sampler = DARTSSampler()
+        ss = ArchitectureSearchSpace(cell_types=["conv1d", "rnn"]).to_sp_search_space()
+        params = sampler.sample(ss, [])
+        assert isinstance(params, dict)
+        # 应含 cell_type key
+        assert "cell_type" in params
+
+    def test_darts_sampler_sample_with_empty_alpha(self):
+        """arch_alpha 为空时 sample 应自动初始化 α。"""
+        sampler = DARTSSampler()
+        assert sampler.arch_alpha == {}
+        ss = ArchitectureSearchSpace(cell_types=["conv1d", "rnn"]).to_sp_search_space()
+        sampler.sample(ss, [])
+        # α 应被自动初始化（每个 categorical 参数一个 α 向量）
+        assert len(sampler.arch_alpha) > 0
+        # cell_type 应在 α 中
+        assert "cell_type" in sampler.arch_alpha
+
+    def test_darts_sampler_sample_with_preset_alpha(self):
+        """预设 arch_alpha 时 sample 应使用预设值。"""
+        # 预设 cell_type 的 α 偏向第二个 choice
+        from senseframe.nas.search_space import ArchitectureSearchSpace as ASS
+        ss_arch = ASS(cell_types=["conv1d", "rnn"])
+        sp_ss = ss_arch.to_sp_search_space()
+        # cell_type choices = ["conv1d", "rnn"]（顺序可能不固定，取长度即可）
+        cell_type_param = ss_arch.get_param("cell_type")
+        n_choices = len(cell_type_param.choices)
+        # 构造 α：偏向最后一个 choice（用 data 构造避免 in-place 限制）
+        alpha_data = torch.zeros(n_choices)
+        alpha_data[-1] = 10.0
+        alpha = alpha_data.clone().requires_grad_(True)
+        sampler = DARTSSampler(arch_alpha={"cell_type": alpha})
+        params = sampler.sample(sp_ss, [])
+        # cell_type 应为最后一个 choice
+        assert params["cell_type"] == cell_type_param.choices[-1]
+
+    def test_darts_sampler_update_modifies_alpha(self):
+        """update(gradient) 应修改 arch_alpha（通过 optimizer step）。"""
+        sampler = DARTSSampler()
+        ss = ArchitectureSearchSpace(cell_types=["conv1d"]).to_sp_search_space()
+        sampler.sample(ss, [])
+        # 取 α 的初始值
+        alpha_before = {k: v.clone() for k, v in sampler.arch_alpha.items()}
+        # 构造梯度
+        gradient = {k: torch.ones_like(v) for k, v in sampler.arch_alpha.items()}
+        sampler.update(gradient)
+        # α 应发生变化（Adam 优化器应用了梯度）
+        changed = any(
+            not torch.allclose(alpha_before[k], sampler.arch_alpha[k])
+            for k in sampler.arch_alpha
+        )
+        assert changed, "update() 应修改 arch_alpha"
+
+    def test_darts_sampler_warm_start_no_op(self):
+        """warm_start 应为 no-op（不报错）。"""
+        sampler = DARTSSampler()
+        # 应不抛异常
+        sampler.warm_start([{"params": {"cell_type": "conv1d"}, "result": {"value": 0.5}}])
+
+    def test_darts_sampler_registered(self):
+        """get_sampler('darts') 应返回 DARTSSampler。"""
+        assert "darts" in list_samplers()
+        assert get_sampler("darts") is DARTSSampler
+
+    def test_darts_sampler_optimizer_lazy_init(self):
+        """optimizer 应延迟构造（init 时为 None）。"""
+        sampler = DARTSSampler()
+        assert sampler.optimizer is None
+        # 触发 sample + update
+        ss = ArchitectureSearchSpace(cell_types=["conv1d"]).to_sp_search_space()
+        sampler.sample(ss, [])
+        gradient = {k: torch.ones_like(v) for k, v in sampler.arch_alpha.items()}
+        sampler.update(gradient)
+        # update 后 optimizer 应已构造
+        assert sampler.optimizer is not None
+
+    def test_darts_sampler_sample_with_real_search_space(self):
+        """与真实 SearchSpace 集成（含 conv1d + rnn 参数）。"""
+        sampler = DARTSSampler()
+        ss = ArchitectureSearchSpace(cell_types=["conv1d", "rnn"]).to_sp_search_space()
+        params = sampler.sample(ss, [])
+        # 应返回离散化的合法参数
+        assert "cell_type" in params
+        assert params["cell_type"] in ["conv1d", "rnn"]
+
+
+# ============================================================
+# P3.3.2: DARTSPipelineRun
+# ============================================================
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
+class TestDARTSPipelineRun:
+    """DARTSPipelineRun 行为验证（P3.3.2）。"""
+
+    def test_darts_pipeline_run_construct(self):
+        """DARTSPipelineRun 可构造。"""
+        sampler = DARTSSampler()
+        builder = ArchitectureBuilder()
+        ss = ArchitectureSearchSpace(cell_types=["conv1d"]).to_sp_search_space()
+        run = DARTSPipelineRun(
+            sampler=sampler, builder=builder, search_space=ss,
+            input_shape=(30, 100), num_classes=7, n_epochs=1,
+        )
+        assert run is not None
+        assert run.n_epochs == 1
+
+    def test_darts_pipeline_run_run_with_dummy_data(self):
+        """用 dummy train/val loader 跑通 1 epoch。"""
+        sampler = DARTSSampler()
+        builder = ArchitectureBuilder()
+        ss = ArchitectureSearchSpace(cell_types=["conv1d"]).to_sp_search_space()
+        run = DARTSPipelineRun(
+            sampler=sampler, builder=builder, search_space=ss,
+            input_shape=(30, 100), num_classes=7, n_epochs=2,
+        )
+        # 构造 dummy loader
+        train_loader = [(torch.randn(4, 30, 100), torch.randint(0, 7, (4,))) for _ in range(3)]
+        val_loader = [(torch.randn(4, 30, 100), torch.randint(0, 7, (4,))) for _ in range(3)]
+        result = run.run(train_loader, val_loader)
+        assert isinstance(result, dict)
+
+    def test_darts_pipeline_run_returns_arch(self):
+        """run() 返回 dict 含 best_arch。"""
+        sampler = DARTSSampler()
+        builder = ArchitectureBuilder()
+        ss = ArchitectureSearchSpace(cell_types=["conv1d"]).to_sp_search_space()
+        run = DARTSPipelineRun(
+            sampler=sampler, builder=builder, search_space=ss,
+            input_shape=(30, 100), num_classes=7, n_epochs=1,
+        )
+        train_loader = [(torch.randn(4, 30, 100), torch.randint(0, 7, (4,)))]
+        val_loader = [(torch.randn(4, 30, 100), torch.randint(0, 7, (4,)))]
+        result = run.run(train_loader, val_loader)
+        assert "best_arch" in result
+        assert isinstance(result["best_arch"], dict)
+        assert "cell_type" in result["best_arch"]
+
+    def test_darts_pipeline_run_double_optimization(self):
+        """w 和 α 都被更新（双优化机制实证）。"""
+        sampler = DARTSSampler()
+        builder = ArchitectureBuilder()
+        ss = ArchitectureSearchSpace(cell_types=["conv1d"]).to_sp_search_space()
+        run = DARTSPipelineRun(
+            sampler=sampler, builder=builder, search_space=ss,
+            input_shape=(30, 100), num_classes=7, n_epochs=2,
+        )
+        # 记录 α 的初始值
+        sampler._init_arch_alpha_from_search_space(ss)
+        alpha_before = {k: v.clone() for k, v in sampler.arch_alpha.items()}
+
+        train_loader = [(torch.randn(4, 30, 100), torch.randint(0, 7, (4,))) for _ in range(3)]
+        val_loader = [(torch.randn(4, 30, 100), torch.randint(0, 7, (4,))) for _ in range(3)]
+        result = run.run(train_loader, val_loader)
+
+        # α 应发生变化（被 update 调用）
+        alpha_changed = any(
+            not torch.allclose(alpha_before[k], result["final_alpha"][k])
+            for k in alpha_before
+        )
+        assert alpha_changed, "DARTS 双优化应使 α 被更新"
+
+        # best_arch 应在合法范围内
+        best_arch = result["best_arch"]
+        assert "cell_type" in best_arch
+
+    def test_darts_pipeline_run_history_recorded(self):
+        """返回的 history 含每 epoch 的 loss。"""
+        sampler = DARTSSampler()
+        builder = ArchitectureBuilder()
+        ss = ArchitectureSearchSpace(cell_types=["conv1d"]).to_sp_search_space()
+        run = DARTSPipelineRun(
+            sampler=sampler, builder=builder, search_space=ss,
+            input_shape=(30, 100), num_classes=7, n_epochs=3,
+        )
+        train_loader = [(torch.randn(4, 30, 100), torch.randint(0, 7, (4,))) for _ in range(3)]
+        val_loader = [(torch.randn(4, 30, 100), torch.randint(0, 7, (4,))) for _ in range(3)]
+        result = run.run(train_loader, val_loader)
+        assert "history" in result
+        history = result["history"]
+        assert len(history) == 3
+        for i, entry in enumerate(history):
+            assert entry["epoch"] == i
+            assert "w_loss" in entry
+            assert "alpha_loss" in entry
+
+
+# ============================================================
+# P3 资源泄露修复验证（TestDARTSResourceLeakFix）
+# ============================================================
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
+class TestDARTSResourceLeakFix:
+    """DARTS 资源泄露修复验证（P3 审查）。
+
+    验证以下修复点：
+    - alpha_loss 计算图不累积（torch.no_grad 包裹）
+    - alpha_grad 用 .detach() 切断外部引用
+    - run() try/finally 释放 supernet / optimizer / iterator
+    - _InfiniteLoader.close() 释放 loader 引用
+    - DARTSSampler.cleanup() 释放 arch_alpha / optimizer
+    """
+
+    def test_darts_sampler_cleanup_releases_resources(self):
+        """DARTSSampler.cleanup() 释放 arch_alpha 和 optimizer。"""
+        sampler = DARTSSampler()
+        ss = ArchitectureSearchSpace(cell_types=["conv1d"]).to_sp_search_space()
+        sampler._init_arch_alpha_from_search_space(ss)
+        # 触发 optimizer 构造
+        grad = {k: torch.randn_like(v) for k, v in sampler.arch_alpha.items()}
+        sampler.update(grad)
+        assert sampler.optimizer is not None
+        assert len(sampler.arch_alpha) > 0
+        # cleanup
+        sampler.cleanup()
+        assert sampler.optimizer is None
+        assert len(sampler.arch_alpha) == 0
+        assert sampler._search_space is None
+
+    def test_darts_pipeline_run_releases_supernet_after_run(self):
+        """run() 结束后 supernet 被 del（无强引用残留）。"""
+        import gc
+        import weakref
+        sampler = DARTSSampler()
+        builder = ArchitectureBuilder()
+        ss = ArchitectureSearchSpace(cell_types=["conv1d"]).to_sp_search_space()
+        run = DARTSPipelineRun(
+            sampler=sampler, builder=builder, search_space=ss,
+            input_shape=(30, 100), num_classes=7, n_epochs=1,
+        )
+        train_loader = [(torch.randn(4, 30, 100), torch.randint(0, 7, (4,)))]
+        val_loader = [(torch.randn(4, 30, 100), torch.randint(0, 7, (4,)))]
+        # 在 run 内部构造 supernet 后用 weakref 跟踪
+        # run() 结束后 supernet 应无强引用，gc 后被回收
+        result = run.run(train_loader, val_loader)
+        # run 实例不应持有 supernet 引用
+        assert not hasattr(run, "_supernet") or run.__dict__.get("_supernet") is None
+        # gc.collect() 后应有更多对象被回收（无法直接断言 supernet 死亡，
+        # 但可验证 run.__dict__ 不含 supernet/w_optimizer/train_iter/val_iter）
+        for attr in ("supernet", "w_optimizer", "train_iter", "val_iter"):
+            assert attr not in run.__dict__, f"run() 泄露了 {attr} 引用"
+
+    def test_darts_pipeline_run_no_grad_accumulation_for_alpha_loss(self):
+        """验证 alpha_loss 不累积计算图（torch.no_grad 修复）。
+
+        修复前：alpha_loss = criterion(val_logits, y_val) 创建计算图但从不 backward，
+        每个 epoch 泄露一份。修复后用 torch.no_grad() 包裹。
+        """
+        # 通过 grep 实证：darts.py 中 val_logits / alpha_loss 在 torch.no_grad() 块内
+        darts_path = Path(__file__).parent.parent / "senseframe" / "nas" / "darts.py"
+        content = darts_path.read_text(encoding="utf-8")
+        # 验证 torch.no_grad 包裹了 val_logits 计算
+        assert "with torch.no_grad():" in content
+        assert "val_logits = supernet(x_val)" in content
+        # 验证 no_grad 块在 val_logits 之前
+        idx_no_grad = content.find("with torch.no_grad():")
+        idx_val_logits = content.find("val_logits = supernet(x_val)")
+        assert idx_no_grad != -1 and idx_val_logits != -1
+        assert idx_no_grad < idx_val_logits, "val_logits 应在 torch.no_grad() 块内"
+
+    def test_darts_pipeline_run_alpha_grad_detached(self):
+        """验证 alpha_grad 用 .detach() 切断外部计算图引用。"""
+        darts_path = Path(__file__).parent.parent / "senseframe" / "nas" / "darts.py"
+        content = darts_path.read_text(encoding="utf-8")
+        # grep 实证：randn_like 后接 .detach()
+        assert "torch.randn_like(ap) * 0.01).detach()" in content
+
+    def test_darts_pipeline_run_try_finally_cleanup(self):
+        """验证 run() 含 try/finally 块释放资源。"""
+        darts_path = Path(__file__).parent.parent / "senseframe" / "nas" / "darts.py"
+        content = darts_path.read_text(encoding="utf-8")
+        # grep 实证：try/finally 块 + 资源释放
+        assert "finally:" in content
+        assert "train_iter.close()" in content
+        assert "val_iter.close()" in content
+        assert "del supernet" in content
+
+    def test_darts_pipeline_run_update_uses_set_to_none(self):
+        """验证 optimizer.zero_grad(set_to_none=True) 释放 grad 引用。"""
+        darts_path = Path(__file__).parent.parent / "senseframe" / "nas" / "darts.py"
+        content = darts_path.read_text(encoding="utf-8")
+        assert "zero_grad(set_to_none=True)" in content
+
+    def test_infinite_loader_close_releases_loader(self):
+        """_InfiniteLoader.close() 释放 loader 和 _iter 引用。"""
+        from senseframe.nas.darts import _InfiniteLoader
+        loader = [(torch.randn(2, 3), torch.tensor([0, 1]))]
+        inf = _InfiniteLoader(loader)
+        assert inf.loader is not None
+        assert inf._iter is not None
+        inf.close()
+        assert inf.loader is None
+        assert inf._iter is None
+
+    def test_infinite_loader_context_manager(self):
+        """_InfiniteLoader 支持 context manager 协议。"""
+        from senseframe.nas.darts import _InfiniteLoader
+        loader = [(torch.randn(2, 3), torch.tensor([0, 1]))]
+        with _InfiniteLoader(loader) as inf:
+            x, y = inf.next()
+            assert x.shape == (2, 3)
+        # 退出 with 块后 loader 应被释放
+        assert inf.loader is None
+        assert inf._iter is None
+
+    def test_darts_pipeline_run_does_not_leak_tensor_memory(self):
+        """端到端验证：多次 run() 调用不累积 tensor 内存。
+
+        通过检查 sampler.arch_alpha 在 cleanup 后被清空，
+        且再次 run() 可正常工作（重新初始化 arch_alpha）。
+        """
+        sampler = DARTSSampler()
+        builder = ArchitectureBuilder()
+        ss = ArchitectureSearchSpace(cell_types=["conv1d"]).to_sp_search_space()
+
+        # 第一次 run
+        run1 = DARTSPipelineRun(
+            sampler=sampler, builder=builder, search_space=ss,
+            input_shape=(30, 100), num_classes=7, n_epochs=1,
+        )
+        train_loader = [(torch.randn(4, 30, 100), torch.randint(0, 7, (4,)))]
+        val_loader = [(torch.randn(4, 30, 100), torch.randint(0, 7, (4,)))]
+        result1 = run1.run(train_loader, val_loader)
+        assert "best_arch" in result1
+
+        # cleanup sampler
+        sampler.cleanup()
+        assert len(sampler.arch_alpha) == 0
+
+        # 第二次 run（重新初始化 arch_alpha）
+        run2 = DARTSPipelineRun(
+            sampler=sampler, builder=builder, search_space=ss,
+            input_shape=(30, 100), num_classes=7, n_epochs=1,
+        )
+        result2 = run2.run(train_loader, val_loader)
+        assert "best_arch" in result2
+        # 第二次 run 后 arch_alpha 应非空
+        assert len(sampler.arch_alpha) > 0
+
+
+# ============================================================
+# P3.3.3: ENASSampler
+# ============================================================
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
+class TestENASSampler:
+    """ENASSampler 行为验证（P3.3.3）。"""
+
+    def test_enas_sampler_name(self):
+        """sampler.name 应为 'enas'。"""
+        sampler = ENASSampler()
+        assert sampler.name == "enas"
+
+    def test_enas_sampler_satisfies_protocol(self):
+        """ENASSampler 应满足 Sampler Protocol。"""
+        sampler = ENASSampler()
+        assert isinstance(sampler, Sampler)
+
+    def test_enas_sampler_sample_returns_dict(self):
+        """sample() 应返回 dict。"""
+        sampler = ENASSampler(seed=42)
+        ss = ArchitectureSearchSpace(cell_types=["conv1d", "rnn"]).to_sp_search_space()
+        params = sampler.sample(ss, [])
+        assert isinstance(params, dict)
+        assert "cell_type" in params
+
+    def test_enas_sampler_sample_without_controller_fallback_random(self):
+        """无 controller 时应随机采样 fallback。"""
+        sampler = ENASSampler(seed=42)
+        ss = ArchitectureSearchSpace(cell_types=["conv1d", "rnn"]).to_sp_search_space()
+        params = sampler.sample(ss, [])
+        # 应返回合法参数
+        assert params["cell_type"] in ["conv1d", "rnn"]
+        assert "n_layers" in params
+
+    def test_enas_sampler_sample_with_controller(self):
+        """有 controller 时应 controller 采样。"""
+        # 构造一个简单的 controller（nn.LSTM）
+        controller_hidden = 64
+        controller = nn.LSTM(
+            input_size=controller_hidden,
+            hidden_size=controller_hidden,
+            batch_first=True,
+        )
+        sampler = ENASSampler(controller=controller, controller_hidden=controller_hidden, seed=42)
+        ss = ArchitectureSearchSpace(cell_types=["conv1d", "rnn"]).to_sp_search_space()
+        params = sampler.sample(ss, [])
+        # 应返回 dict（不抛异常）
+        assert isinstance(params, dict)
+        assert "cell_type" in params
+
+    def test_enas_sampler_warm_start_no_op(self):
+        """warm_start 应为 no-op（不报错）。"""
+        sampler = ENASSampler()
+        sampler.warm_start([{"params": {"cell_type": "conv1d"}, "result": {"value": 0.5}}])
+
+    def test_enas_sampler_registered(self):
+        """get_sampler('enas') 应返回 ENASSampler。"""
+        assert "enas" in list_samplers()
+        assert get_sampler("enas") is ENASSampler
+
+    def test_enas_sampler_sample_with_real_search_space(self):
+        """与真实 SearchSpace 集成。"""
+        sampler = ENASSampler(seed=42)
+        ss = ArchitectureSearchSpace(cell_types=["conv1d", "rnn", "attention"]).to_sp_search_space()
+        params = sampler.sample(ss, [])
+        assert "cell_type" in params
+        assert params["cell_type"] in ["conv1d", "rnn", "attention"]
+
+
+# ============================================================
+# P3.3.4: 反假绿 grep 实证检查
+# ============================================================
+class TestGrepEvidenceDartsEnas:
+    """P3.3 DARTS/ENAS/attention 源码 grep 实证检查。"""
+
+    def test_grep_attention_net_class(self):
+        """builder.py 应含 class AttentionNet。"""
+        path = _source_path("nas/builder.py")
+        assert _grep_source(path, "class AttentionNet"), \
+            "builder.py 应有 AttentionNet 类"
+
+    def test_grep_build_attention_method(self):
+        """builder.py 应含 _build_attention 方法。"""
+        path = _source_path("nas/builder.py")
+        assert _grep_source(path, "def _build_attention"), \
+            "builder.py 应有 _build_attention 方法"
+
+    def test_grep_supported_cell_types_has_attention(self):
+        """search_space.py 的 SUPPORTED_CELL_TYPES 应含 attention。"""
+        path = _source_path("nas/search_space.py")
+        content = path.read_text(encoding="utf-8")
+        # SUPPORTED_CELL_TYPES 行应含 attention
+        for line in content.splitlines():
+            if "SUPPORTED_CELL_TYPES" in line and "=" in line and "[" in line:
+                assert "attention" in line, \
+                    f"SUPPORTED_CELL_TYPES 应含 attention, got: {line}"
+                return
+        assert False, "未找到 SUPPORTED_CELL_TYPES 定义"
+
+    def test_grep_default_attention_params(self):
+        """search_space.py 应含 _default_attention_params 函数。"""
+        path = _source_path("nas/search_space.py")
+        assert _grep_source(path, "def _default_attention_params"), \
+            "search_space.py 应有 _default_attention_params 函数"
+
+    def test_grep_darts_sampler_class(self):
+        """darts.py 应含 class DARTSSampler。"""
+        path = _source_path("nas/darts.py")
+        assert _grep_source(path, "class DARTSSampler"), \
+            "darts.py 应有 DARTSSampler 类"
+
+    def test_grep_darts_pipeline_run_class(self):
+        """darts.py 应含 class DARTSPipelineRun。"""
+        path = _source_path("nas/darts.py")
+        assert _grep_source(path, "class DARTSPipelineRun"), \
+            "darts.py 应有 DARTSPipelineRun 类"
+
+    def test_grep_enas_sampler_class(self):
+        """sampler.py 应含 class ENASSampler。"""
+        path = _source_path("nas/sampler.py")
+        assert _grep_source(path, "class ENASSampler"), \
+            "sampler.py 应有 ENASSampler 类"
+
+    def test_grep_darts_registered(self):
+        """darts.py 应含 register_sampler("darts" 注册调用。"""
+        path = _source_path("nas/darts.py")
+        assert _grep_source(path, 'register_sampler("darts"'), \
+            "darts.py 应注册 DARTSSampler 到 SP"
+
+    def test_grep_enas_registered(self):
+        """sampler.py 应含 register_sampler("enas" 注册调用。"""
+        path = _source_path("nas/sampler.py")
+        assert _grep_source(path, 'register_sampler("enas"'), \
+            "sampler.py 应注册 ENASSampler 到 SP"
+
+    def test_grep_nas_init_exports_darts_enas(self):
+        """__init__.py 应导出 DARTSSampler, ENASSampler, DARTSPipelineRun, AttentionNet。"""
+        path = _source_path("nas/__init__.py")
+        assert _grep_source(path, "DARTSSampler"), \
+            "__init__.py 应导出 DARTSSampler"
+        assert _grep_source(path, "ENASSampler"), \
+            "__init__.py 应导出 ENASSampler"
+        assert _grep_source(path, "DARTSPipelineRun"), \
+            "__init__.py 应导出 DARTSPipelineRun"
+        assert _grep_source(path, "AttentionNet"), \
+            "__init__.py 应导出 AttentionNet"
+
+    def test_grep_darts_sampler_name(self):
+        """darts.py 应有 name = 'darts' 类属性。"""
+        path = _source_path("nas/darts.py")
+        assert _grep_source(path, 'name = "darts"'), \
+            "DARTSSampler.name 应为 'darts'"
+
+    def test_grep_enas_sampler_name(self):
+        """sampler.py 应有 name = 'enas' 类属性。"""
+        path = _source_path("nas/sampler.py")
+        assert _grep_source(path, 'name = "enas"'), \
+            "ENASSampler.name 应为 'enas'"
+
+    def test_grep_darts_warm_start(self):
+        """darts.py 应含 warm_start 方法（Sampler Protocol 合规）。"""
+        path = _source_path("nas/darts.py")
+        assert _grep_source(path, "def warm_start"), \
+            "DARTSSampler 应有 warm_start 方法"
+
+    def test_grep_enas_warm_start(self):
+        """sampler.py 应含 ENASSampler 的 warm_start 方法。"""
+        path = _source_path("nas/sampler.py")
+        # sampler.py 已有 EvolutionarySampler 的 warm_start；确保 ENAS 也有
+        content = path.read_text(encoding="utf-8")
+        # 找到 ENASSampler 类定义后的 warm_start
+        enas_idx = content.find("class ENASSampler")
+        assert enas_idx >= 0, "应含 ENASSampler 类"
+        enas_section = content[enas_idx:]
+        assert "def warm_start" in enas_section, \
+            "ENASSampler 应有 warm_start 方法"

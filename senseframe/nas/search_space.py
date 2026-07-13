@@ -1,4 +1,4 @@
-"""RFC-003 ε2 NAS：架构搜索空间（P2.6）。
+"""RFC-003 ε2 NAS：架构搜索空间（P2.6，P3.3.1 扩展 attention）。
 
 定义 NAS 搜索空间的数据结构（DSP 合规）：
 - ArchitectureParameterSpec：单个架构参数规格（cell_type / n_layers / hidden_dim / ...）
@@ -7,13 +7,13 @@
 与 SP SearchSpace 的关系：
 - NAS SearchSpace 是 SP SearchSpace 的特化（约束 cell_type 取值范围 + NAS 特化参数）
 - 通过 to_sp_search_space() 转换为标准 SP SearchSpace，注册到 StudyManager 后可被
- 任意 SP Sampler（random / grid / evolutionary / ...）采样
+  任意 SP Sampler（random / grid / evolutionary / ...）采样
 
 P2 支持的 cell_type：
 - conv1d：1D 卷积网络（WiFi CSI 时序信号）
 - rnn：循环神经网络（LSTM / GRU）
 
-P3 推迟的 cell_type：
+P3.3.1 新增的 cell_type：
 - attention：Transformer 风格架构
 - hybrid：conv1d + rnn 混合
 """
@@ -22,10 +22,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, List, Literal, Optional
 
-# P2 支持的 cell_type（attention / hybrid 推迟到 P3）
-SUPPORTED_CELL_TYPES: List[str] = ["conv1d", "rnn"]
+# P3.3.1: SUPPORTED_CELL_TYPES 加入 "attention"
+SUPPORTED_CELL_TYPES: List[str] = ["conv1d", "rnn", "attention"]
 SUPPORTED_ACTIVATIONS: List[str] = ["relu", "gelu", "tanh", "elu"]
 SUPPORTED_RNN_TYPES: List[str] = ["lstm", "gru"]
+SUPPORTED_ATTENTION_ACTIVATIONS: List[str] = ["gelu", "relu"]
+SUPPORTED_N_HEADS: List[int] = [2, 4, 8]
 
 
 @dataclass
@@ -154,6 +156,41 @@ def _default_hybrid_params() -> List[ArchitectureParameterSpec]:
     return params
 
 
+def _default_attention_params() -> List[ArchitectureParameterSpec]:
+    """attention cell_type 的默认搜索参数（P3.3.1 新增）。
+
+    Transformer 风格架构参数：
+    - n_layers: Transformer encoder 层数（1-8）
+    - d_model: embedding 维度（16-512，log 采样）
+    - n_heads: 多头注意力头数（2/4/8）
+    - dropout: dropout 比率（0-0.5）
+    - activation: FFN 激活函数（gelu/relu）
+    """
+    return [
+        ArchitectureParameterSpec(
+            name="cell_type", type="categorical",
+            choices=["attention"], default="attention",
+        ),
+        ArchitectureParameterSpec(
+            name="n_layers", type="int", low=1, high=8, default=4,
+        ),
+        ArchitectureParameterSpec(
+            name="d_model", type="int", low=16, high=512, log=True, default=64,
+        ),
+        ArchitectureParameterSpec(
+            name="n_heads", type="categorical",
+            choices=SUPPORTED_N_HEADS, default=4,
+        ),
+        ArchitectureParameterSpec(
+            name="dropout", type="float", low=0.0, high=0.5, default=0.1,
+        ),
+        ArchitectureParameterSpec(
+            name="activation", type="categorical",
+            choices=SUPPORTED_ATTENTION_ACTIVATIONS, default="gelu",
+        ),
+    ]
+
+
 @dataclass
 class ArchitectureSearchSpace:
     """NAS 架构搜索空间（DSP 合规）。
@@ -185,13 +222,12 @@ class ArchitectureSearchSpace:
 
     def _build_default_parameters(self) -> None:
         """根据 cell_types 生成默认参数集。"""
-        # 验证 cell_types
+        # 验证 cell_types（P3.3.1: attention 加入 SUPPORTED_CELL_TYPES）
         for ct in self.cell_types:
             if ct not in SUPPORTED_CELL_TYPES and ct != "hybrid":
                 raise ValueError(
-                    f"Unsupported cell_type '{ct}' in P2 "
-                    f"(supported: {SUPPORTED_CELL_TYPES + ['hybrid']}; "
-                    "attention 推迟到 P3)"
+                    f"Unsupported cell_type '{ct}' "
+                    f"(supported: {SUPPORTED_CELL_TYPES + ['hybrid']})"
                 )
 
         all_params: Dict[str, ArchitectureParameterSpec] = {}
@@ -217,6 +253,34 @@ class ArchitectureSearchSpace:
         if "hybrid" in self.cell_types:
             for p in _default_hybrid_params():
                 if p.name not in all_params:
+                    all_params[p.name] = p
+
+        # P3.3.1: attention cell_type 支持
+        if "attention" in self.cell_types:
+            for p in _default_attention_params():
+                if p.name in all_params:
+                    # 合并 categorical choices（如 cell_type / activation / n_heads）
+                    existing = all_params[p.name]
+                    if existing.type == "categorical" and p.choices:
+                        if p.name == "cell_type":
+                            # cell_type 由后续特殊处理统一合并
+                            continue
+                        merged = list(set(existing.choices + (p.choices or [])))
+                        all_params[p.name] = ArchitectureParameterSpec(
+                            name=p.name, type="categorical",
+                            choices=merged, default=existing.default,
+                        )
+                    # int/float 参数：保留更宽的范围
+                    elif existing.type == p.type and p.type in ("int", "float"):
+                        low = min(existing.low or p.low or 0, p.low or existing.low or 0)
+                        high = max(existing.high or p.high or 0, p.high or existing.high or 0)
+                        all_params[p.name] = ArchitectureParameterSpec(
+                            name=p.name, type=p.type,
+                            low=low, high=high,
+                            log=existing.log or p.log,
+                            default=existing.default,
+                        )
+                else:
                     all_params[p.name] = p
 
         # 应用用户自定义覆盖
@@ -359,4 +423,6 @@ __all__ = [
     "SUPPORTED_CELL_TYPES",
     "SUPPORTED_ACTIVATIONS",
     "SUPPORTED_RNN_TYPES",
+    "SUPPORTED_ATTENTION_ACTIVATIONS",
+    "SUPPORTED_N_HEADS",
 ]
