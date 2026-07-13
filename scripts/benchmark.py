@@ -51,10 +51,13 @@ from datetime import datetime
 from pathlib import Path
 from statistics import mean, stdev
 
-# 将项目根目录加入 sys.path
+# 将项目根目录加入 sys.path（bootstrap：senseframe 可导入前的必要本地推导）
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+# 单一数据源：bootstrap 后从 senseframe.common.paths 导入 PROJECT_ROOT
+from senseframe.common.paths import PROJECT_ROOT  # noqa: E402
 
 
 # ============================================================================
@@ -344,6 +347,9 @@ def _run_direct(test_case, run_id, output_base):
     返回 dict: {status, macro_f1, accuracy, epochs_trained, output_dir, error, elapsed}
     """
     from senseframe.engine import ExperimentConfig, run_experiment
+    # data_root 从 SENSEFRAME_DATA_ROOT env 读（框架不猜测路径）
+    from senseframe.common.paths import resolve_data_root
+    from senseframe.registry import get_dataset_spec
 
     model_id = test_case["model_id"]
     dataset = test_case["dataset"]
@@ -357,13 +363,23 @@ def _run_direct(test_case, run_id, output_base):
     scheduler = test_case.get("scheduler", None)
     learning_rate = test_case.get("learning_rate", 1e-3)
 
+    # num_classes 从 DatasetSpec 派生（框架不猜测类别数）
+    try:
+        spec = get_dataset_spec(dataset)
+    except KeyError:
+        raise KeyError(
+            f"benchmark: 数据集 '{dataset}' 未注册，无法派生 num_classes。"
+            f"请先通过场景注册声明该数据集元数据。"
+        )
+    num_classes = spec.num_classes
+
     # 构建 ExperimentConfig（与 cross_validate.py 等价）
     scene = {
         "name": "wifi_csi",
         "dataset": dataset,
         "model_id": model_id,
         "learning_mode": "supervised",
-        "data_root": str(_PROJECT_ROOT / "CSI_DATASETS" / "Data"),
+        "data_root": str(resolve_data_root()),
     }
     trainer = {
         "epochs": epochs,
@@ -384,8 +400,9 @@ def _run_direct(test_case, run_id, output_base):
         scene["params"] = {"scheduler": scheduler}
     config_dict = {
         "scene": scene,
-        "input_features": [{"name": "csi", "type": "csi", "shape": [1]}],
-        "output_features": [{"name": "y", "type": "category", "num_classes": 2}],
+        "input_features": [{"name": "csi", "type": "csi", "shape": list(spec.input_shape)}],
+        # num_classes 从 DatasetSpec 派生（单一数据源），禁止硬编码
+        "output_features": [{"name": "y", "type": "category", "num_classes": num_classes}],
         "trainer": trainer,
         "output_dir": f"{output_base}/{run_id}",
     }
@@ -462,7 +479,7 @@ def _run_opencode(test_case, run_id, output_base):
     try:
         result = subprocess.run(
             cmd,
-            cwd=str(_PROJECT_ROOT),
+            cwd=str(PROJECT_ROOT),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -515,7 +532,7 @@ def _run_opencode(test_case, run_id, output_base):
         if macro_f1 is None:
             # opencode train 命令默认输出到 runs/ 目录
             # 查找最新的实验目录
-            results_dir = _PROJECT_ROOT / "runs"
+            results_dir = PROJECT_ROOT / "runs"
             if results_dir.exists():
                 exp_dirs = sorted(results_dir.glob("*"), key=lambda p: p.stat().st_mtime,
                                   reverse=True)
@@ -752,7 +769,7 @@ def run_benchmark(matrix_name, mode, baseline_type, repeats_override=None):
     }
 
     # 保存报告
-    benchmarks_dir = _PROJECT_ROOT / "benchmarks"
+    benchmarks_dir = PROJECT_ROOT / "benchmarks"
     benchmarks_dir.mkdir(exist_ok=True)
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = benchmarks_dir / f"report_{matrix_name}_{mode}_{baseline_type}_{timestamp_str}.json"

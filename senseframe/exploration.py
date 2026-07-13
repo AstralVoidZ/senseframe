@@ -685,7 +685,9 @@ class SearchSpaceMap:
         """
         from .scenes import list_scenes, get_scene
 
-        scenes_to_query = [scene] if scene else list(list_scenes().keys())
+        scenes_to_query = [scene] if scene else [
+            k for k in list_scenes().keys() if k != "_unavailable"
+        ]
         all_categories: Dict[str, Any] = {}
         total = 0
 

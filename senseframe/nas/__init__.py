@@ -59,7 +59,13 @@ def make_nas_module_factory(
 
     def module_factory(model=None, **kwargs):
         # 忽略 scene 构建的默认 model（NAS 用自己的 arch_params 构造）
-        num_classes = int(kwargs.get("num_classes", 7))
+        # num_classes 必填：框架不猜测数据集类别数，调用方必须通过 kwargs 传入
+        if "num_classes" not in kwargs:
+            raise ValueError(
+                "make_nas_module_factory: num_classes 必填。"
+                "调用方必须通过 kwargs 传入 num_classes（由 DatasetSpec.num_classes 派生）。"
+            )
+        num_classes = int(kwargs["num_classes"])
         nas_model = actual_builder.build(arch_params, input_shape, num_classes)
         # 用 GenericLightningModule 包装（复用训练逻辑）
         return GenericLightningModule(model=nas_model, **kwargs)

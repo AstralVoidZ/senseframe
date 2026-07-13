@@ -10,6 +10,7 @@
 - Phase 2 (supervised): CrossEntropyLoss，只训练 classifier 参数
 """
 
+import logging
 import random
 from typing import Any, Dict, List, Optional
 
@@ -26,6 +27,8 @@ from torchmetrics import ConfusionMatrix
 
 from ..core.metrics import get_metric, has_metric
 from ..core.ent_loss import EntLoss
+
+_logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -59,20 +62,33 @@ class SelfSupervisedModule(pl.LightningModule):
     def __init__(
         self,
         model: nn.Module,
+        num_classes: int,
         learning_rate: float = 1e-3,
         weight_decay: float = 1.5e-6,
         metrics: Optional[List[str]] = None,
-        num_classes: int = 14,
         tau: float = 1.0,
         eps: float = 1e-5,
         lam1: float = 0.0,
         lam2: float = 0.5,
         incremental_log_writer: Optional[Any] = None,
+        scheduler: Optional[str] = None,
+        max_epochs: Optional[int] = None,
     ):
         super().__init__()
         self.model = model
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        # 修复（2.12）：与 GenericLightningModule 对齐，支持 scheduler
+        self.scheduler_type = scheduler
+        self.max_epochs = max_epochs
+        # num_classes 必填：框架不猜测数据集类别数。
+        # Pipeline 应从 ctx.num_classes（由 DatasetSpec.num_classes 派生）传入。
+        if num_classes is None or num_classes <= 0:
+            raise ValueError(
+                "SelfSupervisedModule: num_classes 必填且必须 > 0。"
+                "Pipeline 应从 ctx.num_classes 传入（由 DatasetSpec.num_classes 派生），"
+                "直接实例化时必须显式提供。"
+            )
         self.num_classes = num_classes
 
         # EntLoss 参数
@@ -198,10 +214,20 @@ class SelfSupervisedModule(pl.LightningModule):
         # 独立验证（trainer.validate()）：存储指标供 final_eval 使用
         if self._is_final_validation:
             self._last_val_metrics = {}
-            for name, metric in self.val_metrics.items():
-                self._last_val_metrics[name] = round(metric.compute().item(), 6)
-                metric.reset()
+            # 修复（双重 compute 陷阱）：val_metrics 已交给 self.log，Lightning 自动
+            # compute + reset，手动 compute 返回 0。改为从 callback_metrics 读取。
+            cb_metrics = self.trainer.callback_metrics if self.trainer else {}
+            for name in self.val_metrics:
+                # self.log 键名为 f"val_{name}"（见 validation_step），从 callback_metrics
+                # 读取对应值。旧逻辑直接用 name 作键（无 val_ 前缀），与 training_log
+                # 字段契约不一致（修复 2.6 字段命名）。
+                key = f"val_{name}"
+                val = cb_metrics.get(key)
+                if val is not None:
+                    self._last_val_metrics[key] = round(float(val.item()
+                                                       if hasattr(val, "item") else val), 6)
             # Phase 2.2b：计算并存储最终 confusion_matrix
+            # confusion_matrix 未交给 self.log，需手动 compute（不受双重 compute 影响）
             cm = self._val_confusion_matrix.compute()
             self._final_confusion_matrix = cm.long().tolist()
             self._val_confusion_matrix.reset()
@@ -212,12 +238,20 @@ class SelfSupervisedModule(pl.LightningModule):
             return
 
         epoch_entry = {"epoch": self.current_epoch + 1, "phase": self.phase}
-        epoch_entry["loss"] = round(self._current_epoch_loss / max(self._current_epoch_steps, 1), 6)
+        # 修复（2.6 字段命名）：loss → train_loss，与 _TRAINING_LOG_ENTRY_SCHEMA 一致
+        epoch_entry["train_loss"] = round(self._current_epoch_loss / max(self._current_epoch_steps, 1), 6)
 
+        # 修复（双重 compute 陷阱）：从 callback_metrics 读取，不手动 compute。
+        # 旧逻辑 val_metrics[name].compute() 在 Lightning 已 reset 后返回 0。
+        cb_metrics = self.trainer.callback_metrics if self.trainer else {}
         for name in self.val_metrics:
-            val = self.val_metrics[name].compute().item()
-            epoch_entry[name] = round(val, 6)
-            self.val_metrics[name].reset()
+            key = f"val_{name}"
+            val = cb_metrics.get(key)
+            if val is not None:
+                epoch_entry[key] = round(float(val.item()
+                                         if hasattr(val, "item") else val), 6)
+            else:
+                epoch_entry[key] = None
         # 训练中验证也重置 confusion_matrix（仅最终验证保留）
         self._val_confusion_matrix.reset()
 
@@ -233,18 +267,23 @@ class SelfSupervisedModule(pl.LightningModule):
         if self._last_val_metrics:
             results = dict(self._last_val_metrics)
         else:
-            # Fallback: 从当前状态计算
+            # Fallback: 从 callback_metrics 读取
+            # 修复（双重 compute 陷阱）：旧逻辑 metric.compute() 在 Lightning 已 reset 后返回 0。
             results = {}
-            for name, metric in self.val_metrics.items():
-                results[name] = round(metric.compute().item(), 6)
-                metric.reset()
+            cb_metrics = self.trainer.callback_metrics if self.trainer else {}
+            for name in self.val_metrics:
+                key = f"val_{name}"
+                val = cb_metrics.get(key)
+                if val is not None:
+                    results[key] = round(float(val.item()
+                                         if hasattr(val, "item") else val), 6)
         # Phase 2.2b：附加 confusion_matrix（如有）
         if self._final_confusion_matrix is not None:
             results["confusion_matrix"] = self._final_confusion_matrix
         return results
 
     def configure_optimizers(self):
-        """根据训练阶段返回不同的优化器。"""
+        """根据训练阶段返回不同的优化器（+ 可选 scheduler）。"""
         if self.phase == "self_supervised":
             # 自监督阶段：AdamW 训练全部参数
             optimizer = torch.optim.AdamW(
@@ -259,7 +298,18 @@ class SelfSupervisedModule(pl.LightningModule):
                 lr=self.learning_rate,
                 weight_decay=1e-5,
             )
-        return optimizer
+        # 修复（2.12）：与 GenericLightningModule 对齐，支持 scheduler
+        if self.scheduler_type is None:
+            return optimizer
+        elif self.scheduler_type == "cosine":
+            t_max = self.max_epochs if self.max_epochs else 50
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max)
+        elif self.scheduler_type == "step":
+            step_size = max(1, self.max_epochs // 3) if self.max_epochs else 30
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.1)
+        else:
+            raise ValueError(f"Unknown scheduler: {self.scheduler_type}")
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
 
 __all__ = ["EntLoss", "SelfSupervisedModule", "gaussian_noise"]

@@ -52,9 +52,17 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-# 将项目根目录加入 sys.path
-# eval.py 位于项目根，parent 即项目根本身
-_PROJECT_ROOT = Path(__file__).resolve().parent
+# 向上搜索 senseframe 包所在的项目根，不硬编码 eval.py 的位置
+# eval.py 可能位于项目根、子目录或任意部署目录，只要能找到 senseframe 包即可
+_PROJECT_ROOT = None
+_search = Path(__file__).resolve().parent
+for _candidate in [_search] + list(_search.parents):
+    if (_candidate / "senseframe" / "__init__.py").exists():
+        _PROJECT_ROOT = _candidate
+        break
+if _PROJECT_ROOT is None:
+    # 回退：当前文件所在目录（向后兼容）
+    _PROJECT_ROOT = _search
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
@@ -260,16 +268,24 @@ def generate_inference_script(metadata_path: str, output_path: str = None) -> st
     # 提取关键字段
     model_id = metadata.get("model_id", "Unknown")
     dataset = metadata.get("dataset", "Unknown")
-    num_classes = metadata.get("num_classes", 7)
+    # num_classes 必填：框架不猜测数据集类别数，metadata 缺失则 raise
+    if "num_classes" not in metadata:
+        raise KeyError(
+            "metadata 中缺少 num_classes，无法生成推理脚本。"
+            "请确保训练时 metadata 完整记录了 num_classes。"
+        )
+    num_classes = metadata["num_classes"]
     learning_mode = metadata.get("learning_mode", "supervised")
     normalization = metadata.get("normalization")
 
-    # 从 metadata.config 读取 data_root，None 时用框架默认值
+    # data_root 必填：从 metadata.config 读取，缺失则 raise（框架不猜测路径）
     config_dict = metadata.get("config", {})
     data_root = config_dict.get("data_root")
     if not data_root:
-        from senseframe.engine.config import DEFAULT_DATA_ROOT
-        data_root = DEFAULT_DATA_ROOT
+        raise KeyError(
+            "metadata.config 中缺少 data_root，无法生成推理脚本。"
+            "请确保训练时 metadata.config 完整记录了 data_root。"
+        )
 
     # 填充模板
     script = _INFERENCE_TEMPLATE

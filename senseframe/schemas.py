@@ -7,7 +7,7 @@
 Phase 6.1：新增结构化错误码（error_code）和机器可读状态摘要（summary）。
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
 
 
@@ -148,3 +148,129 @@ class TrainOutput:
             s["error_code"] = self.error_code or "UNKNOWN_ERROR"
             s["error"] = self.error
         return s
+
+
+# ============================================================
+# P1-1：产物 Schema 层 — training_log 单条记录契约
+# ============================================================
+@dataclass
+class TrainingLogEntry:
+    """training_log.jsonl 单条记录的 schema（P1-1: 产物 Schema 层）。
+
+    强制字段类型契约，拦截 LR 污染等类型错误。
+    None 表示该 epoch 未产生该指标（不强制必填），但非 None 时必须是 float/int。
+    """
+    epoch: int                              # 1-based epoch 序号（与 trainer.current_epoch 对齐时 +1）
+    lr: Optional[float] = None              # 学习率（float 或 None，不允许 str）
+    train_loss: Optional[float] = None
+    train_accuracy: Optional[float] = None
+    train_macro_f1: Optional[float] = None
+    val_loss: Optional[float] = None
+    val_accuracy: Optional[float] = None
+    val_macro_f1: Optional[float] = None
+
+    def __post_init__(self):
+        """字段类型校验，拦截类型污染。"""
+        # epoch 必须是 int >= 0
+        if not isinstance(self.epoch, int) or self.epoch < 0:
+            raise ValueError(
+                f"TrainingLogEntry.epoch must be int >= 0, got {self.epoch!r}"
+            )
+        # 可选字段：None 或 (int, float)
+        for f_name in ["lr", "train_loss", "train_accuracy", "train_macro_f1",
+                       "val_loss", "val_accuracy", "val_macro_f1"]:
+            v = getattr(self, f_name)
+            if v is not None and not isinstance(v, (int, float)):
+                raise TypeError(
+                    f"TrainingLogEntry.{f_name} must be float/int or None, "
+                    f"got {type(v).__name__}: {v!r}"
+                )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """序列化为 dict（仅包含非 None 字段）。
+
+        用于写入 training_log.jsonl，避免 None 字段污染产物。
+        """
+        return {
+            f.name: getattr(self, f.name)
+            for f in fields(self)
+            if getattr(self, f.name) is not None
+        }
+
+
+def validate_training_log_entry(raw: Dict[str, Any]) -> TrainingLogEntry:
+    """从 dict 构造 TrainingLogEntry，做类型转换 + 校验。
+
+    LR 污染为 str 时尝试 float() 转换，转换失败抛 ValueError。
+
+    Args:
+        raw: 原始 dict（通常来自 module.py 的 training_log 列表）
+
+    Returns:
+        TrainingLogEntry 实例
+
+    Raises:
+        ValueError: 字段缺失或类型转换失败
+        TypeError: 字段类型不匹配且无法转换
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f"Expected dict, got {type(raw).__name__}")
+
+    def _to_float(key: str) -> Optional[float]:
+        v = raw.get(key)
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        # 尝试转换（处理 str 数字、tensor 等）
+        try:
+            if hasattr(v, "item"):
+                return float(v.item())
+            return float(v)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Field {key!r} cannot be converted to float: {v!r} ({type(v).__name__})"
+            ) from e
+
+    try:
+        epoch = int(raw["epoch"])
+    except (KeyError, ValueError, TypeError) as e:
+        raise ValueError(f"Field 'epoch' missing or invalid: {e}") from e
+
+    return TrainingLogEntry(
+        epoch=epoch,
+        lr=_to_float("lr"),
+        train_loss=_to_float("train_loss"),
+        train_accuracy=_to_float("train_accuracy"),
+        train_macro_f1=_to_float("train_macro_f1"),
+        val_loss=_to_float("val_loss"),
+        val_accuracy=_to_float("val_accuracy"),
+        val_macro_f1=_to_float("val_macro_f1"),
+    )
+
+
+# ============================================================
+# P1-1：产物 Schema 层 — 类型安全的 JSON 序列化
+# ============================================================
+def safe_json_dumps(obj: Any, strict: bool = False, **kwargs) -> str:
+    """类型安全的 JSON 序列化（P1-1: 产物 Schema 层）。
+
+    Args:
+        obj: 待序列化对象
+        strict: True 时类型不匹配抛 TypeError（生产路径，schema 校验场景）；
+                False 时 default=str 兜底（调试路径，保持向后兼容）
+        **kwargs: 透传给 json.dumps（如 ensure_ascii, indent）
+
+    Returns:
+        JSON 字符串
+
+    Raises:
+        TypeError: strict=True 时遇到不可序列化对象
+    """
+    import json
+    if strict:
+        # strict 模式：不传 default，类型错误直接抛
+        return json.dumps(obj, **kwargs)
+    else:
+        # 兜底模式：default=str 保持向后兼容
+        return json.dumps(obj, default=str, **kwargs)

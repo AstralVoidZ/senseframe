@@ -227,7 +227,20 @@ def manifest_from_dict(
     label_map = {int(k): str(v) for k, v in raw_label_map.items()}
 
     # data_root：manifest 未指定则用 default_data_root
-    data_root = data.get("data_root", default_data_root)
+    # L5 修复：manifest 中的 data_root 视为不可信，校验不逃逸 default_data_root
+    raw_data_root = data.get("data_root", default_data_root)
+    if raw_data_root is not None and default_data_root is not None:
+        # manifest 指定的 data_root 必须位于 default_data_root 内（防穿越）
+        from ..common.path_safe import resolve_under
+        try:
+            resolve_under(default_data_root, raw_data_root)
+        except ValueError:
+            # 逃逸则回退到 default_data_root（保守策略，不阻断加载）
+            data_root = default_data_root
+        else:
+            data_root = raw_data_root
+    else:
+        data_root = raw_data_root
 
     return DatasetManifest(
         name=str(data["name"]),
@@ -374,13 +387,38 @@ def auto_compute_minmax(
 
 
 def _resolve_path(path: str, data_root: Optional[str]) -> Path:
-    """解析样本路径：绝对路径直接用，相对路径拼接 data_root。"""
-    p = Path(path)
-    if p.is_absolute():
-        return p
+    """解析样本路径：相对路径拼接 data_root，校验不逃逸。
+
+    安全策略（H1 修复）：
+    - data_root 为 None：相对路径相对 CWD 解析（向后兼容），但拒绝绝对路径
+      （无基目录时绝对路径无法校验安全性）
+    - data_root 非 None：所有路径必须解析后位于 data_root 内
+    - 绝对路径：必须仍位于 data_root 内，否则拒绝
+    - 含 .. 的相对路径：解析后逃逸 data_root 则拒绝
+
+    Args:
+        path: 样本路径（来自 manifest JSON，不可信）
+        data_root: 数据根目录（可信）
+
+    Returns:
+        解析后的绝对路径
+
+    Raises:
+        ValueError: 路径逃逸 data_root，或无 data_root 时传入绝对路径
+    """
+    from ..common.path_safe import resolve_under
+
     if data_root is None:
+        # 无 data_root：相对路径相对 CWD（向后兼容），但拒绝绝对路径
+        p = Path(path)
+        if p.is_absolute():
+            raise ValueError(
+                f"absolute path not allowed without data_root: {path!r}"
+            )
         return p
-    return Path(data_root) / path
+
+    # 有 data_root：强制校验不逃逸
+    return resolve_under(data_root, path)
 
 
 # ============================================================

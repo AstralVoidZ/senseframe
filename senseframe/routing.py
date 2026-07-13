@@ -307,7 +307,13 @@ class ResourceRouter:
             resolved["device"] = route_config["device"]
 
         # batch_size: YAML > 路由
-        resolved["batch_size"] = yaml_config.get("batch_size") or route_config["batch_size"]
+        # P2 隐藏 bug 修复：用 is not None 判断，避免 batch_size=0 被 or 当 falsy 错误回退
+        # （0 虽不合法，但应由下游校验报错，而非静默回退到路由默认值）
+        yaml_bs = yaml_config.get("batch_size")
+        if yaml_bs is not None:
+            resolved["batch_size"] = yaml_bs
+        else:
+            resolved["batch_size"] = route_config["batch_size"]
 
         # num_workers: 路由 + 平台感知 + 上限保护
         # 优化 5：Windows CPU 环境尝试 2 个 worker 加速数据加载
@@ -351,7 +357,13 @@ class ResourceRouter:
         resolved["optimizer"] = yaml_config.get("optimizer") or "adam"
 
         # weight_decay: YAML > 默认 0.0
-        resolved["weight_decay"] = yaml_config.get("weight_decay") or 0.0
+        # P2 隐藏 bug 修复：用 is not None 判断，避免 weight_decay=0.0 被 or 当 falsy 错误回退
+        # （0.0 是合法值，表示无权重衰减，不应回退到路由默认值）
+        yaml_wd = yaml_config.get("weight_decay")
+        if yaml_wd is not None:
+            resolved["weight_decay"] = yaml_wd
+        else:
+            resolved["weight_decay"] = 0.0
 
         # scheduler: Phase 1.1a — YAML trainer.scheduler > scene.params.scheduler > null
         # 优先读 trainer 级 scheduler（新路径），回退到 scene.params 透传（向后兼容）
@@ -363,7 +375,13 @@ class ResourceRouter:
         # Phase 1.2a：梯度裁剪与累积
         resolved["gradient_clip_val"] = yaml_config.get("gradient_clip_val")
         resolved["gradient_clip_algorithm"] = yaml_config.get("gradient_clip_algorithm") or "norm"
-        resolved["accumulate_grad_batches"] = yaml_config.get("accumulate_grad_batches") or 1
+        # P2 隐藏 bug 修复：用 is not None 判断，避免 accumulate_grad_batches=0 被 or 当 falsy 错误回退
+        # （0 虽不合法，但应由下游校验报错，而非静默回退到 1）
+        yaml_agb = yaml_config.get("accumulate_grad_batches")
+        if yaml_agb is not None:
+            resolved["accumulate_grad_batches"] = yaml_agb
+        else:
+            resolved["accumulate_grad_batches"] = 1
 
         # Phase 2.2a：logger 后端透传（默认 csv）
         resolved["logger"] = yaml_config.get("logger") or "csv"

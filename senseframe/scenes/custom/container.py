@@ -37,6 +37,8 @@
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import json
+import logging
 import numpy as np
 import torch
 import torch.nn as nn
@@ -55,6 +57,8 @@ from ...data.manifest import (
     build_datasets_from_manifest,
     load_manifest,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -255,7 +259,13 @@ class CustomContainer(SceneContainer):
         try:
             manifest = self._get_manifest(params)
             return _get_normalization_cached(manifest)
-        except Exception:
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            _logger.warning("Failed to load manifest for normalization info: %s", e)
+            return None
+        except (TypeError, AttributeError, ValueError) as e:
+            _logger.error(
+                "Failed to get normalization info from manifest: %s", e, exc_info=True
+            )
             return None
 
     def get_manifest_info(self, dataset_name: str, **kwargs) -> Optional[Dict[str, Any]]:
@@ -272,7 +282,13 @@ class CustomContainer(SceneContainer):
                 "input_shape": list(manifest.input_shape),
                 "num_classes": manifest.num_classes,
             }
-        except Exception:
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            _logger.warning("Failed to load manifest for manifest info: %s", e)
+            return None
+        except (TypeError, AttributeError, ValueError) as e:
+            _logger.error(
+                "Failed to get manifest info: %s", e, exc_info=True
+            )
             return None
 
     def get_dataset_info(

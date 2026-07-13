@@ -4,20 +4,32 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Dict
 
 from .base import DatasetLoader
 
+_logger = logging.getLogger(__name__)
+
 _LOADERS: Dict[str, DatasetLoader] = {}
 
 
-def register_loader(loader_type: str, loader: DatasetLoader) -> None:
+def register_loader(
+    loader_type: str, loader: DatasetLoader, overwrite: bool = False
+) -> None:
     """注册数据加载器。
 
     Args:
         loader_type: 加载器类型标识（如 "tensor", "csi_mat", "csv_folder"）
         loader: DatasetLoader 实例
+        overwrite: 是否覆盖已注册的同名加载器（默认 False，重复注册 warning 并跳过）
     """
+    if loader_type in _LOADERS and not overwrite:
+        _logger.warning(
+            "Loader '%s' already registered, skipping (use overwrite=True to replace).",
+            loader_type,
+        )
+        return
     _LOADERS[loader_type] = loader
 
 

@@ -12,6 +12,7 @@ Baseline 组是固定参数的对比基准：
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Optional
 
 from ..engine.runner.pipeline import run_pipeline
@@ -121,7 +122,7 @@ class BaselineRunner:
             manual_tunes=self.config.manual_tunes,
             config_snapshot=_build_config_snapshot(modified_config),
             artifact_manifest_path=(
-                f"{train_output.output_dir}/artifact_manifest.json"
+                str(Path(train_output.output_dir) / "manifest.json")
                 if train_output.output_dir else None
             ),
             status=status,

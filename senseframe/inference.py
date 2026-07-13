@@ -422,6 +422,16 @@ def predict(
         )
         # results: [{"path": "...", "label": 3, "label_name": "walk", "confidence": 0.92}, ...]
     """
+    # 修复（5.18）：离线批量推理无 OTel 埋点。
+    # 旧逻辑：predict 入口未调用 init_otel，record_inference_metric 全部 no-op。
+    # 与 Pipeline.run 入口一致，predict 入口也调用 init_otel（OTel 未安装时 no-op）。
+    try:
+        from .observability_otel import init_otel
+        init_otel()
+    except Exception:
+        # OTel 初始化失败不影响推理主流程（与 Pipeline.run 同语义）
+        pass
+
     model = load_model_for_inference(model_path, metadata_path, device=device)
     results = model.predict_batch(samples, include_logits=include_logits)
 

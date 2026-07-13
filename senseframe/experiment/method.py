@@ -15,6 +15,7 @@ P2.4：支持 Multi-fidelity 早停（ε5）— 可选 Pruner 注入，
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..engine.hpo import apply_params, extract_metric
@@ -24,6 +25,17 @@ from .design import MethodConfig
 from .types import TrialGroup, TrialResult, TrialStatus
 
 logger = logging.getLogger(__name__)
+
+# 修复（5.4 / 5.13）：OTel 埋点常量导入
+# 旧逻辑：ML_TRIAL_BEST_METRIC 定义但从未被 record_training_metric 调用。
+try:
+    from ..observability_otel import record_training_metric, ML_TRIAL_BEST_METRIC
+except ImportError:
+    # OTel 未安装时降级为 no-op
+    def record_training_metric(*args, **kwargs):
+        pass
+
+    ML_TRIAL_BEST_METRIC = "ml.trial.best_metric"
 
 
 def _extract_metrics_from_train_output(train_output) -> Dict[str, float]:
@@ -64,10 +76,11 @@ def _build_config_snapshot(base_config, params: Optional[Dict[str, Any]] = None)
             "learning_mode": base_config.scene.learning_mode,
         },
         "trainer": {
-            "max_epochs": getattr(base_config.trainer, "max_epochs", None),
-            "learning_rate": getattr(base_config.trainer, "learning_rate", None),
-            "batch_size": getattr(base_config.trainer, "batch_size", None),
-            "optimizer": getattr(base_config.trainer, "optimizer", None),
+            # TrainerConfig 字段名是 epochs（非 max_epochs）；max_epochs 是 Lightning Trainer 的字段
+            "epochs": base_config.trainer.epochs,
+            "learning_rate": base_config.trainer.learning_rate,
+            "batch_size": base_config.trainer.batch_size,
+            "optimizer": base_config.trainer.optimizer,
         },
     }
     if params:
@@ -207,6 +220,12 @@ class MethodRunner:
         # 1. SP ask
         trial = self.sm.ask(self.study_id)
         self._agent_decisions += 1
+        # 修复（5.13）：trial 开始无日志，加 INFO 留痕（含 trial_id + params）
+        logger.info(
+            "MethodRunner.run: trial started, trial_id=%s, run_idx=%d, "
+            "dataset=%s, model_id=%s, params=%s",
+            trial.trial_id, run_idx, dataset, model_id, trial.params,
+        )
 
         # 2. 应用参数 + 覆盖 dataset/model_id
         modified_config = apply_params(self.config.base_config, trial.params)
@@ -232,6 +251,11 @@ class MethodRunner:
             logger.warning(
                 "Method trial exception: loss=%s, error=%s",
                 trial.params.get("loss"), e,
+            )
+            # 修复（5.13）：trial 异常结束无日志，加 INFO 留痕
+            logger.info(
+                "MethodRunner.run: trial failed, trial_id=%s, status=FAILED, error=%s",
+                trial.trial_id, e,
             )
             return TrialResult(
                 experiment_id=self.experiment_id,
@@ -338,6 +362,27 @@ class MethodRunner:
         metrics = _extract_metrics_from_train_output(train_output)
         efficiency = _extract_efficiency_from_train_output(train_output)
 
+        # 修复（5.13）：trial 结束无日志，加 INFO 留痕（含 trial_id / status / metric）
+        # 修复（5.4）：ML_TRIAL_BEST_METRIC OTel 埋点（OTel 未初始化时 no-op）
+        try:
+            best_value = float(metrics.get(self.config.metric, 0.0))
+        except (TypeError, ValueError):
+            best_value = 0.0
+        logger.info(
+            "MethodRunner.run: trial finished, trial_id=%s, status=%s, "
+            "metric=%s, value=%s, n_epochs=%d, wall_time_s=%.2f",
+            trial.trial_id, status.value if hasattr(status, "value") else status,
+            self.config.metric, best_value,
+            efficiency["n_epochs_trained"], efficiency["wall_time_s"],
+        )
+        try:
+            record_training_metric(
+                ML_TRIAL_BEST_METRIC, value=best_value,
+                stage="hpo",
+            )
+        except Exception:
+            pass
+
         return TrialResult(
             experiment_id=self.experiment_id,
             group=TrialGroup.METHOD,
@@ -353,7 +398,7 @@ class MethodRunner:
             agent_decisions=self._agent_decisions,
             config_snapshot=_build_config_snapshot(modified_config, trial.params),
             artifact_manifest_path=(
-                f"{train_output.output_dir}/artifact_manifest.json"
+                str(Path(train_output.output_dir) / "manifest.json")
                 if train_output.output_dir else None
             ),
             status=status,

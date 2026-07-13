@@ -16,14 +16,18 @@ import sys
 import traceback
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+# bootstrap：senseframe 可导入前的必要本地推导
+_BOOTSTRAP_ROOT = Path(__file__).resolve().parents[1]
+if str(_BOOTSTRAP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BOOTSTRAP_ROOT))
 
-from senseframe.engine.config import ExperimentConfig
-from senseframe.engine.runner import run_experiment
+from senseframe.common.paths import PROJECT_ROOT, resolve_data_root  # noqa: E402
+from senseframe.engine.config import ExperimentConfig  # noqa: E402
+from senseframe.engine.runner import run_experiment  # noqa: E402
 
 
-DATA_ROOT = PROJECT_ROOT / "CSI_DATASETS" / "Data"
+# data_root 从 SENSEFRAME_DATA_ROOT env 读（框架不猜测路径，未设置则 raise）
+DATA_ROOT = resolve_data_root()
 OUTPUT_BASE = "results_new"
 BASELINE_PATH = PROJECT_ROOT / "tests" / "baseline_report.json"
 NEW_REPORT_PATH = PROJECT_ROOT / "tests" / "new_report.json"

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -19,6 +20,10 @@ from typing import Protocol, runtime_checkable
 if TYPE_CHECKING:
     # 仅用于类型注解，避免运行时循环导入
     from .orchestration_store import OrchestrationStore
+
+# 修复：模块顶部未 import logging，load_checkpoint 等方法引用 logger 时 NameError。
+# 旧逻辑传含 .. 的 output_dir 时直接崩溃，无法记录审计日志。
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -75,10 +80,11 @@ class PipelineDef:
 
     @classmethod
     def default(cls, name: str = "default") -> "PipelineDef":
-        """默认 Pipeline 定义（8 stage）。
+        """默认 Pipeline 定义（9 stage）。
 
         P0.7：stage 顺序与 Pipeline.default() 对齐，
         使 PipelineDef.default().materialize() 与 Pipeline.default() 等价。
+        方案 B：新增 probe_vram stage（位于 build 和 train 之间，动态显存探测）。
         """
         return cls(
             name=name,
@@ -88,6 +94,7 @@ class PipelineDef:
                 StageTemplate("load", reads=["config", "scene", "dataset"], writes=["bundle", "data_profile", "output_dir"]),
                 StageTemplate("resolve", reads=["config", "scene", "dataset"], writes=["task_spec", "feature_spec", "resolved", "lightning_params"]),
                 StageTemplate("build", reads=["config", "scene", "model_id", "bundle"], writes=["model", "datamodule", "module", "callbacks"]),
+                StageTemplate("probe_vram", reads=["model", "datamodule", "resolved", "report"], writes=["vram_probe_result"]),
                 StageTemplate("train", reads=["config", "model", "datamodule", "module"], writes=["trainer", "output"]),
                 StageTemplate("eval", reads=["config", "trainer", "module", "datamodule"], writes=["output"]),
                 StageTemplate("export", reads=["config", "model", "module", "output"], writes=["output"]),
@@ -538,51 +545,83 @@ class Orchestrator:
     def start(self, run_id: str) -> None:
         """启动 PipelineRun（OP-6）。"""
         run = self._get_run(run_id)
+        old_phase = run.phase
         run.transition(PHASE_RUNNING)
+        # 修复（5.14）：状态转换只发 CloudEvent 不写日志，加 INFO 留痕
+        logger.info(
+            "OP start: run_id=%s, phase transition: %s -> %s",
+            run_id, old_phase, run.phase,
+        )
         self._emit_event(EVENT_PIPELINE_STARTED, run_id, {"phase": run.phase})
         self._persist_run(run)
 
     def pause(self, run_id: str) -> None:
         """暂停 PipelineRun（OP-6）。"""
         run = self._get_run(run_id)
+        old_phase = run.phase
         run.transition(PHASE_PAUSED)
+        logger.info(
+            "OP pause: run_id=%s, phase transition: %s -> %s",
+            run_id, old_phase, run.phase,
+        )
         self._emit_event(EVENT_PIPELINE_PAUSED, run_id, {"phase": run.phase})
         self._persist_run(run)
 
     def resume(self, run_id: str) -> None:
         """恢复 PipelineRun（OP-6）。"""
         run = self._get_run(run_id)
+        old_phase = run.phase
         run.transition(PHASE_RUNNING)
+        logger.info(
+            "OP resume: run_id=%s, phase transition: %s -> %s",
+            run_id, old_phase, run.phase,
+        )
         self._emit_event(EVENT_PIPELINE_RESUMED, run_id, {"phase": run.phase})
         self._persist_run(run)
 
     def retry(self, run_id: str) -> None:
         """重试 PipelineRun（OP-6）。"""
         run = self._get_run(run_id)
+        old_phase = run.phase
         run.transition(PHASE_RUNNING)
         run.retry_count += 1
+        logger.info(
+            "OP retry: run_id=%s, phase transition: %s -> %s, retry_count=%d",
+            run_id, old_phase, run.phase, run.retry_count,
+        )
         self._emit_event(EVENT_PIPELINE_STARTED, run_id, {"phase": run.phase, "retry": run.retry_count})
         self._persist_run(run)
 
     def stop(self, run_id: str) -> None:
         """停止 PipelineRun（OP-6）。"""
         run = self._get_run(run_id)
+        old_phase = run.phase
         run.transition(PHASE_FAILED)
         run.error = "Stopped by orchestrator"
+        logger.info(
+            "OP stop: run_id=%s, phase transition: %s -> %s",
+            run_id, old_phase, run.phase,
+        )
         self._emit_event(EVENT_PIPELINE_FAILED, run_id, {"phase": run.phase, "error": run.error})
         self._persist_run(run)
 
     def complete(self, run_id: str, output_uri: str = "") -> None:
         """标记 PipelineRun 成功完成（OP-6）。"""
         run = self._get_run(run_id)
+        old_phase = run.phase
         run.transition(PHASE_SUCCEEDED)
         run.output_uri = output_uri
+        logger.info(
+            "OP complete: run_id=%s, phase transition: %s -> %s, output_uri=%s",
+            run_id, old_phase, run.phase, output_uri,
+        )
         self._emit_event(EVENT_PIPELINE_SUCCEEDED, run_id, {"phase": run.phase, "output_uri": output_uri})
         self._persist_run(run)
 
     def fail(self, run_id: str, error: str, stage_name: str = "") -> None:
         """标记 PipelineRun 失败（OP-6）。"""
         run = self._get_run(run_id)
+        old_phase = run.phase
         run.transition(PHASE_FAILED)
         run.error = error
         if stage_name:
@@ -591,6 +630,10 @@ class Orchestrator:
                     s.phase = "failed"
                     s.error = error
                     break
+        logger.info(
+            "OP fail: run_id=%s, phase transition: %s -> %s, stage=%s, error=%s",
+            run_id, old_phase, run.phase, stage_name, error,
+        )
         self._emit_event(EVENT_PIPELINE_FAILED, run_id, {"phase": run.phase, "error": error, "stage": stage_name})
         self._persist_run(run)
 
@@ -653,7 +696,16 @@ class Orchestrator:
             get_checkpoints(run_id) 返回的 stage_snapshot 含 stage_outputs 字段，
             且与 pipeline_checkpoint.json 内容一致
         """
-        ckpt_path = Path(output_dir) / "pipeline_checkpoint.json"
+        # M4 修复：output_dir 来自外部（不可信），resolve 后记录审计日志
+        # 正常流程下 output_dir 由 pipeline.py 创建（已受 M2 保护），此处防御直接调用
+        output_dir_resolved = Path(output_dir).resolve()
+        # 检测路径含 .. 的可疑输入（resolve 前后差异大）
+        if ".." in str(output_dir):
+            logger.warning(
+                "load_checkpoint: output_dir contains '..' (suspicious): %s -> %s",
+                output_dir, output_dir_resolved,
+            )
+        ckpt_path = output_dir_resolved / "pipeline_checkpoint.json"
         if not ckpt_path.exists():
             return None
 
@@ -848,15 +900,24 @@ class Orchestrator:
         for cb in callbacks:
             try:
                 cb(event)
-            except Exception:
-                pass  # 订阅者异常不影响主流程
+            except Exception as e:
+                # 修复（5.15）：禁止静默吞订阅者异常，至少 warning 留痕
+                # 旧逻辑 except Exception: pass → CloudEvent 丢失无告警
+                logger.warning(
+                    "event subscriber failed (event_type=%s, run_id=%s): %s",
+                    event_type, run_id, e,
+                )
         # P3.4.3: 外部 sink（FileEventSink / Kafka / Webhook 等）
         # sink 异常不影响主流程（与订阅者同语义）
         if self._event_sink is not None:
             try:
                 self._event_sink.emit(event)
-            except Exception:
-                pass  # sink 异常不阻断主流程
+            except Exception as e:
+                # 修复（5.15）：禁止静默吞 sink 异常，至少 warning 留痕
+                logger.warning(
+                    "event sink emit failed (event_type=%s, run_id=%s): %s",
+                    event_type, run_id, e,
+                )
 
     # ============================================================
     # P2.11: 异步执行（reconcile 真循环 + wait_for_completion）

@@ -17,9 +17,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# 默认数据根目录（相对于项目根目录）
-# Phase R3：从顶层 config.py 迁入，统一配置入口
-DEFAULT_DATA_ROOT = str(Path(__file__).parent.parent.parent / "CSI_DATASETS" / "Data")
+# 数据根目录：框架不猜测路径，由调用者显式提供（YAML scene.data_root / CLI --data-root
+# / env SENSEFRAME_DATA_ROOT）。SceneConfig.data_root 必填，validate 校验非空。
+# 删除原 DEFAULT_DATA_ROOT 模块级常量：import 时推导路径是反模式，且掩盖配置缺失。
 
 
 # ============================================================
@@ -174,6 +174,9 @@ class TrainerConfig:
     # RFC-004 方案 E：默认早停（patience=5，5 epoch 无 val_loss 提升则停）
     early_stopping: Optional[int] = 5       # patience，None 表示不启用
     early_stopping_min_delta: float = 0.001  # val_loss 提升阈值，低于此值视为无提升
+    # P2-3 修复：EarlyStopping/ModelCheckpoint monitor 可配置化
+    # 默认 "val_loss"，与 module.py validation_step 的 log key 对齐
+    early_stopping_monitor: str = "val_loss"
     deterministic: bool = False
     max_time: Optional[str] = None           # DD:HH:MM:SS 格式，None 不限时
     seed: int = 42
@@ -199,6 +202,16 @@ class TrainerConfig:
     # Phase 14.3.3：mixed_precision 正交化（原 scene.params 透传）
     # True=16-mixed, False=32, 字符串直接透传（如 "bf16-mixed"），None=自动
     mixed_precision: Optional[Any] = None
+    # P2-3: dry-run 动态校验支持 — 限制训练/验证 batch 数
+    # None=不限制（默认，向后兼容），1.0/1=只跑 1 batch（dry-run 用）
+    limit_train_batches: Optional[Any] = None
+    limit_val_batches: Optional[Any] = None
+    # Part 4：自动 LR 标定（Lightning LR Range Test）。
+    # True 时 stage_train 在 fit 前用独立 Trainer 调 trainer.tune()，基于前向+反向
+    # 1 epoch 数据自动建议学习率。耗时约 1 epoch，默认 False（显式启用）。
+    # 仅监督模式生效（自监督模式的 LR 需不同策略）。
+    # 设计决策（风险推演 R3）：用独立 tune_trainer 隔离副作用，不污染训练 Trainer 状态。
+    auto_lr_find: bool = False
 
     def validate(self) -> None:
         if self.epochs <= 0:
@@ -317,7 +330,7 @@ class SceneConfig:
     dataset: str                                 # 数据集名
     model_id: str                                # 模型 ID
     learning_mode: str = "supervised"            # 见 SUPPORTED_LEARNING_MODES
-    data_root: Optional[str] = None              # 数据根目录，None 用场景默认
+    data_root: str = ""                          # 数据根目录，必填（YAML/CLI/env 三选一）
     params: Dict[str, Any] = field(default_factory=dict)  # 场景特定参数
     # Phase 12.3：task_spec 字段，None 表示用 scene 默认
     task_spec: Optional[TaskSpecField] = None
@@ -333,6 +346,13 @@ class SceneConfig:
             raise ValueError(
                 f"scene.learning_mode '{self.learning_mode}' 不支持，"
                 f"可选: {SUPPORTED_LEARNING_MODES}"
+            )
+        if not self.data_root:
+            raise ValueError(
+                "scene.data_root 必填。提供方式（三选一）：\n"
+                "  - YAML: scene.data_root: /path/to/CSI_DATASETS\n"
+                "  - CLI: --data-root /path/to/CSI_DATASETS\n"
+                "  - Env: SENSEFRAME_DATA_ROOT=/path/to/CSI_DATASETS"
             )
         if self.task_spec is not None:
             self.task_spec.validate()
@@ -372,6 +392,9 @@ class ExperimentConfig:
     # RFC-002 阶段 K：Trainer 工厂注入，Agent 可自定义 Trainer 构造
     # None 时使用框架默认 pl.Trainer 构造逻辑
     trainer_factory: Optional[Any] = None      # Callable(**kwargs) -> pl.Trainer
+    # P1-1: 严格 schema 校验模式（True 时 training_log 类型污染直接抛错，
+    # False 时降级保留原始 entry 保持向后兼容）
+    strict_schema: bool = False
 
     # ------------------------------------------------------------
     # 解析
@@ -431,6 +454,7 @@ class ExperimentConfig:
             output_dir=d.get("output_dir", "runs"),
             save_model=d.get("save_model", True),
             export_formats=d.get("export_formats", []),
+            strict_schema=d.get("strict_schema", False),
         )
 
     # ------------------------------------------------------------
@@ -473,6 +497,7 @@ class ExperimentConfig:
             "output_dir": self.output_dir,
             "save_model": self.save_model,
             "export_formats": self.export_formats,
+            "strict_schema": self.strict_schema,
         }
 
 

@@ -14,7 +14,7 @@ P3 支持的增强算子（候选池）：
 - freq_masking：频域掩码（频谱增强）
 - noise：高斯噪声
 - cutout：随机遮挡（时序片段置零）
-- mixup：样本混合（batch 级，P3 暂不通过 search_space 搜索，走 batch_transform）
+- mixup：样本混合（batch 级，P3 暂不通过 search_space 搜索，走 GenericDataModule.collate_fn）
 
 设计原则（RFC-003 原则 4）：
 - 搜索对象即 SP SearchSpace（不另起炉灶）

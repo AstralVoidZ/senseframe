@@ -362,6 +362,21 @@ def _default_objective(trial, config: ExperimentConfig,
     # 2. 应用参数
     modified_config = apply_params(config, params)
 
+    # 修复（2.8）：注入 OptunaReportingCallback，桥接 Lightning 中间指标到
+    # trial.report()，让 Pruner 基于 epoch 级指标剪枝。
+    # 通过 extra_callbacks 传入（stage_build 会 extend 到 ctx.callbacks），
+    # trial 通过构造函数传入回调。
+    try:
+        from .runner.orchestrator import OptunaReportingCallback
+        modified_config.extra_callbacks.append(
+            OptunaReportingCallback(trial=trial, metric=config.hpo.metric)
+        )
+    except ImportError:
+        logger.warning(
+            "OptunaReportingCallback unavailable (optuna or orchestrator module "
+            "not installed); HPO pruner will not receive intermediate values."
+        )
+
     # 3. 训练
     result = run_pipeline(modified_config)
 

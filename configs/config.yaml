@@ -5,6 +5,9 @@ scene:
   dataset: UT_HAR_data
   model_id: ResNet18
   learning_mode: supervised
+  # data_root 必填：数据根目录绝对路径（如 /home/user/CSI_DATASETS）
+  # 三选一：YAML 此字段 / CLI --data-root / env SENSEFRAME_DATA_ROOT
+  data_root: ""
   params:
     metrics: [accuracy, macro_f1, micro_f1]
     average: macro

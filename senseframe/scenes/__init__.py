@@ -14,9 +14,22 @@
     register_scene("my_scene", MySceneContainer())
 """
 
+import logging
+import threading
 from typing import Any, Dict, List
 
 from .base import DefaultConfig, SceneContainer, SceneMeta, SearchSpace, TransformConfig
+
+_logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 线程安全保护（问题 4.7）
+# ============================================================
+# 用 RLock 避免同线程递归死锁（如 _ensure_lazy_scene 调用 register_scene）
+# 锁粒度最小化：只锁 _REGISTRY / _LAZY_SCENES / _LAZY_PROXIES 的字典读写，
+# 不锁外部代码（如 register_factories 内的 import、container.meta() 等）
+_SCENES_LOCK = threading.RLock()
 
 
 # ============================================================
@@ -25,6 +38,10 @@ from .base import DefaultConfig, SceneContainer, SceneMeta, SearchSpace, Transfo
 # 延迟注册的场景：首次访问时才实例化容器，但元数据可静态声明
 _LAZY_SCENES: Dict[str, SceneMeta] = {}
 
+# 问题 4.8：LazySceneContainer proxy 缓存
+# 同 name 只创建一次 proxy，避免 _REGISTRY 内容器实例漂移
+_LAZY_PROXIES: Dict[str, Any] = {}
+
 
 def declare_lazy_scene(name: str, meta: SceneMeta) -> None:
     """声明延迟注册场景的元数据（不实例化容器）。
@@ -32,16 +49,60 @@ def declare_lazy_scene(name: str, meta: SceneMeta) -> None:
     允许 list_scenes/has_scene 在场景未激活时返回元数据，
     避免在框架核心层硬编码具体场景信息。
     """
-    _LAZY_SCENES[name] = meta
+    with _SCENES_LOCK:
+        _LAZY_SCENES[name] = meta
 
 
 def _ensure_lazy_scene(name: str) -> None:
-    """触发延迟注册场景的实例化。"""
-    if name in _REGISTRY:
+    """触发延迟注册场景的实例化。
+
+    修复（问题 4.8）：缓存 proxy 实例，同 name 只创建一次
+    LazySceneContainer，避免 _REGISTRY 内容器实例漂移。
+
+    修复（问题 4.7）：所有 _REGISTRY / _LAZY_PROXIES 读写均在 _SCENES_LOCK 内。
+    import 在锁外执行（避免锁住外部代码）；register_scene 内部自带锁（RLock 可重入）。
+    """
+    # 快速路径：已注册直接返回
+    with _SCENES_LOCK:
+        if name in _REGISTRY:
+            return
+        proxy = _LAZY_PROXIES.get(name)
+
+    if proxy is not None:
+        # proxy 已缓存，直接注册（register_scene 内部加锁）
+        _register_cached_proxy(name, proxy)
         return
+
+    # 首次创建 proxy（import 在锁外执行，避免锁住外部代码）
     if name == "wifi_csi":
         from ._wifi_csi_lazy import LazyWiFiCSIContainer
-        register_scene("wifi_csi", LazyWiFiCSIContainer())
+        proxy = LazyWiFiCSIContainer()
+    else:
+        return
+
+    # 缓存 proxy（双检：避免多线程同时创建不同 proxy 实例）
+    with _SCENES_LOCK:
+        if name in _LAZY_PROXIES:
+            proxy = _LAZY_PROXIES[name]
+        else:
+            _LAZY_PROXIES[name] = proxy
+
+    _register_cached_proxy(name, proxy)
+
+
+def _register_cached_proxy(name: str, proxy: Any) -> None:
+    """用缓存的 proxy 注册到 _REGISTRY（并发安全）。
+
+    并发场景下另一线程可能已注册同名 scene，此时忽略 ValueError。
+    """
+    with _SCENES_LOCK:
+        if name in _REGISTRY:
+            return
+    try:
+        register_scene(name, proxy)
+    except ValueError:
+        # 并发场景：另一线程已注册同名 scene，忽略
+        pass
 
 # ============================================================
 # 注册表
@@ -78,52 +139,85 @@ def register_scene(name: str, container: Any, *, overwrite: bool = False) -> Non
         container: 场景容器实例（继承 SceneContainer 或鸭子类型）
         overwrite: True 时覆盖已注册的同名场景；False 时已存在则 raise
     """
-    if not overwrite and name in _REGISTRY:
-        raise ValueError(f"Scene '{name}' already registered")
-    _validate_scene_capabilities(container)
-    _REGISTRY[name] = container
+    _validate_scene_capabilities(container)  # 纯验证（getattr），不调外部代码
+    with _SCENES_LOCK:
+        if not overwrite and name in _REGISTRY:
+            raise ValueError(f"Scene '{name}' already registered")
+        _REGISTRY[name] = container
 
 
 def get_scene(name: str) -> SceneContainer:
-    """获取已注册的场景容器（支持延迟注册）。"""
-    if name not in _REGISTRY and name in _LAZY_SCENES:
-        _ensure_lazy_scene(name)
-    if name not in _REGISTRY:
+    """获取已注册的场景容器（支持延迟注册）。
+
+    修复（问题 4.7）：_REGISTRY / _LAZY_SCENES 读操作加锁。
+    _ensure_lazy_scene 触发的外部 import 在锁外执行。
+    """
+    with _SCENES_LOCK:
+        if name in _REGISTRY:
+            return _REGISTRY[name]
+        is_lazy = name in _LAZY_SCENES
+        if not is_lazy:
+            available = list(_REGISTRY.keys()) + list(_LAZY_SCENES.keys())
+            raise ValueError(f"Unknown scene: '{name}'. Available: {available}")
+    # 触发延迟注册（import 在 _ensure_lazy_scene 内部锁外执行）
+    _ensure_lazy_scene(name)
+    with _SCENES_LOCK:
+        if name in _REGISTRY:
+            return _REGISTRY[name]
         available = list(_REGISTRY.keys()) + list(_LAZY_SCENES.keys())
-        raise ValueError(f"Unknown scene: '{name}'. Available: {available}")
-    return _REGISTRY[name]
+    raise ValueError(f"Unknown scene: '{name}'. Available: {available}")
 
 
-def list_scenes() -> Dict[str, SceneMeta]:
+def list_scenes() -> Dict[str, Any]:
     """列出所有已注册场景及其元数据（含延迟注册场景）。
 
     防御性查询：若 _REGISTRY 中某容器的 .meta() 抛异常（如外部依赖缺失
     导致半激活容器），回退到 _LAZY_SCENES 中的静态元数据，不阻塞其他
     场景的列举。这是 list_scenes 作为纯查询函数应有的健壮性
     （CQS 合规：不修改注册表，但容忍容器自身的实例化失败）。
+
+    修复（问题 4.9）：异常不再静默吞，logger.warning 记录失败场景。
+    失败场景名加入返回值的 "_unavailable" 列表（key 为 "_unavailable"，
+    value 为 List[str]），供调用方感知哪些场景激活失败。
+    注意：调用方迭代返回值时应跳过 "_unavailable" key（其 value 是 List[str]
+    而非 SceneMeta）。
+
+    修复（问题 4.7）：_REGISTRY / _LAZY_SCENES 读操作加锁；container.meta()
+    调用外部代码，在锁外执行。
     """
-    result: Dict[str, SceneMeta] = {}
-    for name, container in _REGISTRY.items():
+    result: Dict[str, Any] = {}
+    unavailable: List[str] = []
+    # 快照注册表（锁内），container.meta() 在锁外执行（可能调用外部代码）
+    with _SCENES_LOCK:
+        items = list(_REGISTRY.items())
+        lazy_items = list(_LAZY_SCENES.items())
+    for name, container in items:
         try:
             result[name] = container.meta()
-        except Exception:
+        except Exception as e:
             # 容器实例化失败（如 wifi_csi 缺 SenseFi 依赖）：
-            # 回退到 _LAZY_SCENES 静态元数据，若也不存在则跳过
-            if name in _LAZY_SCENES:
-                result[name] = _LAZY_SCENES[name]
+            # logger.warning 留痕（不再静默吞），回退到 _LAZY_SCENES 静态元数据
+            _logger.warning(f"list_scenes: scene {name} activation failed: {e}")
+            unavailable.append(name)
+            with _SCENES_LOCK:
+                if name in _LAZY_SCENES:
+                    result[name] = _LAZY_SCENES[name]
     # 延迟注册场景：即使未激活也列出其元数据
-    for name, meta in _LAZY_SCENES.items():
+    for name, meta in lazy_items:
         if name not in result:
             result[name] = meta
+    if unavailable:
+        result["_unavailable"] = unavailable
     return result
 
 
 def has_scene(name: str) -> bool:
     """检查场景是否已注册（含延迟注册场景）。"""
-    return name in _REGISTRY or name in _LAZY_SCENES
+    with _SCENES_LOCK:
+        return name in _REGISTRY or name in _LAZY_SCENES
 
 
-def activate_lazy_scenes() -> None:
+def activate_lazy_scenes() -> Dict[str, str]:
     """激活所有延迟注册场景。
 
     入口点契约：任何查询 registry 的入口点（CLI/scripts/external API）
@@ -131,27 +225,58 @@ def activate_lazy_scenes() -> None:
     激活责任转移到调用方。
 
     逐个触发延迟场景的实例化（调用 get_scene 触发 _ensure_lazy_scene）。
-    某个场景因依赖缺失而激活失败时，静默跳过，不影响其他场景。
+    某个场景因依赖缺失而激活失败时，跳过该场景，不影响其他场景。
 
     激活验证：注册容器后立即调用 .meta() 验证可正常实例化。若 .meta()
     抛异常（如外部依赖缺失），从 _REGISTRY 回滚移除，使该场景保持
     "仅 _LAZY_SCENES 元数据可用"状态，避免 list_scenes() 后续触发半激活
     容器的 .meta() 而抛异常（反向验证发现的方案 B 缺陷）。
 
+    修复（异常分级）：
+    - ImportError（如 SenseFi 缺失）：logger.warning + 降级，元数据可能已注册
+      （依赖 register_metadata 拆分），list_models / get_default_epochs 仍可用。
+    - 其他异常（TypeError/AttributeError/NameError 等代码 bug）：
+      logger.error + 留 exc_info 痕迹，便于排查。
+    旧逻辑 except Exception 静默吞所有异常，用户无法感知 wifi_csi 不可用。
+
+    返回 dict: {scene_name: error_message}，激活成功的场景不在 dict 中。
     供 CLI list-models / list-datasets 等需要在场景上下文外查询注册表的入口调用，
     确保 wifi_csi 等延迟场景的模型/数据集元数据已注册到全局注册表。
 
     See: RFC-004 方案 B — 入口点显式激活契约
     """
-    for name in list(_LAZY_SCENES.keys()):
-        if name not in _REGISTRY:
-            try:
-                container = get_scene(name)
-                # 验证容器可正常实例化：调用 .meta() 触发完整激活
-                container.meta()
-            except Exception:
-                # 激活失败：回滚 _REGISTRY，保留 _LAZY_SCENES 元数据
+    errors: Dict[str, str] = {}
+    # 快照 _LAZY_SCENES / _REGISTRY keys（锁内），避免迭代时其他线程修改
+    with _SCENES_LOCK:
+        lazy_names = list(_LAZY_SCENES.keys())
+        registered_names = set(_REGISTRY.keys())
+    for name in lazy_names:
+        if name in registered_names:
+            continue
+        try:
+            container = get_scene(name)
+            # 验证容器可正常实例化：调用 .meta() 触发完整激活
+            container.meta()
+        except ImportError as e:
+            # 预期可恢复异常：外部依赖缺失，降级处理
+            # register_metadata() 可能已完成，list_models 等元数据查询仍可用
+            errors[name] = f"ImportError: {e}"
+            _logger.warning(
+                f"Scene '{name}' activation skipped (missing dependency): {e}"
+            )
+            # 回滚 _REGISTRY，保留 _LAZY_SCENES 元数据
+            with _SCENES_LOCK:
                 _REGISTRY.pop(name, None)
+        except Exception as e:
+            # 代码 bug：留 exc_info 痕迹，便于排查
+            errors[name] = f"{type(e).__name__}: {e}"
+            _logger.error(
+                f"Unexpected error activating scene '{name}': {e}",
+                exc_info=True,
+            )
+            with _SCENES_LOCK:
+                _REGISTRY.pop(name, None)
+    return errors
 
 
 # ============================================================
@@ -162,21 +287,33 @@ def _register_builtin_scenes() -> None:
 
     WiFi CSI 场景延迟注册：仅在首次 get_scene("wifi_csi") 时触发，
     避免 SenseFi 代码库缺失时阻塞框架其他功能。
+
+    修复（异常隔离）：旧逻辑 generic/custom/detection 任一导入失败会导致
+    import senseframe 崩溃。改为逐个 try/except，单个场景失败不影响其他。
     """
-    from .generic.container import GenericContainer
+    # generic 场景
+    try:
+        from .generic.container import GenericContainer
+        if "generic" not in _REGISTRY:
+            register_scene("generic", GenericContainer())
+    except Exception as e:
+        _logger.error(f"Failed to register 'generic' scene: {e}", exc_info=True)
 
-    if "generic" not in _REGISTRY:
-        register_scene("generic", GenericContainer())
+    # custom 场景
+    try:
+        from .custom.container import CustomContainer
+        if "custom" not in _REGISTRY:
+            register_scene("custom", CustomContainer())
+    except Exception as e:
+        _logger.error(f"Failed to register 'custom' scene: {e}", exc_info=True)
 
-    from .custom.container import CustomContainer
-
-    if "custom" not in _REGISTRY:
-        register_scene("custom", CustomContainer())
-
-    from .detection.container import DetectionContainer
-
-    if "detection" not in _REGISTRY:
-        register_scene("detection", DetectionContainer())
+    # detection 场景
+    try:
+        from .detection.container import DetectionContainer
+        if "detection" not in _REGISTRY:
+            register_scene("detection", DetectionContainer())
+    except Exception as e:
+        _logger.error(f"Failed to register 'detection' scene: {e}", exc_info=True)
 
     # WiFi CSI 延迟注册：声明元数据但不实例化容器
     declare_lazy_scene("wifi_csi", SceneMeta(

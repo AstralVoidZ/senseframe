@@ -14,10 +14,22 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# WSL2 检测提示去重标志：进程内只在首次 setup_logging 时打印一次
+# 避免 CLI 子命令重复调用 setup_logging 导致 "WSL2 detected" 日志刷屏
+_WSL2_WARNED = False
+
+# 修复（5.17）：单次初始化标志——setup_logging 被多个模块独立调用时，
+# 首次调用完成配置后，后续调用直接返回已配置的 logger（idempotent），
+# 避免重复 close/clear handler 导致 FileHandler 句柄泄露 + 日志丢失。
+_LOGGING_CONFIGURED = False
+
 
 def setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> logging.Logger:
     """
-    配置全局日志。
+    配置全局日志（单次初始化，重复调用 idempotent）。
+
+    首次调用完成 handler 配置；后续调用直接返回已配置的 logger，
+    不再重复 close/clear handler（避免 FileHandler 句柄泄露）。
 
     Args:
         level: DEBUG/INFO/WARN/ERROR
@@ -26,7 +38,14 @@ def setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> loggin
     Returns:
         配置好的 senseframe logger
     """
+    global _LOGGING_CONFIGURED, _WSL2_WARNED
+
     logger = logging.getLogger("senseframe")
+
+    # 单次初始化：已配置时直接返回，避免重复 reconfigure
+    if _LOGGING_CONFIGURED:
+        return logger
+
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     # RFC-005：先 close 旧 handler（释放文件句柄），再 clear（避免 FileHandler 句柄泄露）
     for h in list(logger.handlers):
@@ -55,17 +74,29 @@ def setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> loggin
 
     # RFC-004 方案 F：WSL2 环境检测 + 内存回收提示（一次性 info）
     # WSL2 autoMemoryReclaim=Gradual 异步缓慢回收，训练后内存占用可能持续偏高
-    try:
-        import platform
-        if "microsoft" in platform.uname().release.lower():
-            logger.info(
-                "WSL2 detected. If memory is not released after training, "
-                "run 'sudo sh -c \"echo 1 > /proc/sys/vm/drop_caches\"' in WSL, "
-                "or set [wsl2] autoMemoryReclaim=dropcache in %USERPROFILE%\\.wslconfig"
-            )
-    except Exception:
-        pass
+    # 去重：进程内仅在首次 setup_logging 时打印，避免 CLI 子命令重复调用刷屏
+    # P2-1：跨进程去重——CLI 每个子命令是新进程，进程内 _WSL2_WARNED 失效，
+    # 用 ~/.senseframe/runtime_state.json 持久化跨进程状态。
+    if not _WSL2_WARNED:
+        # 函数内导入避免早期模块循环依赖（observability 是基础模块）
+        from .common.runtime_state import get_state, set_state
+        # 先检查进程内标志（同进程内去重），再检查跨进程状态（跨进程去重）
+        if not get_state("wsl2_warning_shown", False):
+            try:
+                import platform
+                if "microsoft" in platform.uname().release.lower():
+                    logger.info(
+                        "WSL2 detected. If memory is not released after training, "
+                        "run 'sudo sh -c \"echo 1 > /proc/sys/vm/drop_caches\"' in WSL, "
+                        "or set [wsl2] autoMemoryReclaim=dropcache in %USERPROFILE%\\.wslconfig"
+                    )
+                    # 提示后立即持久化，避免后续子命令重复打印
+                    set_state("wsl2_warning_shown", True)
+            except Exception:
+                pass
+        _WSL2_WARNED = True
 
+    _LOGGING_CONFIGURED = True
     return logger
 
 

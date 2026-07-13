@@ -56,12 +56,15 @@ class CSIDataModule(pl.LightningDataModule):
 
         self.train_dataset = None
         self.test_dataset = None
+        # P2-3 修复：增加 val_dataset 属性，消除 fallback 到 test_set 的隐式行为
+        self.val_dataset = None
         self.unsupervised_dataset = None
         self.supervised_dataset = None
 
     def setup(self, stage: Optional[str] = None):
         from .loaders import get_loader, has_loader
         from .loaders._builtin import register_builtin_loaders
+        from .loaders.base import DatasetLoader
 
         register_builtin_loaders()
 
@@ -69,10 +72,17 @@ class CSIDataModule(pl.LightningDataModule):
         loader_type = spec.loader_type if spec else None
 
         if loader_type and has_loader(loader_type):
-            splits = get_loader(loader_type).load_splits(
+            loader = get_loader(loader_type)
+            splits = loader.load_splits(
                 self.root, self.dataset_name, self.learning_mode,
             )
+            # P2-3 修复：无原生 val 时从 train 自动划分
+            if splits.val is None and spec and spec.val_split_ratio is not None:
+                splits = DatasetLoader._auto_split_val(
+                    splits, spec.val_split_ratio, seed=42,
+                )
             self.train_dataset = splits.train
+            self.val_dataset = splits.val
             self.test_dataset = splits.test
             self.unsupervised_dataset = splits.unsupervised
             self.supervised_dataset = splits.supervised
@@ -129,8 +139,10 @@ class CSIDataModule(pl.LightningDataModule):
         )
 
     def val_dataloader(self):
+        # P2-3 修复：优先使用独立 val_dataset，无 val 时回退到 test_dataset
+        ds = self.val_dataset if self.val_dataset is not None else self.test_dataset
         return DataLoader(
-            self.test_dataset,
+            ds,
             batch_size=self.batch_size * 2,
             shuffle=False,
             num_workers=self.num_workers,

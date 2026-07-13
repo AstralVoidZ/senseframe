@@ -15,10 +15,11 @@
     1. 根据参数生成 ExperimentConfig YAML
     2. 自动填充数据集对应的 num_classes 和 input_shape
     3. 输出到 stdout 或指定文件
-    4. 自监督模式自动设置 num_classes=14
+    4. 自监督模式从 supervised_source 数据集 spec 派生 num_classes
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -38,27 +39,59 @@ activate_lazy_scenes()
 # 注意：input_shape 在 DATASET_INFO 中为 tuple，转为 list 供 YAML 序列化
 from senseframe.registry import DATASET_INFO  # noqa: E402
 
+_logger = logging.getLogger(__name__)
+
 
 def _get_dataset_meta(dataset: str) -> dict:
-    """从 DATASET_INFO 获取数据集元信息，缺失时回退到通用默认值。"""
+    """从 DATASET_INFO 获取数据集元信息，未注册则 raise（框架不猜测）。"""
     info = DATASET_INFO.get(dataset)
     if info is None:
-        return {"num_classes": 7, "input_shape": [270, 3]}
+        raise KeyError(
+            f"数据集 '{dataset}' 未注册，无法派生 num_classes/input_shape。"
+            f"请先通过场景注册（register_dataset）声明该数据集元数据。"
+        )
     return {
         "num_classes": info["num_classes"],
         "input_shape": list(info["input_shape"]),
     }
 
 
+def _derive_supervised_num_classes(dataset: str) -> int:
+    """自监督模式：从 DatasetSpec.supervised_source 派生 num_classes。
+
+    框架不猜测：supervised_source 为空或未注册则 raise，不回退 fallback，
+    不硬编码 "NTU-Fi-HumanID"。
+    """
+    from senseframe.registry import get_dataset_spec, is_dataset_registered
+    if not is_dataset_registered(dataset):
+        raise KeyError(
+            f"数据集 '{dataset}' 未注册，无法派生 supervised_source。"
+            f"请先通过场景注册声明该数据集元数据。"
+        )
+    spec = get_dataset_spec(dataset)
+    supervised_source = spec.supervised_source
+    if not supervised_source:
+        raise ValueError(
+            f"数据集 '{dataset}' 的 DatasetSpec.supervised_source 为空，"
+            f"无法派生 num_classes。请在注册时声明 supervised_source。"
+        )
+    if not is_dataset_registered(supervised_source):
+        raise KeyError(
+            f"数据集 '{dataset}' 的 supervised_source '{supervised_source}' 未注册，"
+            f"无法派生 num_classes。"
+        )
+    return get_dataset_spec(supervised_source).num_classes
+
+
 def build_config(dataset: str, model: str, mode: str, epochs: int,
                  batch_size: int, learning_rate: float, output_dir: str,
-                 metrics: list, ss_epochs: int) -> dict:
+                 metrics: list, ss_epochs: int, data_root: str = "") -> dict:
     """构建 ExperimentConfig dict。"""
     meta = _get_dataset_meta(dataset)
 
-    # 自监督模式硬编码 num_classes=14（NTU-Fi-HumanID）
+    # 自监督模式：从 supervised_source 数据集 spec 派生 num_classes
     if mode == "self_supervised":
-        num_classes = 14
+        num_classes = _derive_supervised_num_classes(dataset)
     else:
         num_classes = meta["num_classes"]
 
@@ -68,6 +101,8 @@ def build_config(dataset: str, model: str, mode: str, epochs: int,
             "dataset": dataset,
             "model_id": model,
             "learning_mode": mode,
+            # P1-3 修复：data_root 由 main() 解析（CLI > env > 默认路径探测）
+            "data_root": data_root,
             "params": {
                 "metrics": metrics,
                 "average": "macro",
@@ -93,6 +128,11 @@ def build_config(dataset: str, model: str, mode: str, epochs: int,
             "batch_size": batch_size,
             "optimizer": "adam",
             "seed": 42,
+            # RFC-004 方案 E：默认即最佳实践，显式写入便于用户感知/编辑
+            "weight_decay": 1e-4,
+            "early_stopping": 5,
+            "early_stopping_min_delta": 0.001,
+            "scheduler": "cosine",
         },
         "output_dir": output_dir,
         "save_model": True,
@@ -132,28 +172,64 @@ def main():
                         help="评测指标列表")
     parser.add_argument("--output", type=str,
                         help="输出文件路径（不指定则输出到 stdout）")
+    parser.add_argument("--data-root", type=str, default=None,
+                        help="数据集根目录（不指定则依次检查 SENSEFRAME_DATA_ROOT 环境变量、"
+                             "resource/CSI_DATASETS 默认路径）")
 
     args = parser.parse_args()
 
-    # 自监督模式校验
-    if args.mode == "self_supervised" and args.dataset != "NTU-Fi_HAR":
-        print(f"错误：自监督模式仅支持 dataset=NTU-Fi_HAR，当前为 {args.dataset}",
-              file=sys.stderr)
-        sys.exit(1)
+    # 自监督模式校验：从注册表 DatasetSpec.supervised_source 派生，不硬编码数据集名
+    if args.mode == "self_supervised":
+        from senseframe.registry import get_dataset_spec, is_dataset_registered
+        if not is_dataset_registered(args.dataset):
+            print(f"错误：数据集 '{args.dataset}' 未注册，无法校验自监督模式支持",
+                  file=sys.stderr)
+            sys.exit(1)
+        spec = get_dataset_spec(args.dataset)
+        if not spec.supervised_source:
+            print(f"错误：数据集 '{args.dataset}' 未声明 supervised_source，"
+                  f"不支持自监督模式", file=sys.stderr)
+            sys.exit(1)
 
-    # 确定默认 epochs
+    # 确定默认 epochs：方案 B 去静态化后，完全由 _compute_epochs_budget(n_samples) 动态计算
     if args.epochs is None:
-        if args.mode == "self_supervised":
-            default_epochs = 30  # NTU-Fi_HAR 的监督微调默认 epochs
-        else:
-            # 从 EPOCHS_TABLE 获取默认值
+        try:
+            from senseframe.registry import get_default_epochs, get_dataset_spec
+            # 方案 B：epochs 完全动态，必须传入 n_samples。
+            # 数据集未注册时 spec 查询失败 → n_samples=None → get_default_epochs raise
+            # （框架不猜测、不回退默认值）
             try:
-                from senseframe.registry import get_default_epochs
-                default_epochs = get_default_epochs(args.model, args.dataset)
+                n_samples = get_dataset_spec(args.dataset).n_samples
             except Exception:
-                default_epochs = 100
+                n_samples = None
+            default_epochs = get_default_epochs(
+                args.model, args.dataset, scene_name="wifi_csi",
+                n_samples=n_samples)
+        except Exception as e:
+            print(f"错误：get_default_epochs 失败 ({e})。"
+                  f"请通过 --epochs 显式指定，或确保数据集已注册默认 epochs。",
+                  file=sys.stderr)
+            sys.exit(1)
     else:
         default_epochs = args.epochs
+
+    # P1-3 修复：解析 data_root（优先级：CLI > env > 默认路径探测）
+    import os
+    if args.data_root is not None:
+        data_root = args.data_root
+    elif os.environ.get("SENSEFRAME_DATA_ROOT"):
+        data_root = os.environ["SENSEFRAME_DATA_ROOT"]
+    else:
+        # 探测默认路径 resource/CSI_DATASETS（相对于 cwd 或项目根）
+        _candidate = Path.cwd() / "resource" / "CSI_DATASETS"
+        if _candidate.exists():
+            data_root = str(_candidate)
+        else:
+            _candidate = _PROJECT_ROOT / "resource" / "CSI_DATASETS"
+            if _candidate.exists():
+                data_root = str(_candidate)
+            else:
+                data_root = ""
 
     # 构建配置
     config = build_config(
@@ -166,6 +242,7 @@ def main():
         output_dir=args.output_dir,
         metrics=args.metrics,
         ss_epochs=args.ss_epochs,
+        data_root=data_root,
     )
 
     # 输出 YAML

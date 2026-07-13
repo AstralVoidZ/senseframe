@@ -1,25 +1,24 @@
 #!/usr/bin/env python
-"""训练后处理：拷贝模型到 models/ + 生成推理脚本 eval.py 到项目根。
+"""训练后处理：将模型/元数据/推理脚本统一整理到 output_dir 内，生成产物清单。
+
+设计原则（P0-1.5 路径安全修复）：
+- 所有后处理产物均在 output_dir 内（deployed/ 子目录 + output_dir/eval.py + output_dir/result/）
+- manifest.json 中存储相对 output_dir 的相对路径，禁止绝对路径
+- 框架不为"受信任脚本"开后门，path_safe 策略对 postprocess 一视同仁
 
 用法：
     python postprocess.py --output-dir runs/MLP_UT_HAR_data_20240101_120000_123
-    python postprocess.py --output-dir runs/... --models-dir models --result-dir result
 
-功能：
-    1. 读取训练输出目录的 metadata.json 和 model.pth
-    2. 拷贝 model.pth 到 models/ 目录（带语义命名）
-    3. 调用 generate_inference.py 生成推理脚本 eval.py 到项目根
-    4. 创建 result/ 目录（用于存放后续推理结果）
-    5. Phase 2.2d：生成 artifact_manifest.json（产物清单 + 校验和）
-    6. 输出结构化 JSON 摘要
-
-产物职责：
-    - models/    存放模型权重 + 元数据
-    - eval.py    推理脚本入口（项目根，运行时 --output 指定结果到 result/）
-    - result/    存放推理运行产生的结果 JSON
-    - artifact_manifest.json  产物清单（含路径/大小/SHA256，便于校验与追溯）
-
-本脚本不侵入 senseframe 框架，仅做训练后的产物整理。
+产物布局（全部位于 output_dir 内）：
+    output_dir/
+    ├── metadata.json           （训练时生成）
+    ├── model.pth               （训练时生成）
+    ├── manifest.json           （训练时生成 + postprocess 追加）
+    ├── eval.py                 （postprocess 生成）
+    ├── deployed/
+    │   ├── {model}_{dataset}_{mode}.pth
+    │   └── {model}_{dataset}_{mode}.json
+    └── result/                 （推理结果存放目录，仅创建）
 """
 
 import argparse
@@ -27,10 +26,9 @@ import hashlib
 import json
 import shutil
 import sys
-from datetime import datetime
 from pathlib import Path
 
-# 将项目根目录加入 sys.path
+# 将项目根目录加入 sys.path（bootstrap：senseframe 可导入前的必要本地推导）
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -45,28 +43,6 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _build_artifact_entry(path: Path, base_dir: Path, kind: str,
-                          compute_hash: bool = True) -> dict:
-    """构建单个产物的 manifest 条目。"""
-    # is_relative_to 为 Python 3.9+，此处做兼容回退
-    try:
-        rel = str(path.relative_to(base_dir)) if path.is_relative_to(base_dir) else None
-    except AttributeError:
-        try:
-            rel = str(path.relative_to(base_dir))
-        except ValueError:
-            rel = None
-    entry = {
-        "kind": kind,
-        "path": str(path.resolve()),
-        "relative_path": rel,
-        "size_bytes": path.stat().st_size if path.exists() else 0,
-    }
-    if compute_hash and path.exists() and path.is_file():
-        entry["sha256"] = _file_sha256(path)
-    return entry
-
-
 def generate_artifact_manifest(
     output_dir: Path,
     dest_model_path: Path,
@@ -74,84 +50,97 @@ def generate_artifact_manifest(
     eval_script_path: Path,
     metadata: dict,
 ) -> Path:
-    """
-    Phase 2.2d：生成产物清单 artifact_manifest.json。
+    """追加后处理产物到框架 manifest.json（统一 schema A，相对路径存储）。
 
-    清单记录训练 + 后处理产生的所有关键产物，含路径、大小、SHA256 校验和，
-    便于产物完整性校验、版本追溯与下游工具消费。
+    P0-1.5 修复：所有产物均在 output_dir 内，path 字段存储相对 output_dir 的相对路径，
+    禁止绝对路径。复用框架 ArtifactManifest.save() 写回，schema 与训练阶段一致。
+    """
+    from senseframe.engine.runner.artifacts import (
+        ArtifactDescriptor, ArtifactManifest, sha256_file,
+    )
+
+    manifest_path = output_dir / "manifest.json"
+
+    # 1. 读取框架训练阶段生成的 manifest（schema A）
+    try:
+        manifest = ArtifactManifest.load(manifest_path)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"generate_artifact_manifest: failed to load framework manifest, "
+            f"starting with empty manifest: {e}"
+        )
+        from datetime import datetime as _dt
+        manifest = ArtifactManifest(
+            run_id="",
+            created_at=_dt.now().isoformat(),
+            senseframe_version="unknown",
+            pipeline_version="",
+            config_hash="",
+            data_hash="",
+            artifacts=[],
+        )
+
+    # 2. 追加后处理产物（相对路径存储，无 output_dir 外路径）
+    # 幂等：同名产物已存在则跳过
+    existing_names = {a.name for a in manifest.artifacts}
+
+    postprocess_artifacts = [
+        (dest_model_path, "deployed_model", "model",
+         {"format": "state_dict", "deployed": True}),
+        (dest_metadata_path, "deployed_metadata", "metadata",
+         {"deployed": True}),
+        (eval_script_path, "inference_script", "log",
+         {"format": "python", "entry": "eval.py"}),
+    ]
+
+    for path, name, kind, content_schema in postprocess_artifacts:
+        if name in existing_names:
+            continue
+        if not path.exists():
+            continue
+        # P0-1.5: 强制相对路径，禁止绝对路径存储
+        try:
+            rel_path = path.relative_to(output_dir)
+        except ValueError:
+            # 不应发生：所有产物应在 output_dir 内
+            import logging
+            logging.getLogger(__name__).error(
+                f"generate_artifact_manifest: artifact {name} path {path} "
+                f"is outside output_dir {output_dir}, skipping"
+            )
+            continue
+        try:
+            desc = ArtifactDescriptor(
+                name=name,
+                path=str(rel_path),  # 相对 output_dir 的相对路径
+                kind=kind,
+                producer_stage="postprocess",
+                content_hash=sha256_file(path),
+                size_bytes=path.stat().st_size,
+                content_schema=content_schema,
+            )
+            manifest.artifacts.append(desc)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"generate_artifact_manifest: failed to append {name}: {e}"
+            )
+
+    # 3. 用框架 API 写回（统一 schema A）
+    return manifest.save(output_dir)
+
+
+def postprocess(output_dir: str) -> dict:
+    """训练后处理：所有产物整理到 output_dir 内。
 
     Args:
-        output_dir: 训练输出目录
-        dest_model_path: 拷贝后的模型权重路径
-        dest_metadata_path: 拷贝后的 metadata 路径
-        eval_script_path: 生成的推理脚本路径
-        metadata: 训练 metadata dict
+        output_dir: 训练输出目录（含 metadata.json + model.pth），产物也写入此目录
 
     Returns:
-        manifest 文件路径
+        dict: 后处理结果摘要（路径均为相对 output_dir 的相对路径）
     """
-    artifacts = []
-
-    # 训练输出目录内的产物
-    for name, kind in [
-        ("model.pth", "model_weights"),
-        ("metadata.json", "metadata"),
-        ("config.yaml", "config"),
-        ("training_log.jsonl", "training_log"),
-    ]:
-        p = output_dir / name
-        if p.exists():
-            artifacts.append(_build_artifact_entry(p, output_dir, kind))
-
-    # checkpoints 目录
-    ckpt_dir = output_dir / "checkpoints"
-    if ckpt_dir.exists():
-        for ckpt in ckpt_dir.glob("*.ckpt"):
-            artifacts.append(_build_artifact_entry(ckpt, output_dir, "checkpoint"))
-
-    # 后处理产物
-    if dest_model_path.exists():
-        artifacts.append(_build_artifact_entry(
-            dest_model_path, _PROJECT_ROOT, "deployed_model"))
-    if dest_metadata_path.exists():
-        artifacts.append(_build_artifact_entry(
-            dest_metadata_path, _PROJECT_ROOT, "deployed_metadata"))
-    if eval_script_path.exists():
-        artifacts.append(_build_artifact_entry(
-            eval_script_path, _PROJECT_ROOT, "inference_script"))
-
-    manifest = {
-        "manifest_version": "1.0",
-        "generated_at": datetime.now().isoformat(),
-        "model_id": metadata.get("model_id"),
-        "dataset": metadata.get("dataset"),
-        "learning_mode": metadata.get("learning_mode"),
-        "training_output_dir": str(output_dir.resolve()),
-        "artifact_count": len(artifacts),
-        "artifacts": artifacts,
-    }
-
-    manifest_path = output_dir / "artifact_manifest.json"
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2, default=str)
-
-    return manifest_path
-
-
-def postprocess(output_dir: str, models_dir: str = "models",
-                result_dir: str = "result", eval_script: str = "eval.py") -> dict:
-    """训练后处理。
-
-    Args:
-        output_dir: 训练输出目录（含 metadata.json + model.pth）
-        models_dir: 模型拷贝目标目录
-        result_dir: 推理结果存放目录（仅创建，不写入）
-        eval_script: 推理脚本输出路径（默认: eval.py，项目根）
-
-    Returns:
-        dict: 后处理结果摘要
-    """
-    output_path = Path(output_dir)
+    output_path = Path(output_dir).resolve()
     metadata_path = output_path / "metadata.json"
     model_path = output_path / "model.pth"
 
@@ -172,48 +161,47 @@ def postprocess(output_dir: str, models_dir: str = "models",
     # 构建语义化文件名
     model_filename = f"{model_id}_{dataset}_{learning_mode}.pth"
 
-    # 1. 拷贝模型到 models/
-    models_path = Path(models_dir)
-    models_path.mkdir(parents=True, exist_ok=True)
-    dest_model_path = models_path / model_filename
+    # 1. 拷贝模型到 output_dir/deployed/
+    deployed_dir = output_path / "deployed"
+    deployed_dir.mkdir(parents=True, exist_ok=True)
+    dest_model_path = deployed_dir / model_filename
     shutil.copy2(model_path, dest_model_path)
 
-    # 2. 拷贝 metadata 到 models/（同名 .json）
-    dest_metadata_path = models_path / f"{model_id}_{dataset}_{learning_mode}.json"
+    # 2. 拷贝 metadata 到 output_dir/deployed/（同名 .json）
+    dest_metadata_path = deployed_dir / f"{model_id}_{dataset}_{learning_mode}.json"
     shutil.copy2(metadata_path, dest_metadata_path)
 
-    # 3. 生成推理脚本（路径由参数指定，默认项目根 eval.py）
-    eval_script_path = Path(eval_script)
-    eval_script_path.parent.mkdir(parents=True, exist_ok=True)
+    # 3. 生成推理脚本到 output_dir/eval.py
+    eval_script_path = output_path / "eval.py"
     from scripts.generate_inference import generate_inference_script
     generate_inference_script(str(metadata_path), str(eval_script_path))
 
-    # 4. 创建 result/ 目录（用于存放后续推理结果）
-    result_path = Path(result_dir)
+    # 4. 创建 output_dir/result/ 目录（用于存放后续推理结果）
+    result_path = output_path / "result"
     result_path.mkdir(parents=True, exist_ok=True)
 
-    # 5. Phase 2.2d：生成产物清单 artifact_manifest.json
+    # 5. 生成产物清单 manifest.json（追加后处理产物，相对路径）
     manifest_path = generate_artifact_manifest(
         output_path, dest_model_path, dest_metadata_path,
         eval_script_path, metadata,
     )
 
-    # 6. 输出摘要
+    # 6. 输出摘要（相对路径，便于跨机器复用）
     summary = {
         "status": "success",
         "model_id": model_id,
         "dataset": dataset,
         "learning_mode": learning_mode,
         "training_output_dir": str(output_path),
-        "model_file": str(dest_model_path),
-        "model_metadata": str(dest_metadata_path),
-        "eval_script": str(eval_script_path),
-        "result_dir": str(result_path),
-        "artifact_manifest": str(manifest_path),
+        "model_file": str(dest_model_path.relative_to(output_path)),
+        "model_metadata": str(dest_metadata_path.relative_to(output_path)),
+        "eval_script": str(eval_script_path.relative_to(output_path)),
+        "result_dir": str(result_path.relative_to(output_path)),
+        "manifest": str(manifest_path.relative_to(output_path)),
         "usage": {
-            "batch_eval": f"python eval.py --checkpoint {dest_model_path} --batch-eval",
-            "single_sample": f"python eval.py --checkpoint {dest_model_path} --single-sample --input sample.npy",
-            "result_output": f"python eval.py --checkpoint {dest_model_path} --batch-eval --output {result_dir}/eval_result.json",
+            "batch_eval": f"python eval.py --checkpoint deployed/{model_filename} --batch-eval",
+            "single_sample": f"python eval.py --checkpoint deployed/{model_filename} --single-sample --input sample.npy",
+            "result_output": f"python eval.py --checkpoint deployed/{model_filename} --batch-eval --output result/eval_result.json",
         },
         "final_eval": metadata.get("final_eval", {}),
     }
@@ -223,22 +211,15 @@ def postprocess(output_dir: str, models_dir: str = "models",
 def main():
     parser = argparse.ArgumentParser(
         prog="postprocess",
-        description="训练后处理：拷贝模型到 models/ + 生成 eval.py 到项目根",
+        description="训练后处理：将模型/元数据/推理脚本整理到 output_dir 内",
     )
     parser.add_argument("--output-dir", type=str, required=True,
-                        help="训练输出目录（含 metadata.json + model.pth）")
-    parser.add_argument("--models-dir", type=str, default="models",
-                        help="模型拷贝目标目录（默认: models）")
-    parser.add_argument("--result-dir", type=str, default="result",
-                        help="推理结果存放目录（默认: result）")
-    parser.add_argument("--eval-script", type=str, default="eval.py",
-                        help="推理脚本输出路径（默认: eval.py，项目根）")
+                        help="训练输出目录（含 metadata.json + model.pth，产物也写入此目录）")
 
     args = parser.parse_args()
 
     try:
-        summary = postprocess(args.output_dir, args.models_dir, args.result_dir,
-                              args.eval_script)
+        summary = postprocess(args.output_dir)
         print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
     except FileNotFoundError as e:
         print(json.dumps({

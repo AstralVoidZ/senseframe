@@ -26,7 +26,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from senseframe.registry import MODEL_TABLE, get_default_epochs  # noqa: E402
+from senseframe.registry import MODEL_TABLE, get_default_epochs, get_dataset_spec, is_dataset_registered  # noqa: E402
 from senseframe.routing import ResourceProbe, ResourceRouter  # noqa: E402
 
 
@@ -69,7 +69,9 @@ def main():
             for model_id in available_models:
                 info = MODEL_TABLE[model_id].copy()
                 info["model_id"] = model_id
-                info["default_epochs"] = get_default_epochs(model_id, args.dataset)
+                # 方案 B：epochs 完全动态，需 n_samples
+                _n_samples = get_dataset_spec(args.dataset).n_samples if is_dataset_registered(args.dataset) else None
+                info["default_epochs"] = get_default_epochs(model_id, args.dataset, n_samples=_n_samples)
                 recommendations.append(info)
 
             # 按优先级排序

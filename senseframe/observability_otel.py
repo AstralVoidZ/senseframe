@@ -5,7 +5,10 @@ OTel 为可选依赖，未安装时降级为 no-op。
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
+
+_logger = logging.getLogger(__name__)
 
 # OBP-1: Resource 属性常量
 RESOURCE_SERVICE_NAME = "senseframe"
@@ -24,6 +27,9 @@ ML_DATASET = "ml.dataset"
 ML_TRAIN_LOSS = "ml.train.loss"
 ML_VAL_LOSS = "ml.val.loss"
 ML_VAL_ACCURACY = "ml.val.accuracy"
+# 对称性修复：新增 test 指标常量，与 val 对称
+ML_TEST_LOSS = "ml.test.loss"
+ML_TEST_ACCURACY = "ml.test.accuracy"
 ML_LEARNING_RATE = "ml.learning_rate"
 
 ML_INFERENCE_REQUEST_COUNT = "ml.inference.request_count"
@@ -33,6 +39,18 @@ ML_INFERENCE_CONFIDENCE = "ml.inference.confidence"
 ML_TRIAL_COUNT = "ml.trial.count"
 ML_TRIAL_BEST_METRIC = "ml.trial.best_metric"
 ML_SEARCH_COVERAGE_RATIO = "ml.search.coverage_ratio"
+
+# P2-2: 数据侧 OTel 指标常量
+# 仅新增常量定义，不强制埋点调用；stage_load 等位置选择性埋点。
+ML_DATA_LOAD_DURATION_S = "ml.data.load.duration_s"        # 数据加载耗时
+ML_DATA_PROFILE_DURATION_S = "ml.data.profile.duration_s"  # DataProfiler 耗时
+ML_BATCH_LATENCY_S = "ml.batch.latency_s"                  # batch 处理延迟
+ML_DATA_N_SAMPLES = "ml.data.n_samples"                    # 数据样本数
+ML_DATA_N_CLASSES = "ml.data.n_classes"                    # 类别数
+ML_DATA_IMBALANCE_RATIO = "ml.data.imbalance_ratio"        # 类别不平衡比率
+ML_OOM_FALLBACK_EVENT = "ml.oom.fallback.event"            # OOM 回退事件（counter）
+ML_EARLY_STOP_EVENT = "ml.early_stop.event"                # early stopping 事件（counter）
+ML_GPU_MEMORY_USED_MB = "ml.gpu.memory.used_mb"            # GPU 显存使用
 
 _otel_initialized = False
 _meter = None
@@ -164,8 +182,9 @@ def shutdown_otel() -> None:
             provider = otel_metrics.get_meter_provider()
             if hasattr(provider, "shutdown"):
                 provider.shutdown()
-    except Exception:
-        pass
+    except Exception as e:
+        # P2-5.19: shutdown 路径加 debug 留痕（不影响进程退出）
+        _logger.debug("OTel shutdown failed (non-fatal): %s", e)
     _meter = None
     _resource = None
     _memory_reader = None
@@ -234,8 +253,8 @@ def record_training_metric(
             unit="1",
         )
         gauge.set(value, attributes=attributes)
-    except Exception:
-        pass  # OTel 失败不影响主流程
+    except Exception as e:
+        _logger.warning("OTel record_training_metric failed: %s", e)
 
 
 def record_inference_metric(
@@ -274,8 +293,8 @@ def record_inference_metric(
                 unit="1",
             )
             gauge.set(confidence, attributes=attributes)
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.warning("OTel record_inference_metric failed: %s", e)
 
 
 def record_trial_metric(
@@ -297,8 +316,8 @@ def record_trial_metric(
             unit="1",
         )
         gauge.set(value, attributes=attributes)
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.warning("OTel record_trial_metric failed: %s", e)
 
 
 def get_grafana_dashboard_template() -> dict:

@@ -160,6 +160,36 @@ def load_extension(
         file_path = Path(path).resolve()
         if not file_path.is_file():
             raise FileNotFoundError(f"Extension file not found: {file_path}")
+
+        # M3 修复：扩展路径白名单校验
+        # 通过环境变量 SENSEFRAME_EXTENSION_DIRS 配置允许的扩展目录（冒号分隔）
+        # 配置后强制校验 file_path 必须位于其中一个目录内；未配置时记录 warning 但允许
+        import os as _os
+        allowed_dirs_str = _os.environ.get("SENSEFRAME_EXTENSION_DIRS", "")
+        if allowed_dirs_str:
+            sep = ";" if _os.name == "nt" else ":"
+            allowed_dirs = [Path(d).resolve() for d in allowed_dirs_str.split(sep) if d.strip()]
+            if allowed_dirs:
+                from .common.path_safe import resolve_under
+                in_allowed = False
+                for ad in allowed_dirs:
+                    try:
+                        resolve_under(ad, file_path)
+                        in_allowed = True
+                        break
+                    except ValueError:
+                        continue
+                if not in_allowed:
+                    raise PermissionError(
+                        f"Extension file not in allowed dirs (SENSEFRAME_EXTENSION_DIRS): {file_path}. "
+                        f"Allowed: {allowed_dirs}"
+                    )
+        else:
+            logger.warning(
+                "Loading extension from %s without SENSEFRAME_EXTENSION_DIRS whitelist; "
+                "set this env var to restrict extension paths", file_path
+            )
+
         ext_name = ext_name or file_path.stem
         source = file_path.read_text(encoding="utf-8")
         file_path_str = str(file_path)

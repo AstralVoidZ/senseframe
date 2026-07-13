@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import List, Optional
 
@@ -18,6 +19,9 @@ import torch
 from torch.utils.data import TensorDataset
 
 from .base import DatasetLoader, DatasetSplits
+
+# 修复（5.9）：数据加载器零日志，加模块级 logger
+_logger = logging.getLogger(__name__)
 
 
 def _find_parquet_file(root: str, dataset_name: str, split: str) -> Path:
@@ -75,9 +79,22 @@ class ParquetLoader(DatasetLoader):
         train_path = _find_parquet_file(root, dataset_name, "train")
         test_path = _find_parquet_file(root, dataset_name, "test")
 
-        train_ds = self._build_dataset(pd.read_parquet(str(train_path)))
-        test_ds = self._build_dataset(pd.read_parquet(str(test_path)))
+        train_df = pd.read_parquet(str(train_path))
+        test_df = pd.read_parquet(str(test_path))
+        train_ds = self._build_dataset(train_df)
+        test_ds = self._build_dataset(test_df)
 
+        # 修复（5.9）：load_splits 返回前 log 样本数/形状/类别分布
+        train_y = train_df[self.label_col].to_numpy()
+        test_y = test_df[self.label_col].to_numpy()
+        _logger.info(
+            "ParquetLoader.load_splits: dataset=%s, "
+            "train_path=%s (samples=%d, classes=%d), "
+            "test_path=%s (samples=%d, classes=%d)",
+            dataset_name,
+            train_path, len(train_ds), len(np.unique(train_y)),
+            test_path, len(test_ds), len(np.unique(test_y)),
+        )
         return DatasetSplits(train=train_ds, test=test_ds)
 
     def _build_dataset(self, df) -> TensorDataset:

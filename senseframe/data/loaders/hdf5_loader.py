@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Tuple
 
@@ -17,6 +18,10 @@ import torch
 from torch.utils.data import TensorDataset
 
 from .base import DatasetLoader, DatasetSplits
+
+# 修复（5.9）：数据加载器零日志，加模块级 logger
+# 旧逻辑：load_splits 返回前无任何日志，样本数/形状/类别分布全无
+_logger = logging.getLogger(__name__)
 
 
 def _find_hdf5_file(root: str, dataset_name: str) -> Path:
@@ -83,6 +88,19 @@ class HDF5Loader(DatasetLoader):
         test_ds = TensorDataset(
             torch.as_tensor(np.asarray(test_x), dtype=torch.float32),
             torch.as_tensor(np.asarray(test_y), dtype=torch.long),
+        )
+
+        # 修复（5.9）：load_splits 返回前 log 样本数/形状/类别分布
+        train_y_np = np.asarray(train_y)
+        test_y_np = np.asarray(test_y)
+        _logger.info(
+            "HDF5Loader.load_splits: dataset=%s, path=%s, "
+            "train_samples=%d (shape=%s), test_samples=%d (shape=%s), "
+            "train_classes=%d, test_classes=%d",
+            dataset_name, path,
+            len(train_ds), tuple(train_ds[0][0].shape) if len(train_ds) > 0 else (),
+            len(test_ds), tuple(test_ds[0][0].shape) if len(test_ds) > 0 else (),
+            len(np.unique(train_y_np)), len(np.unique(test_y_np)),
         )
 
         return DatasetSplits(train=train_ds, test=test_ds)

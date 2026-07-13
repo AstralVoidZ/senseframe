@@ -9,6 +9,7 @@ Phase 14.1.2：配置与 Spec 解析模块。
 - manifest 元数据加载
 """
 
+import dataclasses
 from typing import Any, Dict, Optional
 
 from ...core.task import TaskSpec, TaskType
@@ -23,7 +24,9 @@ def experiment_config_to_dict(cfg: ExperimentConfig) -> Dict[str, Any]:
     将声明式 ExperimentConfig 转换为 resolve_config 所需的 dict 配置。
 
     转换规则：
-    - scene.* → 顶层 model_id/dataset/learning_mode/data_root
+    - scene.* → 顶层 model_id/dataset/learning_mode/data_root（向后兼容，供 resolve_config 路由读取）
+    - scene → 完整递归序列化 dict（含 name/dataset/model_id/learning_mode/data_root/params/task_spec），
+      供 metadata.config.scene 使用（P2 修复：原实现缺失此字段导致下游为 None）
     - scene.params → 合并到顶层（支持 self_supervised_epochs/metrics/gpu/resume 等透传）
     - trainer.* → 顶层 epochs/learning_rate/batch_size/optimizer/...
     - output_dir/save_model → 顶层
@@ -36,7 +39,12 @@ def experiment_config_to_dict(cfg: ExperimentConfig) -> Dict[str, Any]:
         "model_id": cfg.scene.model_id,
         "dataset": cfg.scene.dataset,
         "learning_mode": cfg.scene.learning_mode,
-        "data_root": cfg.scene.data_root,  # None → run_experiment 用 DEFAULT_DATA_ROOT
+        "data_root": cfg.scene.data_root,  # 已由 SceneConfig.validate() 校验非空
+        # P2 修复：递归序列化完整 SceneConfig（含嵌套 task_spec dataclass），
+        # 供 metadata.config.scene 使用。根因：原实现仅展开 scene 标量字段到顶层，
+        # 无 scene 整体 dict，导致下游 metadata.config.scene 为 None。
+        # asdict() 递归转换嵌套 dataclass（TaskSpec）/dict/list/tuple，原始类型保持不变。
+        "scene": dataclasses.asdict(cfg.scene) if cfg.scene is not None else None,
         # 训练器
         "epochs": cfg.trainer.epochs,
         "learning_rate": cfg.trainer.learning_rate,
@@ -200,7 +208,7 @@ def validate_scene_capabilities(
     if meta.supported_tasks:
         if task_spec.task_type not in meta.supported_tasks:
             raise ValueError(
-                f"Scene '{config.scene.name}' does not support task type "
+                f"Scene '{scene_name}' does not support task type "
                 f"'{task_spec.task_type}'. "
                 f"Supported: {meta.supported_tasks}"
             )
