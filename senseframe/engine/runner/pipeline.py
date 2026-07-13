@@ -297,6 +297,7 @@ _FIELD_FILL_STAGE: Dict[str, str] = {
     "training_duration_s": "stage_train",
     "best_model_path": "stage_train",
     "best_model_score": "stage_train",
+    "intermediate_values": "stage_train",  # P2.3: ε5 Multi-fidelity（IntermediateMetricLogger 回调写入）
     # stage_eval
     "final_eval": "stage_eval",
     "training_log": "stage_eval",
@@ -385,6 +386,9 @@ class PipelineContext:
     best_model_score: Optional[float] = None        # stage_train 写入
     final_eval: Dict[str, Any] = field(default_factory=dict)       # stage_eval 写入
     training_log: List[Any] = field(default_factory=list)          # stage_eval 写入
+    # P2.3: ε5 Multi-fidelity — epoch 级中间值，IntermediateMetricLogger 回调写入
+    # 供 MethodRunner 早停检查（P2.4）与 SP Pruner should_prune 使用
+    intermediate_values: Dict[int, float] = field(default_factory=dict)
     early_stopped: bool = False                                     # stage_eval 写入
     feedback: Optional[Dict[str, Any]] = None                      # stage_eval 写入
     # 错误状态（Pipeline.run 异常时写入）
@@ -1005,8 +1009,14 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
     from ...observability import TrainingMonitor
     ctx.monitor = TrainingMonitor()
 
-    from .orchestrator import EpochLogCallback
+    from .orchestrator import EpochLogCallback, IntermediateMetricLogger
     ctx.callbacks.append(EpochLogCallback(log_every_n=10, monitor=ctx.monitor))
+    # P2.3: ε5 Multi-fidelity — 捕获 epoch 级中间值供 Pruner should_prune 使用
+    # 回调写入 ctx.intermediate_values（dict 引用），stage_train 不需修改
+    ctx.callbacks.append(IntermediateMetricLogger(
+        metric="val_accuracy",
+        intermediate_values=ctx.intermediate_values,
+    ))
 
     if ctx.config.extra_callbacks:
         ctx.callbacks.extend(ctx.config.extra_callbacks)
@@ -1591,6 +1601,7 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
             "duration_s": ctx.training_duration_s,
             "best_val_loss": ctx.best_model_score,
             "best_checkpoint": ctx.best_model_path,
+            "intermediate_values": ctx.intermediate_values,  # P2.3: ε5 Multi-fidelity
         }
         ctx.output.final_eval = final_eval
         ctx.output.model_path = model_path

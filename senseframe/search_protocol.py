@@ -206,6 +206,265 @@ register_sampler("random_fallback", RandomSampler)  # 显式别名，避免 tpe 
 
 
 # ============================================================
+# SP-3 扩展: Pruner 注册表（P2.1 新增，ε5 Multi-fidelity 早停）
+# ============================================================
+
+@runtime_checkable
+class Pruner(Protocol):
+    """Pruner 契约（SP-3 扩展，P2.1）。
+
+    所有 Pruner 必须满足此 Protocol：拥有 `name` 类属性与 `should_prune` 方法。
+    `@runtime_checkable` 使 `isinstance(pruner, Pruner)` 可用，
+    仅校验属性/方法存在性，不校验签名。
+
+    契约语义：
+    - `name`：Pruner 策略名（用于注册表 key + StudySpec 持久化）
+    - `should_prune`：基于已收集的 intermediate_values 与当前 rung，
+      返回 True 表示丢弃该 trial（早停），False 表示继续训练到下一 rung。
+
+    `intermediate_values` 为 Dict[int, float]，key 为 epoch/rung 序号，
+    value 为该 epoch 的目标指标（如 val_accuracy）。
+    `rung` 为当前所处的 rung 序号（从 0 开始）。
+    """
+    name: str  # 类属性（早停策略名）
+
+    def should_prune(
+        self,
+        trial_id: str,
+        intermediate_values: Dict[int, float],
+        rung: int,
+    ) -> bool: ...
+
+
+_PRUNERS: Dict[str, type] = {}
+
+
+def register_pruner(name: str, pruner_cls: type) -> None:
+    """注册 Pruner（SP-3 扩展，P2.1）。
+
+    Args:
+        name: Pruner 策略名（如 "hyperband" / "asha" / "median"）
+        pruner_cls: Pruner 类（必须满足 Pruner Protocol）
+    """
+    _PRUNERS[name] = pruner_cls
+
+
+def get_pruner(name: str) -> Optional[type]:
+    """获取 Pruner 类。
+
+    Args:
+        name: Pruner 策略名
+
+    Returns:
+        Pruner 类；未注册返回 None
+    """
+    return _PRUNERS.get(name)
+
+
+def list_pruners() -> List[str]:
+    """列出已注册的 Pruner 策略名。
+
+    Returns:
+        Pruner 策略名列表（按注册顺序）
+    """
+    return list(_PRUNERS.keys())
+
+
+# ============================================================
+# SP-3 扩展: 内置 Pruner 实现（P2.2，ε5 Multi-fidelity）
+# ============================================================
+# HyperbandSampler / ASHASampler 同时满足 Sampler 和 Pruner Protocol。
+# 采样策略与 RandomSampler 相同（随机），区别在 should_prune 逻辑。
+# 注册到 sampler 与 pruner 两个注册表，使 StudyManager 可通过 sampler="asha"
+# 同时获得采样与早停能力。
+#
+# 算法参考：
+# - ASHA: Asynchronous Successive Halving (Li et al., 2018)
+# - Hyperband: Multi-bracket SHA (Li et al., 2017)
+
+
+class ASHASampler:
+    """ASHA（Asynchronous Successive Halving）Sampler + Pruner（P2.2）。
+
+    ASHA 是 SHA 的异步版本，用于 Multi-fidelity 早停。
+
+    算法：
+    - max_resource (R): 最大资源量（epoch 数）
+    - eta (η): 降比率（每 rung 保留 1/η 的 trial）
+    - 在每个 rung，将 trial 按 intermediate value 排序，保留 top 1/η，剪枝其余
+
+    同时满足 Sampler Protocol（sample 方法）与 Pruner Protocol（should_prune 方法）。
+
+    Args:
+        max_resource: 最大资源量（epoch 数），默认 81
+        eta: 降比率，默认 3
+        direction: 优化方向，"maximize" 或 "minimize"
+    """
+    name = "asha"
+
+    def __init__(self, max_resource: int = 81, eta: int = 3, direction: str = "maximize"):
+        self.max_resource = max_resource
+        self.eta = eta
+        self.direction = direction  # "maximize" / "minimize"
+        # rung_index -> [(value, trial_id)]
+        self._rungs: Dict[int, List[Tuple[float, str]]] = {}
+
+    def sample(self, search_space: SearchSpace, history: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """随机采样（与 RandomSampler 相同，ASHA 的区别仅在 should_prune）。"""
+        import random
+        params = {}
+        for p in search_space.parameters:
+            if p.type == "float":
+                if p.log and p.low and p.high:
+                    import math
+                    params[p.name] = math.exp(random.uniform(math.log(p.low), math.log(p.high)))
+                else:
+                    params[p.name] = random.uniform(p.low or 0, p.high or 1)
+            elif p.type == "int":
+                params[p.name] = random.randint(int(p.low or 0), int(p.high or 100))
+            elif p.type == "categorical" and p.choices:
+                params[p.name] = random.choice(p.choices)
+        return params
+
+    def should_prune(self, trial_id: str, intermediate_values: Dict[int, float], rung: int) -> bool:
+        """ASHA 早停判断。
+
+        在 rung 处将 trial 按 intermediate value 排序，保留 top 1/η，剪枝其余。
+        若 rung 处 trial 数不足 η，则不剪枝（数据不足）。
+
+        Args:
+            trial_id: Trial 标识
+            intermediate_values: {epoch: value} 已收集的中间值
+            rung: 当前 rung 序号（0-based）
+
+        Returns:
+            True 表示应剪枝该 trial，False 表示继续训练
+        """
+        if rung not in intermediate_values:
+            return False
+        value = intermediate_values[rung]
+
+        # 记录 trial 在该 rung 的值（避免重复记录同一 trial）
+        if rung not in self._rungs:
+            self._rungs[rung] = []
+        if not any(tid == trial_id for _, tid in self._rungs[rung]):
+            self._rungs[rung].append((value, trial_id))
+
+        # 数据点不足，不剪枝
+        if len(self._rungs[rung]) < self.eta:
+            return False
+
+        # 排序：maximize 时降序（高值在前），minimize 时升序（低值在前）
+        reverse = (self.direction == "maximize")
+        sorted_vals = sorted(self._rungs[rung], key=lambda x: x[0], reverse=reverse)
+        # 保留 top 1/η
+        n_keep = max(1, len(self._rungs[rung]) // self.eta)
+        kept_ids = set(tid for _, tid in sorted_vals[:n_keep])
+
+        return trial_id not in kept_ids
+
+
+class HyperbandSampler:
+    """Hyperband Sampler + Pruner（P2.2）。
+
+    Hyperband 是多 bracket 的 SHA，通过不同 bracket 探索不同资源分配策略。
+
+    算法：
+    - 在 ASHA 基础上增加 brackets 维度
+    - bracket 数: floor(log_η(R)) + 1
+    - 每个 bracket 有独立的 rung 跟踪
+    - trial 通过 trial_id hash 分配到 bracket（确定性 + 均匀分布）
+
+    同时满足 Sampler Protocol 与 Pruner Protocol。
+
+    Args:
+        max_resource: 最大资源量（epoch 数），默认 81
+        eta: 降比率，默认 3
+        direction: 优化方向，"maximize" 或 "minimize"
+    """
+    name = "hyperband"
+
+    def __init__(self, max_resource: int = 81, eta: int = 3, direction: str = "maximize"):
+        self.max_resource = max_resource
+        self.eta = eta
+        self.direction = direction
+        # bracket 数: floor(log_η(R)) + 1，至少为 1
+        import math
+        if max_resource > 1 and eta > 1:
+            self.n_brackets = max(1, int(math.log(max_resource) / math.log(eta)) + 1)
+        else:
+            self.n_brackets = 1
+        # 每个 bracket 独立的 rung 跟踪
+        self._brackets: List[Dict[int, List[Tuple[float, str]]]] = [
+            {} for _ in range(self.n_brackets)
+        ]
+        # trial_id -> bracket index（确定性分配）
+        self._trial_bracket: Dict[str, int] = {}
+
+    def _get_bracket(self, trial_id: str) -> int:
+        """获取 trial 所属的 bracket（基于 trial_id hash 确定性分配）。"""
+        if trial_id not in self._trial_bracket:
+            import hashlib
+            h = int(hashlib.md5(trial_id.encode()).hexdigest(), 16)
+            self._trial_bracket[trial_id] = h % self.n_brackets
+        return self._trial_bracket[trial_id]
+
+    def sample(self, search_space: SearchSpace, history: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """随机采样（与 RandomSampler 相同，Hyperband 的区别仅在 should_prune）。"""
+        import random
+        params = {}
+        for p in search_space.parameters:
+            if p.type == "float":
+                if p.log and p.low and p.high:
+                    import math
+                    params[p.name] = math.exp(random.uniform(math.log(p.low), math.log(p.high)))
+                else:
+                    params[p.name] = random.uniform(p.low or 0, p.high or 1)
+            elif p.type == "int":
+                params[p.name] = random.randint(int(p.low or 0), int(p.high or 100))
+            elif p.type == "categorical" and p.choices:
+                params[p.name] = random.choice(p.choices)
+        return params
+
+    def should_prune(self, trial_id: str, intermediate_values: Dict[int, float], rung: int) -> bool:
+        """Hyperband 早停判断（基于 bracket 内的 ASHA 逻辑）。
+
+        每个 bracket 独立跟踪 rung，trial 在所属 bracket 内与同 rung 的其他 trial 比较。
+        """
+        if rung not in intermediate_values:
+            return False
+        value = intermediate_values[rung]
+
+        bracket_idx = self._get_bracket(trial_id)
+        bracket_rungs = self._brackets[bracket_idx]
+
+        # 记录 trial 在该 rung 的值（避免重复记录）
+        if rung not in bracket_rungs:
+            bracket_rungs[rung] = []
+        if not any(tid == trial_id for _, tid in bracket_rungs[rung]):
+            bracket_rungs[rung].append((value, trial_id))
+
+        # 数据点不足，不剪枝
+        if len(bracket_rungs[rung]) < self.eta:
+            return False
+
+        # 排序：maximize 时降序，minimize 时升序
+        reverse = (self.direction == "maximize")
+        sorted_vals = sorted(bracket_rungs[rung], key=lambda x: x[0], reverse=reverse)
+        n_keep = max(1, len(bracket_rungs[rung]) // self.eta)
+        kept_ids = set(tid for _, tid in sorted_vals[:n_keep])
+
+        return trial_id not in kept_ids
+
+
+# 注册为 Sampler + Pruner（同时具备采样与早停能力）
+register_sampler("asha", ASHASampler)
+register_sampler("hyperband", HyperbandSampler)
+register_pruner("asha", ASHASampler)
+register_pruner("hyperband", HyperbandSampler)
+
+
+# ============================================================
 # SP 核心：StudyManager（Ask-Tell + ExplorationTracker 桥接）
 # ============================================================
 class StudyManager:
@@ -340,10 +599,13 @@ class StudyManager:
             result_val = 0.0
             if entry.get("result") and "value" in entry["result"]:
                 result_val = entry["result"]["value"]
+            # P2.5: 读取 intermediate_values（与 get_trial 保持一致）
+            iv = entry.get("result", {}).get("intermediate_values", {})
             results.append(TrialResult(
                 trial_id=entry["trial_id"], study_id=study_id,
                 params=entry.get("strategy", {}),
                 value=result_val,
+                intermediate_values=iv,
                 state=entry.get("status", "completed"),
                 datetime_complete=entry.get("timestamp", ""),
                 feedback=entry.get("feedback"),
@@ -385,4 +647,8 @@ __all__ = [
     "Sampler",  # P0.5：Sampler Protocol
     "register_sampler", "get_sampler", "list_samplers",
     "RandomSampler", "GridSampler",
+    "Pruner",  # P2.1：Pruner Protocol（ε5 Multi-fidelity 早停）
+    "register_pruner", "get_pruner", "list_pruners",
+    "ASHASampler",  # P2.2：ε5 Multi-fidelity 内置实现
+    "HyperbandSampler",
 ]

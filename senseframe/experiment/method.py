@@ -8,6 +8,9 @@ Method 组通过 SP（search_protocol）的 ask/tell 驱动搜索：
 5. 构造 TrialResult（DSP 合规）
 
 过渡形态：直接调 run_pipeline，不走向 OP create_run（OP 完整迁移推迟到 P2）。
+
+P2.4：支持 Multi-fidelity 早停（ε5）— 可选 Pruner 注入，
+训练后检查 should_prune，若 True 则标记 trial 为 pruned。
 """
 from __future__ import annotations
 
@@ -16,7 +19,7 @@ from typing import Any, Dict, Optional
 
 from ..engine.hpo import apply_params, extract_metric
 from ..engine.runner.pipeline import run_pipeline
-from ..search_protocol import SearchSpace, StudyManager, get_study_manager
+from ..search_protocol import Pruner, SearchSpace, StudyManager, get_study_manager
 from .design import MethodConfig
 from .types import TrialGroup, TrialResult, TrialStatus
 
@@ -91,16 +94,88 @@ class MethodRunner:
         study_id: str,
         study_manager: Optional[StudyManager] = None,
         experiment_id: str = "",
+        pruner: Optional[Pruner] = None,
+        use_op: bool = False,
+        orchestrator: Optional[Any] = None,
     ):
         self.config = config
         self.study_id = study_id
         self._sm = study_manager
         self.experiment_id = experiment_id
         self._agent_decisions = 0  # SP ask 次数计数
+        # P2.4: ε5 Multi-fidelity 早停 — 可选 Pruner 注入
+        # 训练后检查 should_prune，若 True 则标记 trial 为 pruned
+        self.pruner = pruner
+        # P2.12: OP 迁移 — 可选通过 Orchestrator 编排 run_pipeline
+        # use_op=False（默认）直接调 run_pipeline（P1 行为，向后兼容）
+        # use_op=True 时通过 OP create_run + start + reconcile + complete/fail 包装
+        self.use_op = use_op
+        self._orchestrator = orchestrator  # None 时用全局单例
 
     @property
     def sm(self) -> StudyManager:
         return self._sm or get_study_manager()
+
+    @property
+    def orchestrator(self):
+        """获取 Orchestrator 实例（None 时用全局单例，P2.12）。"""
+        if self._orchestrator is not None:
+            return self._orchestrator
+        from ..orchestration import get_orchestrator
+        return get_orchestrator()
+
+    def _run_pipeline_via_op(
+        self,
+        modified_config,
+        trial_params: Dict[str, Any],
+    ):
+        """通过 OP 编排 run_pipeline（P2.12，OP 迁移路径）。
+
+        与直接 run_pipeline 的区别：
+        - create_run + start + complete/fail 包装，发射 CloudEvent
+        - ExperimentRunner 可订阅 OP 事件实现事件驱动聚合（P2.13）
+        - 失败时 run.error 持久化到 PipelineRun
+
+        P2.12 渐进式迁移：run_pipeline 仍在主线程执行（同步语义），
+        OP 仅作状态跟踪 + 事件发射层。完全异步执行推迟到 P3（需解决 GIL + 资源隔离）。
+
+        Args:
+            modified_config: 应用 trial.params 后的 ExperimentConfig
+            trial_params: SP Trial 参数（用于 OP create_run.params 持久化）
+
+        Returns:
+            TrainOutput（run_pipeline 的返回值）
+        """
+        from ..orchestration import PipelineDef, PHASE_SUCCEEDED, PHASE_FAILED
+
+        orch = self.orchestrator
+        pdef = PipelineDef(name=f"method_{self.experiment_id or 'default'}")
+        pipeline_id = orch.create_pipeline(pdef)
+        run_id = orch.create_run(pipeline_id, params=trial_params)
+
+        # start 触发 PHASE_RUNNING + emit EVENT_PIPELINE_STARTED
+        orch.start(run_id)
+
+        train_output = None
+        error: Optional[Exception] = None
+        try:
+            train_output = run_pipeline(modified_config)
+        except Exception as e:
+            error = e
+
+        # 根据 train_output 状态回写 OP 状态
+        if train_output is not None and train_output.status == "success" and error is None:
+            orch.complete(run_id, output_uri=str(train_output.output_dir or ""))
+        else:
+            err_msg = str(error) if error is not None else (
+                train_output.error if train_output is not None else "unknown error"
+            )
+            orch.fail(run_id, error=err_msg)
+
+        # 若有异常，重新抛出（保持与直接 run_pipeline 一致的异常语义）
+        if error is not None:
+            raise error
+        return train_output
 
     def run(self, dataset: str, model_id: str, run_idx: int) -> TrialResult:
         """执行一次 Method 试验（SP 驱动）。
@@ -124,7 +199,12 @@ class MethodRunner:
 
         # 3. 训练
         try:
-            train_output = run_pipeline(modified_config)
+            if self.use_op:
+                # P2.12: OP 迁移路径 — create_run + start + complete/fail 包装
+                train_output = self._run_pipeline_via_op(modified_config, trial.params)
+            else:
+                # P1 路径：直接调 run_pipeline（向后兼容）
+                train_output = run_pipeline(modified_config)
         except Exception as e:
             # 训练异常 → SP tell failed + 返回失败 TrialResult
             self.sm.tell(
@@ -176,17 +256,55 @@ class MethodRunner:
                     agent_decisions=self._agent_decisions,
                 )
 
-            self.sm.tell(
-                trial.trial_id,
-                value=value,
-                state="completed",
-                feedback={
-                    "model_path": train_output.model_path,
-                    "final_eval": train_output.final_eval,
-                },
+            # P2.4: ε5 Multi-fidelity 早停检查
+            # 从 TrainOutput.training 提取 epoch 级中间值
+            intermediate_values: Dict[int, float] = (
+                train_output.training.get("intermediate_values", {})
+                if train_output.training
+                else {}
             )
-            status = TrialStatus.SUCCESS
-            error_msg = None
+
+            should_prune = False
+            if self.pruner is not None and intermediate_values:
+                # rung = 最后一个 epoch（已收集到的最高 fidelity）
+                rung = max(intermediate_values.keys())
+                try:
+                    should_prune = self.pruner.should_prune(
+                        trial.trial_id, intermediate_values, rung,
+                    )
+                except Exception as e:
+                    # Pruner 异常不应阻断试验完成，降级为不剪枝
+                    logger.warning("Pruner should_prune raised, skipping prune: %s", e)
+                    should_prune = False
+
+            if should_prune:
+                # 剪枝：标记 trial 为 pruned，value 仍上报（供 SP 记录）
+                self.sm.tell(
+                    trial.trial_id,
+                    value=value,
+                    intermediate_values=intermediate_values,
+                    state="pruned",
+                    feedback={
+                        "model_path": train_output.model_path,
+                        "final_eval": train_output.final_eval,
+                        "pruned": True,
+                    },
+                )
+                status = TrialStatus.PRUNED
+                error_msg = None
+            else:
+                self.sm.tell(
+                    trial.trial_id,
+                    value=value,
+                    intermediate_values=intermediate_values if intermediate_values else None,
+                    state="completed",
+                    feedback={
+                        "model_path": train_output.model_path,
+                        "final_eval": train_output.final_eval,
+                    },
+                )
+                status = TrialStatus.SUCCESS
+                error_msg = None
         else:
             self.sm.tell(
                 trial.trial_id,

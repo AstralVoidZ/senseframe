@@ -6,7 +6,7 @@ feedback 分析、exploration_history、skill 自动沉淀）。
 run_experiment 保留为向后兼容入口，委托 run_pipeline。
 """
 
-from typing import Any
+from typing import Any, Dict, Optional
 
 try:
     import pytorch_lightning as pl
@@ -65,6 +65,48 @@ class EpochLogCallback(pl.Callback):
             logger.info(" ".join(parts))
 
         self._epoch_metrics = {}  # 重置
+
+
+class IntermediateMetricLogger(pl.Callback):
+    """P2.3: 捕获 epoch 级中间值到 intermediate_values dict（ε5 Multi-fidelity）。
+
+    每 validation epoch end 将目标指标写入 intermediate_values[epoch]，
+    供 MethodRunner 早停检查（P2.4）与 SP Pruner should_prune 使用。
+
+    设计原则（RFC-003 原则 4）：
+    - 通过 Lightning Callback 注入，不修改 stage_train 主逻辑
+    - 写入外部 dict（由 PipelineContext.intermediate_values 提供），
+      回调本身无状态，便于测试与复用
+
+    Args:
+        metric: 目标指标名（trainer.callback_metrics 的 key），默认 "val_accuracy"
+        intermediate_values: 外部 dict 引用，回调写入 {epoch: value}；
+                             None 时回调 no-op（便于无条件注入）
+    """
+
+    def __init__(
+        self,
+        metric: str = "val_accuracy",
+        intermediate_values: Optional[Dict[int, float]] = None,
+    ):
+        super().__init__()
+        self.metric = metric
+        self.intermediate_values = intermediate_values  # 外部 dict 引用；None 则 no-op
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self.intermediate_values is None:
+            return
+        value = trainer.callback_metrics.get(self.metric)
+        if value is None:
+            return
+        # Lightning callback_metrics 可能返回 Tensor 或 float（版本/后端相关）
+        if hasattr(value, "item"):
+            value = float(value.item())
+        elif isinstance(value, (int, float)):
+            value = float(value)
+        else:
+            return
+        self.intermediate_values[trainer.current_epoch] = value
 
 
 def run_experiment(config: ExperimentConfig) -> TrainOutput:

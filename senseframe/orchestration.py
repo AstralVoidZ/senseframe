@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import threading
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -301,6 +302,12 @@ class Orchestrator:
         # P0.1: PipelineRun ↔ PipelineContext 映射（reconcile 驱动执行）
         self._contexts: Dict[str, Any] = {}  # run_id -> PipelineContext
         self._lock = threading.Lock()
+        # P2.11: 异步执行支持（reconcile 真循环）
+        # ThreadPoolExecutor 用于 start_and_execute 异步提交 _execute_pipeline
+        # 单独的 _run_futures 跟踪每个 run 的 Future（用于 wait_for_completion）
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._run_futures: Dict[str, Future] = {}
+        self._async_lock = threading.Lock()  # 保护 _run_futures
 
     def create_pipeline(self, pipeline_def: PipelineDef) -> str:
         """注册 Pipeline 定义（OP-1/6）。"""
@@ -606,6 +613,141 @@ class Orchestrator:
                 cb(event)
             except Exception:
                 pass  # 订阅者异常不影响主流程
+
+    # ============================================================
+    # P2.11: 异步执行（reconcile 真循环 + wait_for_completion）
+    # ============================================================
+    def start_and_execute(
+        self,
+        run_id: str,
+        pipeline: Any = None,
+    ) -> "Future":
+        """异步启动并执行 PipelineRun（P2.11，OP-6 异步扩展）。
+
+        与同步 reconcile() 的区别：
+        - reconcile()：阻塞当前线程直到 Pipeline 执行完成
+        - start_and_execute()：提交到 ThreadPoolExecutor，立即返回 Future
+          调用方可通过 wait_for_completion(run_id) 阻塞等待结果
+
+        异步任务 _execute_pipeline 内部调用 reconcile() 逻辑，
+        复用 stage 包装 + CloudEvent 发射 + checkpoint 保存。
+
+        Args:
+            run_id: PipelineRun ID
+            pipeline: Pipeline 实例（None 时用 Pipeline.default()）
+
+        Returns:
+            concurrent.futures.Future（异步任务句柄）
+
+        Raises:
+            KeyError: run_id 不存在
+            RuntimeError: run 已在执行中
+        """
+        run = self._get_run(run_id)
+        # 防止重复提交
+        with self._async_lock:
+            if run_id in self._run_futures and not self._run_futures[run_id].done():
+                raise RuntimeError(f"Run '{run_id}' is already executing")
+            # 确保线程池存在
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="orch")
+            future = self._executor.submit(self._execute_pipeline, run_id, pipeline)
+            self._run_futures[run_id] = future
+        return future
+
+    def _execute_pipeline(self, run_id: str, pipeline: Any = None) -> Dict[str, Any]:
+        """异步执行 Pipeline（P2.11，内部方法）。
+
+        在 ThreadPoolExecutor 工作线程中调用 reconcile()，
+        reconcile 内部完成 stage 循环 + CloudEvent 发射 + 状态回写。
+
+        异常处理：
+        - reconcile 已捕获 stage 异常并标记 run 为 failed
+        - 此处仅作为兜底，捕获 reconcile 自身的异常（如 PipelineContext 未绑定）
+
+        Args:
+            run_id: PipelineRun ID
+            pipeline: Pipeline 实例
+
+        Returns:
+            reconcile 返回的 dict（status / completed_stages / failed_stage / error）
+        """
+        try:
+            # start() 触发 PHASE_RUNNING + emit EVENT_PIPELINE_STARTED
+            # （若已是 RUNNING 则 transition 会被忽略，这里幂等）
+            run = self._get_run(run_id)
+            if run.phase == PHASE_PENDING:
+                self.start(run_id)
+            return self.reconcile(run_id, pipeline=pipeline)
+        except Exception as e:
+            # 兜底：reconcile 自身异常
+            try:
+                self.fail(run_id, error=f"_execute_pipeline crashed: {e}")
+            except Exception:
+                pass
+            return {
+                "status": "failed",
+                "completed_stages": [],
+                "failed_stage": None,
+                "error": str(e),
+            }
+
+    def wait_for_completion(
+        self,
+        run_id: str,
+        timeout: Optional[float] = None,
+    ) -> PipelineRun:
+        """阻塞等待 PipelineRun 收敛（P2.11，OP-6 异步扩展）。
+
+        阻塞当前线程直到 PipelineRun 进入终态（succeeded / failed）或超时。
+        若 run 通过 start_and_execute 启动，等待异步任务完成；
+        若 run 通过同步 reconcile 启动，立即返回（已是终态）。
+
+        Args:
+            run_id: PipelineRun ID
+            timeout: 最大等待秒数（None 表示无限等待）
+
+        Returns:
+            PipelineRun 实例（终态）
+
+        Raises:
+            KeyError: run_id 不存在
+            TimeoutError: 等待超时
+        """
+        run = self._get_run(run_id)
+        # 若有异步 future，先等 future 完成
+        with self._async_lock:
+            future = self._run_futures.get(run_id)
+        if future is not None:
+            try:
+                future.result(timeout=timeout)
+            except Exception:
+                # future 异常已在 _execute_pipeline 中处理为 failed
+                pass
+
+        # 即使 future 完成，也要确认 run.phase 已是终态（轮询保险）
+        import time
+        deadline = None if timeout is None else (time.monotonic() + timeout)
+        while run.phase not in (PHASE_SUCCEEDED, PHASE_FAILED):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Run '{run_id}' did not complete within {timeout}s "
+                    f"(current phase: {run.phase})"
+                )
+            time.sleep(0.05)
+        return run
+
+    def shutdown(self) -> None:
+        """关闭线程池（P2.11，资源清理）。
+
+        在 Orchestrator 不再使用时调用，释放 ThreadPoolExecutor 资源。
+        通常在测试 tearDown 或应用退出时调用。
+        """
+        with self._async_lock:
+            if self._executor is not None:
+                self._executor.shutdown(wait=False)
+                self._executor = None
+            self._run_futures.clear()
 
 
 # 全局单例
