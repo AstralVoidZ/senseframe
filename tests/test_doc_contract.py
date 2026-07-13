@@ -363,11 +363,13 @@ def test_metadata_config_contains_repro_fields():
     from senseframe.engine.config import ExperimentConfig, SceneConfig, TrainerConfig
     from senseframe.engine.runner.resolver import experiment_config_to_dict
 
-    # 构造最小合法配置
+    # 构造最小合法配置（data_root 仅作占位符，不触发文件访问）
+    import tempfile
+    from pathlib import Path
     config = ExperimentConfig(
         scene=SceneConfig(
             name="test", dataset="UT_HAR_data", model_id="ResNet18",
-            learning_mode="supervised", data_root="/tmp/data",
+            learning_mode="supervised", data_root=str(Path(tempfile.gettempdir()) / "sf_test_data"),
         ),
         input_features=[],
         output_features=[],
@@ -789,6 +791,88 @@ def test_skill_md_api_signatures():
         pytest.fail(
             "SKILL.md 中 API 示例与实际签名不一致（P3-8 契约）：\n"
             + "\n".join(msg_lines)
+        )
+
+
+# ============================================================
+# 21. P5 P3-12：TrainerConfig 默认值与 config_schema.md 一致性
+# ============================================================
+def test_trainer_config_defaults_match_doc():
+    """config_schema.md 中 TrainerConfig 表格的默认值应与代码 dataclass 默认值一致。
+
+    P5 P3-12：防止文档默认值与代码漂移。覆盖字段名完整性和标量默认值一致性。
+    """
+    from senseframe.engine.config import TrainerConfig
+
+    tc = TrainerConfig()
+    code_fields = {f.name: getattr(tc, f.name) for f in dataclass_fields(tc)}
+
+    doc_path = PROJECT_ROOT / "reference" / "config_schema.md"
+    content = _read_doc(doc_path)
+
+    # 定位 TrainerConfig 表格（## TrainerConfig 到下一个 ## 之间）
+    m = re.search(r"## TrainerConfig.*?\n(.*?)(?=\n## |\Z)", content, re.DOTALL)
+    if not m:
+        pytest.fail("config_schema.md 未找到 TrainerConfig 章节")
+    table = m.group(1)
+
+    # 解析表格行：| `field` | type | 必填 | default | desc |
+    doc_defaults = {}
+    for line in table.splitlines():
+        m = re.match(r"\|\s*`(\w+)`\s*\|[^|]+\|[^|]+\|\s*([^|]+?)\s*\|", line)
+        if m:
+            field_name = m.group(1)
+            default_str = m.group(2).strip()
+            doc_defaults[field_name] = default_str
+
+    # 1. 字段完整性：代码字段应在 doc 中
+    missing_in_doc = set(code_fields.keys()) - set(doc_defaults.keys())
+    if missing_in_doc:
+        pytest.fail(
+            f"config_schema.md TrainerConfig 表格缺失字段: {sorted(missing_in_doc)}。"
+            f"代码 TrainerConfig 共 {len(code_fields)} 个字段，doc 仅列出 {len(doc_defaults)} 个。"
+        )
+
+    # 2. 默认值一致性（对标量字段做比对）
+    def _format(v):
+        if v is None:
+            return "null"
+        if v is True:
+            return "true"
+        if v is False:
+            return "false"
+        return str(v)
+
+    def _parse_float(s):
+        """从文档字符串中提取数值，支持 1e-4 / 0.0001 / `1e-4` 等形式。"""
+        m = re.search(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", s)
+        if m:
+            try:
+                return float(m.group())
+            except ValueError:
+                return None
+        return None
+
+    mismatches = []
+    for name, code_val in code_fields.items():
+        doc_val = doc_defaults.get(name, "")
+        if isinstance(code_val, (list, tuple)):
+            continue  # 容器类型跳过
+        # 数值字段：浮点归一化比较（1e-4 == 0.0001）
+        if isinstance(code_val, (int, float)) and not isinstance(code_val, bool):
+            doc_float = _parse_float(doc_val)
+            if doc_float is not None and abs(doc_float - float(code_val)) < 1e-9:
+                continue
+            mismatches.append((name, _format(code_val), doc_val))
+            continue
+        expected = _format(code_val)
+        if expected not in doc_val and f"`{expected}`" not in doc_val:
+            mismatches.append((name, expected, doc_val))
+
+    if mismatches:
+        pytest.fail(
+            "config_schema.md TrainerConfig 默认值与代码不一致：\n"
+            + "\n".join(f"  {n}: 代码={exp}, doc={act}" for n, exp, act in mismatches)
         )
 
 

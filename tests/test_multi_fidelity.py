@@ -510,11 +510,14 @@ class TestMethodRunnerPrunerIntegration:
         mock.error = None
         mock.error_code = None
         mock.final_eval = {"val_accuracy": 0.8, "val_loss": 0.5}
-        mock.training = {
-            "duration_s": 10.0,
-            "epochs_trained": 2,
-            "intermediate_values": intermediate_values or {},
-        }
+        # P5 P2-7 阶段2：training 现在是 TrainingSummary dataclass
+        from senseframe.schemas import TrainingSummary
+        mock.training = TrainingSummary(
+            epochs_trained=2,
+            early_stopped=False,
+            duration_s=10.0,
+            intermediate_values=intermediate_values or {},
+        )
         return mock
 
     def test_pruner_none_no_pruning(self):
@@ -770,8 +773,9 @@ class TestGrepEvidence:
     def test_pipeline_export_intermediate_values_to_train_output(self):
         """pipeline.py 应将 intermediate_values 写入 TrainOutput.training。"""
         path = _source_path("engine/runner/pipeline.py")
+        # P5 P2-7 阶段2：构造点改为 validate_training_summary 调用
         assert _grep_source(path, '"intermediate_values": ctx.intermediate_values'), \
-            "stage_export 应将 intermediate_values 写入 TrainOutput.training"
+            "stage_export 应将 intermediate_values 写入 TrainingSummary 构造"
 
     def test_field_fill_stage_has_intermediate_values(self):
         """_FIELD_FILL_STAGE 应包含 intermediate_values 映射。"""

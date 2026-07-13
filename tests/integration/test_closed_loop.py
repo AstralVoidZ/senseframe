@@ -40,17 +40,27 @@ class TestClosedLoop:
         )
 
         # 2. 读取 feedback（stage_eval 写入 ctx.extra）
+        # P5 P2-7 阶段2：feedback 现在是 FeedbackResult dataclass，用属性访问
         feedback = ctx.extra.get("feedback")
         assert feedback is not None, "ctx.extra 未生成 feedback（stage_eval 未执行或异常）"
-        assert "status" in feedback, "feedback 缺少 status 字段"
-        assert "diagnosis" in feedback
-        assert "suggestions" in feedback
+        # 兼容 FeedbackResult dataclass 和 dict 两种形态
+        if hasattr(feedback, "status"):
+            assert feedback.status is not None, "feedback 缺少 status 字段"
+            assert hasattr(feedback, "diagnosis")
+            assert hasattr(feedback, "suggestions")
+            fb_status = feedback.status
+        else:
+            assert "status" in feedback, "feedback 缺少 status 字段"
+            assert "diagnosis" in feedback
+            assert "suggestions" in feedback
+            fb_status = feedback["status"]
 
         # 3. feedback 应已回写到 exploration_history 最后一次 trial
         assert len(ctx.exploration_history) > 0
         last_trial = ctx.exploration_history[-1]
         assert last_trial.get("feedback") is not None, "最近 trial 未回写 feedback"
-        assert last_trial["feedback"]["status"] == feedback["status"]
+        # tracker 中的 feedback 已被 hpo.py 转为 dict
+        assert last_trial["feedback"]["status"] == fb_status
 
         # 4. recommend_next 应返回非空列表
         tracker = ExplorationTracker(ctx.exploration_history)
@@ -59,7 +69,7 @@ class TestClosedLoop:
 
         # 5. 验证推荐方向匹配 feedback status
         # feedback 感知推荐优先级最高，置于 recs 列表前列（见 ExplorationTracker.recommend_next）
-        status = feedback["status"]
+        status = fb_status
         first = recs[0]
         strategy_str = str(first.get("strategy", {}))
 
@@ -83,4 +93,4 @@ class TestClosedLoop:
         # converged / success：推荐方向不强制断言（兼容性矩阵/HPO 候选即可）
 
         # 6. tracker.last_feedback 应与 pipeline 生成的 feedback 一致
-        assert tracker.last_feedback()["status"] == feedback["status"]
+        assert tracker.last_feedback()["status"] == fb_status

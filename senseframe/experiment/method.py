@@ -47,16 +47,29 @@ def _extract_metrics_from_train_output(train_output) -> Dict[str, float]:
     for k, v in (train_output.final_eval or {}).items():
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             metrics[k] = float(v)
-    # 补充 training dict 中的数值字段（如 best_val_loss）
-    for k, v in (train_output.training or {}).items():
-        if isinstance(v, (int, float)) and not isinstance(v, bool) and k not in metrics:
-            metrics[k] = float(v)
+    # 补充 training 中的数值字段（如 best_val_loss）
+    # P5 P2-7 阶段2：training 现在是 TrainingSummary dataclass，用 to_dict() 兼容
+    training = train_output.training
+    if training is not None:
+        training_dict = training.to_dict() if hasattr(training, "to_dict") else training
+        for k, v in training_dict.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and k not in metrics:
+                metrics[k] = float(v)
     return metrics
 
 
 def _extract_efficiency_from_train_output(train_output) -> Dict[str, Any]:
     """从 TrainOutput 提取效率指标（wall_time_s / n_epochs_trained）。"""
-    training = train_output.training or {}
+    # P5 P2-7 阶段2：training 现在是 TrainingSummary dataclass，用属性访问
+    training = train_output.training
+    if training is None:
+        return {"wall_time_s": 0.0, "n_epochs_trained": 0}
+    if hasattr(training, "to_dict"):
+        return {
+            "wall_time_s": float(training.duration_s or 0.0),
+            "n_epochs_trained": int(training.epochs_trained),
+        }
+    # 向后兼容：dict 形态
     return {
         "wall_time_s": float(training.get("duration_s", 0.0)),
         "n_epochs_trained": int(training.get("epochs_trained", 0)),
@@ -298,11 +311,14 @@ class MethodRunner:
 
             # P2.4: ε5 Multi-fidelity 早停检查
             # 从 TrainOutput.training 提取 epoch 级中间值
-            intermediate_values: Dict[int, float] = (
-                train_output.training.get("intermediate_values", {})
-                if train_output.training
-                else {}
-            )
+            # P5 P2-7 阶段2：training 现在是 TrainingSummary dataclass，用属性访问
+            training = train_output.training
+            if training is not None and hasattr(training, "intermediate_values"):
+                intermediate_values: Dict[int, float] = dict(training.intermediate_values)
+            elif training is not None:
+                intermediate_values = training.get("intermediate_values", {})
+            else:
+                intermediate_values = {}
 
             should_prune = False
             if self.pruner is not None and intermediate_values:

@@ -300,8 +300,9 @@ class ResourceRouter:
         resolved = {}
 
         # device: YAML > 路由
+        # P5 P2-4：用 is not None 判断，避免空字符串被 falsy 错误回退
         yaml_device = yaml_config.get("device")
-        if yaml_device and yaml_device != "auto":
+        if yaml_device is not None and yaml_device != "auto":
             resolved["device"] = yaml_device
         else:
             resolved["device"] = route_config["device"]
@@ -354,7 +355,9 @@ class ResourceRouter:
             resolved["learning_rate"] = model_info.get("default_lr", 1e-3)
 
         # optimizer: YAML > 默认 adam
-        resolved["optimizer"] = yaml_config.get("optimizer") or "adam"
+        # P5 P2-4：用 is not None 判断，避免空字符串被 falsy 错误回退
+        yaml_opt = yaml_config.get("optimizer")
+        resolved["optimizer"] = yaml_opt if yaml_opt is not None else "adam"
 
         # weight_decay: YAML > 默认 0.0
         # P2 隐藏 bug 修复：用 is not None 判断，避免 weight_decay=0.0 被 or 当 falsy 错误回退
@@ -374,7 +377,11 @@ class ResourceRouter:
 
         # Phase 1.2a：梯度裁剪与累积
         resolved["gradient_clip_val"] = yaml_config.get("gradient_clip_val")
-        resolved["gradient_clip_algorithm"] = yaml_config.get("gradient_clip_algorithm") or "norm"
+        resolved["gradient_clip_algorithm"] = (
+            yaml_config.get("gradient_clip_algorithm")
+            if yaml_config.get("gradient_clip_algorithm") is not None
+            else "norm"
+        )
         # P2 隐藏 bug 修复：用 is not None 判断，避免 accumulate_grad_batches=0 被 or 当 falsy 错误回退
         # （0 虽不合法，但应由下游校验报错，而非静默回退到 1）
         yaml_agb = yaml_config.get("accumulate_grad_batches")
@@ -384,7 +391,9 @@ class ResourceRouter:
             resolved["accumulate_grad_batches"] = 1
 
         # Phase 2.2a：logger 后端透传（默认 csv）
-        resolved["logger"] = yaml_config.get("logger") or "csv"
+        # P5 P2-4：用 is not None 判断，避免空字符串被 falsy 错误回退
+        yaml_logger = yaml_config.get("logger")
+        resolved["logger"] = yaml_logger if yaml_logger is not None else "csv"
 
         # Phase 4.3：分布式训练配置透传
         # devices: GPU 数量（int 或 "auto"），默认 1（单卡，向后兼容）

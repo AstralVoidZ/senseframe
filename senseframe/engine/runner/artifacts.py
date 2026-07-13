@@ -257,6 +257,80 @@ def verify_artifacts(output_dir: Path) -> Dict[str, bool]:
     return result
 
 
+# P5 P3-11：manifest schema 完整性校验
+_REQUIRED_MANIFEST_FIELDS = frozenset({
+    "run_id", "created_at", "senseframe_version", "pipeline_version",
+    "config_hash", "data_hash",
+})
+
+# 成功路径必须声明的产物
+_REQUIRED_ARTIFACT_NAMES = frozenset({
+    "config", "metadata", "training_log",
+})
+
+
+def verify_manifest_schema(manifest_path: Path) -> List[str]:
+    """校验 manifest.json schema 完整性，返回缺失字段列表。
+
+    P5 P3-11：verify_artifacts 只校验文件 hash，不校验 manifest 自身完整性。
+    此函数补充 schema 校验：必填字段是否存在。
+
+    Args:
+        manifest_path: manifest.json 路径
+
+    Returns:
+        缺失的 manifest 字段名列表（空列表表示完整）
+    """
+    import json
+    manifest_path = Path(manifest_path)
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return list(_REQUIRED_MANIFEST_FIELDS)
+    return [f for f in _REQUIRED_MANIFEST_FIELDS if f not in data]
+
+
+def verify_artifacts_full(output_dir: Path) -> Dict[str, Any]:
+    """完整校验：hash + schema + 必填产物。
+
+    P5 P3-11：补充 verify_artifacts 的不足，增加：
+    1. manifest schema 校验（必填字段是否齐全）
+    2. 必填产物校验（config/metadata/training_log 是否声明）
+
+    Args:
+        output_dir: 训练输出目录
+
+    Returns:
+        {
+            "hash_check": {产物名: bool},
+            "manifest_schema_missing": [缺失字段],
+            "missing_artifacts": [缺失产物名],
+        }
+    """
+    output_dir = Path(output_dir)
+    manifest_path = output_dir / "manifest.json"
+
+    # 1. manifest schema
+    schema_missing = verify_manifest_schema(manifest_path)
+
+    # 2. hash 校验（复用现有逻辑）
+    hash_check = verify_artifacts(output_dir)
+
+    # 3. 必填产物校验
+    try:
+        manifest = ArtifactManifest.load(output_dir)
+        declared = {a.name for a in manifest.artifacts}
+    except Exception:
+        declared = set()
+    missing_artifacts = [n for n in _REQUIRED_ARTIFACT_NAMES if n not in declared]
+
+    return {
+        "hash_check": hash_check,
+        "manifest_schema_missing": schema_missing,
+        "missing_artifacts": missing_artifacts,
+    }
+
+
 def verify_artifacts_recursive(
     output_dir: Path,
     max_depth: int = 3,

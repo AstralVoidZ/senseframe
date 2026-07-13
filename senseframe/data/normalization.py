@@ -14,7 +14,7 @@ from ..registry import get_normalization
 def normalize(x: np.ndarray, dataset_name: str) -> np.ndarray:
     """按数据集注册的策略归一化。
 
-    通过 registry.get_normalization() 取得策略（默认 IdentityStrategy）。
+    P5 P0-2：通过 registry.get_normalization() 取得策略，未注册时 raise KeyError。
     """
     return get_normalization(dataset_name).apply(x)
 

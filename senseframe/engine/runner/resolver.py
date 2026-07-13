@@ -96,6 +96,9 @@ def experiment_config_to_dict(cfg: ExperimentConfig) -> Dict[str, Any]:
     # scene.params 透传到顶层（允许覆盖 trainer 字段，提供 escape hatch）
     # 已知透传键：self_supervised_epochs, metrics, average, scheduler,
     #             gpu, resume, mixed_precision
+    # P5 P3-4 选项 B：透传前校验 scene.params 已知键类型，捕获类型污染
+    from ...schemas import validate_scene_params
+    validate_scene_params(cfg.scene.params)
     for k, v in (cfg.scene.params or {}).items():
         d[k] = v
 
@@ -143,9 +146,11 @@ def resolve_task_spec(
         return ts_field
 
     # 场景容器默认
+    # P5 P1-E：缩小 except 范围至 (NotImplementedError, KeyError)，
+    # 仅捕获场景未实现/数据集未注册等预期异常，其他异常（代码 bug）应正常抛出
     try:
         return scene.get_task_spec(dataset, model_id, **(scene_kwargs or {}))
-    except Exception:
+    except (NotImplementedError, KeyError):
         # RFC Phase B：场景容器无法提供时，用数据画像推断
         if data_profile is not None:
             from ...core.task import TaskSpec
@@ -172,23 +177,26 @@ def resolve_feature_spec(
     2. 从 ExperimentConfig.input_features 派生（YAML 声明）
     """
     from ...core.features import FeatureSpec
-    # 1. 场景容器默认
-    # 缩小 except 范围：仅捕获数据集不存在/manifest 缺失等预期异常，
-    # 其他异常（如代码 bug）应正常抛出
-    try:
-        spec = scene.get_feature_spec(dataset, **(scene_kwargs or {}))
-        if spec is not None and spec.input_shape is not None:
-            return spec
-    except (KeyError, FileNotFoundError, ValueError) as e:
-        logger.debug(f"Scene get_feature_spec fallback to input_features: {e}")
-    # 2. 从 input_features 派生
+    # P5 P1-F：消除静默 fallback。旧代码在场景 get_feature_spec 失败时
+    # 静默回退到 config.input_features，再回退到空 FeatureSpec()，
+    # 掩盖了场景配置错误。现在：场景异常直接 raise；场景返回 None
+    # 时用 config.input_features（显式声明优先）；两者都无则 raise。
+    spec = scene.get_feature_spec(dataset, **(scene_kwargs or {}))
+    if spec is not None and spec.input_shape is not None:
+        return spec
+    # 场景未提供有效 spec，从 input_features 派生（显式 YAML 声明）
     if config.input_features:
         f = config.input_features[0]
         return FeatureSpec(
             input_shape=tuple(f.shape) if f.shape else None,
             modality=f.type,
         )
-    return FeatureSpec()
+    raise ValueError(
+        f"Cannot resolve FeatureSpec: scene '{scene.meta().name}' returned "
+        f"{spec!r} and config.input_features is empty. "
+        f"Either implement scene.get_feature_spec() properly or declare "
+        f"input_features in the experiment config."
+    )
 
 
 def validate_scene_capabilities(

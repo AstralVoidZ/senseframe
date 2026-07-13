@@ -5,6 +5,10 @@ subtask: false
 
 <!--
 
+本文件是 Agent 提示词，部署到 .opencode/.claude/.agents/commands/ 供 AI Agent CLI 工具调用。
+slash 命令 /senseframe-auto 由 Agent CLI 工具（opencode/Claude Code）解析，不是 SenseFrame CLI 子命令。
+SenseFrame CLI 子命令清单见 SKILL.md 或 `python -m senseframe.cli --help`。
+
 command: /senseframe-auto
 场景: 中等 (15-30 min)
 目的: 验证多轮训练中 Agent 主导的配置调优闭环

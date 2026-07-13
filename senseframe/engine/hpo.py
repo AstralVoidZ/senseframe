@@ -256,6 +256,10 @@ def apply_params(config: ExperimentConfig,
         深拷贝后的新 ExperimentConfig
     """
     new_config = copy.deepcopy(config)
+    # P5 P3-4：params 现在是 Optional[SceneParams]，确保非 None 后再赋值
+    if new_config.scene.params is None:
+        from ..core.params import SceneParams
+        new_config.scene.params = SceneParams()
     for name, value in params.items():
         if name in _TRAINER_FIELDS:
             setattr(new_config.trainer, name, value)
@@ -319,9 +323,13 @@ def extract_metric(result, metric: str) -> float:
     Raises:
         ValueError: 指标未找到
     """
+    # P5 P2-7 阶段2：training 现在是 TrainingSummary dataclass，用属性访问
+    training = result.training
+    training_dict = training.to_dict() if hasattr(training, "to_dict") else (training or {})
+
     # 特殊别名
     if metric == "val_loss":
-        val = result.training.get("best_val_loss")
+        val = training_dict.get("best_val_loss")
         if val is not None:
             return float(val)
 
@@ -330,13 +338,13 @@ def extract_metric(result, metric: str) -> float:
         return float(result.final_eval[metric])
 
     # training 字典
-    if metric in result.training:
-        return float(result.training[metric])
+    if metric in training_dict:
+        return float(training_dict[metric])
 
     raise ValueError(
         f"Metric '{metric}' not found in TrainOutput. "
         f"Available final_eval: {list(result.final_eval.keys())}, "
-        f"training: {list(result.training.keys())}"
+        f"training: {list(training_dict.keys())}"
     )
 
 
@@ -400,15 +408,20 @@ def _default_objective(trial, config: ExperimentConfig,
         # P4-5：从 TrainOutput.feedback 读取 pipeline 实际生成的 feedback。
         # 旧代码硬编码 {"status": "success"}，忽略 pipeline 中 analyze_training_result
         # 的实际判定（如 underfitting/overfitting），导致探索-反馈回路断裂。
+        # P5 P2-7 阶段2：feedback 现在是 FeedbackResult dataclass，转 dict 给 tracker
         feedback = result.feedback
         if feedback is None:
-            feedback = {"status": "success", "diagnosis": "HPO trial succeeded", "suggestions": []}
+            feedback_dict = {"status": "success", "diagnosis": "HPO trial succeeded", "suggestions": []}
+        elif hasattr(feedback, "to_dict"):
+            feedback_dict = feedback.to_dict()
+        else:
+            feedback_dict = feedback
         tracker.add_trial(
             strategy=params,
             result={"val_accuracy": result.final_eval.get("val_accuracy"),
                     "val_loss": result.final_eval.get("val_loss"),
                     config.hpo.metric: metric_value},
-            feedback=feedback,
+            feedback=feedback_dict,
         )
 
     return metric_value

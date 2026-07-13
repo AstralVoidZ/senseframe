@@ -35,8 +35,8 @@ save_model: bool = true         # 可选
 | `dataset` | str | 是 | - | 数据集名 |
 | `model_id` | str | 是 | - | 模型 ID |
 | `learning_mode` | str | 否 | `supervised` | `supervised` / `self_supervised` |
-| `data_root` | str | 否 | null | 数据根目录，null 用场景默认 |
-| `params` | dict | 否 | `{}` | 场景特定参数（escape hatch） |
+| `data_root` | str | 否 | `""` | 数据根目录，必填（YAML/CLI/env 三选一），空字符串触发 env/CLI 回退 |
+| `params` | SceneParams \| dict | 否 | `None` | 场景特定参数（escape hatch）；YAML 中的 dict 会在 from_dict 时自动转为 SceneParams 实例 |
 
 **校验规则**：
 - `name` / `dataset` / `model_id` 不能为空
@@ -94,17 +94,27 @@ save_model: bool = true         # 可选
 | `learning_rate` | float | 否 | null | 学习率，null=用模型默认值，>0 |
 | `batch_size` | int | 否 | 64 | 批大小，>0 |
 | `optimizer` | str | 否 | `adam` | 优化器 |
-| `weight_decay` | float | 否 | 0.0 | 权重衰减，>=0 |
-| `early_stopping` | int | 否 | null | patience，null=不启用 |
+| `weight_decay` | float | 否 | `1e-4` | 权重衰减（L2 正则），>=0 |
+| `early_stopping` | int | 否 | `5` | patience，null=不启用 |
+| `early_stopping_min_delta` | float | 否 | `0.001` | val_loss 提升阈值，低于此值视为无提升 |
+| `early_stopping_monitor` | str | 否 | `val_loss` | 早停监控指标名 |
 | `deterministic` | bool | 否 | false | 确定性模式 |
 | `max_time` | str | 否 | null | DD:HH:MM:SS 格式 |
 | `seed` | int | 否 | 42 | 随机种子 |
 | `enable_progress_bar` | bool | 否 | true | 进度条开关，后台进程可关闭 |
-| `scheduler` | str | 否 | null | 学习率调度器：null/cosine/step |
+| `scheduler` | str | 否 | `cosine` | 学习率调度器：null/cosine/step |
 | `gradient_clip_val` | float | 否 | null | 梯度裁剪阈值，null=不裁剪 |
 | `gradient_clip_algorithm` | str | 否 | `norm` | 梯度裁剪算法：norm/value |
 | `accumulate_grad_batches` | int | 否 | 1 | 梯度累积步数，>0 |
 | `logger` | str | 否 | `csv` | 日志后端：csv/tensorboard/wandb/none |
+| `self_supervised_epochs` | int | 否 | 100 | 自监督预训练轮数 |
+| `metrics` | list[str] | 否 | `["accuracy", "macro_f1"]` | 评估指标列表 |
+| `gpu` | int | 否 | null | 指定 GPU ID，null=自动 |
+| `resume` | str | 否 | null | resume checkpoint 路径，null=不恢复 |
+| `mixed_precision` | any | 否 | null | 混合精度：True=16-mixed, False=32, 字符串直接透传, null=自动 |
+| `limit_train_batches` | any | 否 | null | 限制训练 batch 数（dry-run 用），null=不限制 |
+| `limit_val_batches` | any | 否 | null | 限制验证 batch 数（dry-run 用），null=不限制 |
+| `auto_lr_find` | bool | 否 | false | 自动 LR 标定（Lightning LR Range Test），true 时 stage_train 调 trainer.tune() |
 
 **支持的 optimizer**：`adam` / `adamw` / `sgd` / `rmsprop`
 **支持的 logger**：`csv`（默认，始终可用）/ `tensorboard`（需 `pip install tensorboard`）/ `wandb`（需 `pip install wandb`）/ `none`（关闭日志）

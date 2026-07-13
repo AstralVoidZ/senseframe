@@ -162,6 +162,9 @@ def run_experiment_with_retry(
     policies = policies or DEFAULT_RETRY_POLICIES
     attempts: List[RetryAttempt] = []
     total_retries = 0
+    # P5 P2-10：deepcopy config，避免重试修改污染调用者状态
+    # 旧代码直接修改传入的 config 对象（output_dir/batch_size），调用者持有引用看到最后重试值
+    config = copy.deepcopy(config)
     original_output_dir = config.output_dir
     original_batch_size = config.trainer.batch_size
 

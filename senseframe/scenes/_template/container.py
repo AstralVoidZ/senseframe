@@ -18,6 +18,7 @@ class {SCENE_NAME_CLASS}Container(SceneContainer):
             supported_datasets=["{SCENE_NAME}_dataset"],
             supported_models=["mlp"],
             is_dynamic_dataset=False,
+            modality="tabular",  # P5 P1-D：显式声明模态，消除 shape-based fallback
         )
 
     def load_dataset(self, dataset_name: str, root: str,

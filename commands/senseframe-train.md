@@ -5,6 +5,10 @@ subtask: false
 
 <!--
 
+本文件是 Agent 提示词，部署到 .opencode/.claude/.agents/commands/ 供 AI Agent CLI 工具调用。
+slash 命令 /senseframe-train 由 Agent CLI 工具（opencode/Claude Code）解析，不是 SenseFrame CLI 子命令。
+SenseFrame CLI 子命令清单见 SKILL.md 或 `python -m senseframe.cli --help`。
+
 command: /senseframe-train
 场景: 简单 (5-15 min)
 目的: 验证声明式训练路径 + 配置校验 + 预检 + 基础训练 + 错误码

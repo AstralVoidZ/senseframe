@@ -28,6 +28,13 @@ SenseFrame 让 Agent 持有训练流程控制权：框架提供可组合的 Stag
 - **自省协议** — `context_schema()` / `stage_io()` / `pipeline_graph()` 查询字段契约，无需读源码
 - **探索闭环** — `record_trial` 记录历史，`save_skill` 策略复用，`Pipeline.resume` 断点续跑
 
+### v0.3.0 类型安全加固（P5 全面源码审查）
+- **TrainOutput dataclass 化** — `training`/`env_snapshot`/`feedback` 从 `Dict[str, Any]` 收窄为 `Optional[TrainingSummary/EnvSnapshot/FeedbackResult]`，运行时校验捕获类型污染
+- **SceneParams 正交化** — `SceneConfig.params` 从 `Dict[str, Any]` 收窄为 `Optional[SceneParams]`，11 标准字段接口契约 + dict-like 兼容层（`__getitem__`/`__setitem__`/`__contains__`/`items`），下游零改动
+- **Loader spec 驱动** — hdf5/parquet/csi_mat/tensor 4 个 loader 统一从 `DatasetSpec.dir_names` 派生候选路径，删除全部 glob 兜底
+- **validate 函数体系** — `validate_feedback`/`validate_training_summary`/`validate_env_snapshot`/`validate_scene_params` 在构造出口和入口校验类型
+- **渐进式 dataclass 化方法论** — 阶段1 dataclass+validate → Step 1 validate+to_dict 还原 → 阶段2 构造点切换 → 阶段3 类型收窄，每阶段零破坏或可控破坏
+
 ### 训练能力
 - **自监督学习** — 两阶段训练（AutoFi 风格 EntLoss 预训练 + 监督微调）
 - **HPO 超参搜索** — Optuna + 断点续搜
@@ -204,10 +211,11 @@ from senseframe import load_manifest, verify_artifacts
 manifest = load_manifest("runs/<exp>/artifact_manifest.json")
 # manifest.artifacts: {name: ArtifactDescriptor(path, sha256, size)}
 
-# 校验产物完整性（未被篡改/丢失）
-report = verify_artifacts("runs/<exp>/")
-if report.dangling_refs:
-    print(f"缺失产物: {report.dangling_refs}")
+# 校验产物完整性（未被篡改/丢失）— 返回 {产物名: hash 是否匹配}
+result = verify_artifacts("runs/<exp>/")
+tampered = [name for name, ok in result.items() if not ok]
+if tampered:
+    print(f"产物校验失败: {tampered}")
 ```
 
 ## 资源安全

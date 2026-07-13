@@ -25,24 +25,40 @@ _logger = logging.getLogger(__name__)
 
 
 def _find_parquet_file(root: str, dataset_name: str, split: str) -> Path:
-    """在 root 下查找 dataset_name 对应 split 的 .parquet/.pq 文件。"""
+    """在 root 下查找 dataset_name 对应 split 的 .parquet/.pq 文件。
+
+    P5 P2-2：候选路径从 DatasetSpec.dir_names 派生（单一数据源），
+    禁止硬编码候选路径 + glob 兜底。未注册或 dir_names 为空则 raise。
+    """
+    from ...registry import get_dataset_spec
+    try:
+        spec = get_dataset_spec(dataset_name)
+    except KeyError:
+        raise KeyError(
+            f"ParquetLoader: 数据集 '{dataset_name}' 未注册，无法派生 dir_names。"
+            f"请先通过场景注册（register_dataset）声明该数据集的 dir_names。"
+        )
+    if not spec.dir_names:
+        raise ValueError(
+            f"ParquetLoader: 数据集 '{dataset_name}' 的 DatasetSpec.dir_names 为空。"
+            f"请在注册时声明 dir_names（如 ('{dataset_name}',)）。"
+        )
+
+    # 按候选目录顺序探测，扩展名按 supported_extensions 声明
     candidates = []
-    for ext in (".parquet", ".pq"):
-        candidates.append(Path(root, dataset_name, f"{split}{ext}"))
-        candidates.append(Path(root, dataset_name, dataset_name, f"{split}{ext}"))
+    for dir_name in spec.dir_names:
+        for ext in (".parquet", ".pq"):
+            candidates.append(Path(root, dir_name, f"{split}{ext}"))
+            candidates.append(Path(root, dir_name, dir_name, f"{split}{ext}"))
+
     for c in candidates:
         if c.exists():
             return c
-    # 兜底：在 root/dataset_name 目录下扫第一个匹配 split 前缀的文件
-    d = Path(root, dataset_name)
-    if d.is_dir():
-        for ext in (".parquet", ".pq"):
-            files = sorted(d.glob(f"{split}*{ext}"))
-            if files:
-                return files[0]
+
     raise FileNotFoundError(
         f"No {split}.parquet/.pq file found for dataset '{dataset_name}' under '{root}'. "
-        f"Searched: {[str(c) for c in candidates]}"
+        f"Searched candidates (derived from dir_names={list(spec.dir_names)}): "
+        f"{[str(c) for c in candidates]}"
     )
 
 

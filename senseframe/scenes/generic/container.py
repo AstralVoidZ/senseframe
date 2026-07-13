@@ -279,6 +279,7 @@ class GenericContainer(SceneContainer):
             input_shape_hint=None,
             requires_custom_dataloader=False,
             is_dynamic_dataset=True,
+            modality="tabular",  # P5 P1-D：显式声明模态，消除 shape-based fallback
         )
 
     def load_dataset(

@@ -144,6 +144,10 @@ def _apply_loss_params(
 
     # label_smoothing → loss_kwargs.label_smoothing
     if "label_smoothing" in params:
+        # P5 P3-4：params 现在是 Optional[SceneParams]，确保非 None
+        if new_config.scene.params is None:
+            from ..core.params import SceneParams
+            new_config.scene.params = SceneParams()
         existing_kwargs = dict(new_config.scene.params.get("loss_kwargs", {}) or {})
         existing_kwargs["label_smoothing"] = params["label_smoothing"]
         new_config.scene.params["loss_kwargs"] = existing_kwargs

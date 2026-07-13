@@ -27,11 +27,13 @@ from .search_space import (
 )
 from .policy_builder import (
     AutoAugmentPolicyBuilder,
+    IdentityTransform,
     list_augment_ops,
     get_augment_op,
     make_policy_from_params,
 )
 from .sampler import AutoAugmentSampler
+from ..common.transforms import ChainedTransform
 
 
 def make_autoaugment_datamodule_factory(
@@ -76,14 +78,13 @@ def make_autoaugment_datamodule_factory(
 
     actual_builder = builder or AutoAugmentPolicyBuilder(search_space=search_space)
     aug_train_transform = actual_builder.build(policy_params)
-    # 评估 transform：不增强（用 base_eval_transform 或 identity）
-    eval_transform = base_eval_transform if base_eval_transform is not None else (lambda x, y: (x, y))
+    # P5 P1-A：评估 transform 使用 IdentityTransform 替代 lambda 闭包（可 pickle）
+    eval_transform = base_eval_transform if base_eval_transform is not None else IdentityTransform()
 
-    # 组合 base_train_transform 与 aug_train_transform
+    # P5 P1-A：组合 base_train_transform 与 aug_train_transform 使用 ChainedTransform
+    # 替代嵌套函数闭包（module-level callable 类，可 pickle，DataLoader num_workers>0 安全）
     if base_train_transform is not None:
-        def combined_train_transform(x, y):
-            x, y = base_train_transform(x, y)
-            return aug_train_transform(x, y)
+        combined_train_transform = ChainedTransform([base_train_transform, aug_train_transform])
     else:
         combined_train_transform = aug_train_transform
 

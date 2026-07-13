@@ -1,13 +1,16 @@
 """
 Phase 11.4 — SceneParams 正交化。
 
-将 SceneContext.params 由原始 dict 升级为 SceneParams 数据类，
-提供：
+将场景参数由原始 dict 升级为 SceneParams 数据类，提供：
 - 标准字段（target_frames / window_size / overlap_ratio / sampling_rate）
 - 自定义字段（extra 透传）
 - 向后兼容：支持从 dict 构造，提供 to_dict() 序列化
+- dict-like 接口：__getitem__/__setitem__/__contains__/items，减少下游迁移成本
 
-目标：让场景特定参数在 runner / HPO / CLI 层面有一致的接口契约。
+P5 P3-4 完整正交化（2026-07-13）：
+- SceneConfig.params 类型从 Dict[str, Any] 收窄为 Optional[SceneParams]
+- SceneParams 提供 dict-like 兼容层，下游 []/= /in/.get()/.items() 零改动
+- 10 个标准字段为接口契约（即使无消费者也定义清楚），extra 承载场景特定扩展
 """
 
 from __future__ import annotations
@@ -98,3 +101,54 @@ class SceneParams:
 
     def __bool__(self) -> bool:
         return not self.is_empty()
+
+    # ============================================================
+    # P5 P3-4：dict-like 兼容层
+    # ============================================================
+    # 让 SceneParams 兼容 [] / []= / in / .get() / .items() 等 dict 操作，
+    # 下游消费方零改动。标准字段和 extra 统一访问。
+
+    def __getitem__(self, key: str) -> Any:
+        """支持下标取值：params["key"]。"""
+        if key in self.__dataclass_fields__ and key != "extra":
+            val = getattr(self, key)
+            if val is not None:
+                return val
+            raise KeyError(key)
+        if key in self.extra:
+            return self.extra[key]
+        raise KeyError(key)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """支持下标赋值：params["key"] = value。委托给 .set()。"""
+        self.set(key, value)
+
+    def __contains__(self, key: str) -> bool:
+        """支持 in 操作：key in params。"""
+        if key in self.__dataclass_fields__ and key != "extra":
+            return getattr(self, key) is not None
+        return key in self.extra
+
+    def items(self):
+        """返回扁平 dict 的 items（标准字段非 None 值 + extra）。"""
+        result = {}
+        for f in self.__dataclass_fields__:
+            if f == "extra":
+                continue
+            val = getattr(self, f)
+            if val is not None:
+                result[f] = val
+        result.update(self.extra)
+        return result.items()
+
+    def keys(self):
+        """返回扁平 dict 的 keys。"""
+        return [k for k, _ in self.items()]
+
+    def to_flat_dict(self) -> Dict[str, Any]:
+        """返回扁平 dict（标准字段非 None 值 + extra 合并）。
+
+        用于 JSON 序列化或需要 dict 形态的下游消费方。
+        to_dict() 返回嵌套结构（含 extra 子 dict），to_flat_dict() 返回扁平结构。
+        """
+        return dict(self.items())

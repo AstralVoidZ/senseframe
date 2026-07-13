@@ -139,7 +139,12 @@ class CustomContainer(SceneContainer):
             requires_custom_dataloader=False,
             supported_learning_modes=["supervised"],
             is_dynamic_dataset=True,
+            modality="tabular",  # P5 P1-D：显式声明模态，消除 shape-based fallback
         )
+
+    def get_catalog(self):
+        """P5 P3-3：显式覆写，custom 场景技术目录由 manifest 决定，无静态目录。"""
+        return None
 
     def load_dataset(
         self,

@@ -524,8 +524,24 @@ def register_normalization(name: str, strategy: NormalizationStrategy, overwrite
 
 
 def get_normalization(name: str) -> NormalizationStrategy:
-    """获取归一化策略；若未注册则回退到 IdentityStrategy。"""
-    return _NORMALIZATION_REGISTRY.get(name, IdentityStrategy())
+    """获取归一化策略。
+
+    P5 P0-2：未注册时 raise KeyError，不再静默回退到 IdentityStrategy。
+    旧代码的 fallback 是 NTU-Fi_HAR val_loss 爆炸（7.6→260260）的根因机制
+    ——forkserver worker 丢失注册表时静默降级，原始幅值进入模型。
+    """
+    if name not in _NORMALIZATION_REGISTRY:
+        raise KeyError(
+            f"Normalization strategy for '{name}' is not registered. "
+            f"Use register_normalization('{name}', strategy) to register. "
+            f"Registered: {list(_NORMALIZATION_REGISTRY.keys())}"
+        )
+    return _NORMALIZATION_REGISTRY[name]
+
+
+def get_normalization_or_none(name: str) -> Optional[NormalizationStrategy]:
+    """非破坏性查询归一化策略，未注册时返回 None。"""
+    return _NORMALIZATION_REGISTRY.get(name)
 
 
 def has_normalization(name: str) -> bool:
@@ -931,15 +947,35 @@ def get_model_info(
     return info
 
 
-def list_datasets() -> List[Dict[str, Any]]:
-    """列出所有可用数据集。"""
+def list_datasets(
+    scene_name: Optional[str] = None,
+    modality: Optional[str] = None,
+    learning_mode: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """列出所有可用数据集。
+
+    P5 P3-1：与 list_models 的过滤维度对称，支持按 scene_name/modality/learning_mode 筛选。
+
+    Args:
+        scene_name: 按场景名过滤（None=不过滤）
+        modality: 按数据模态过滤（如 "csi"/"image"/"tabular"，None=不过滤）
+        learning_mode: 按学习模式过滤（如 "supervised"/"self_supervised"，None=不过滤）
+    """
     # P2-1 修复：未激活场景时 registry 为空，warning 提示用户先 activate_lazy_scenes
     if len(_DATASET_REGISTRY) == 0:
         _logger.warning(
             "list_datasets: registry 为空，可能未调用 activate_lazy_scenes()。"
             "请先 import senseframe as sf; sf.activate_lazy_scenes() 再查询。"
         )
-    return [{"name": k, **v} for k, v in DATASET_INFO.items()]
+    result = [{"name": k, **v} for k, v in DATASET_INFO.items()]
+    # P5 P3-1：过滤维度
+    if scene_name is not None:
+        result = [d for d in result if d.get("scene_name") == scene_name]
+    if modality is not None:
+        result = [d for d in result if d.get("modality") == modality]
+    if learning_mode is not None:
+        result = [d for d in result if learning_mode in (d.get("supported_learning_modes") or [])]
+    return result
 
 
 # ============================================================

@@ -460,6 +460,7 @@ class GenericDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             collate_fn=self.collate_fn,
+            worker_init_fn=_np_random_worker_init_fn,
         )
         # P1-3: 首次创建 dataloader 时打印摘要
         try:

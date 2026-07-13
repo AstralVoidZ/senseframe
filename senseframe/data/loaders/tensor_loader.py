@@ -54,8 +54,15 @@ def _load_ut_har(root_dir: str) -> Dict[str, torch.Tensor]:
             f"UT_HAR_data 应注册为 'npy'（或 'csv' 若扩展名确实为 .csv）。"
         )
 
-    data_dir = resolve_data_path(root_dir, "UT_HAR", "data")
-    label_dir = resolve_data_path(root_dir, "UT_HAR", "label")
+    # P5 P2-2: 目录名从 spec.dir_names 派生（单一数据源），禁止硬编码 "UT_HAR"
+    if not spec.dir_names:
+        raise ValueError(
+            "TensorLoader: 数据集 'UT_HAR_data' 的 DatasetSpec.dir_names 为空。"
+            "请在注册时声明 dir_names（如 ('UT_HAR',)）。"
+        )
+    dir_name = spec.dir_names[0]
+    data_dir = resolve_data_path(root_dir, dir_name, "data")
+    label_dir = resolve_data_path(root_dir, dir_name, "label")
     # L3 修复：glob 前 resolve，避免相对路径含 .. 匹配逃逸目录
     data_dir_resolved = Path(data_dir).resolve()
     label_dir_resolved = Path(label_dir).resolve()

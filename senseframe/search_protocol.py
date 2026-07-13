@@ -393,31 +393,46 @@ class ASHASampler:
         max_resource: 最大资源量（epoch 数），默认 81
         eta: 降比率，默认 3
         direction: 优化方向，"maximize" 或 "minimize"
+        seed: 随机种子（P5 P1-G：独立 RNG，不受全局 set_seed 影响）
     """
     name = "asha"
 
-    def __init__(self, max_resource: int = 81, eta: int = 3, direction: str = "maximize"):
+    def __init__(self, max_resource: int = 81, eta: int = 3, direction: str = "maximize",
+                 seed: Optional[int] = None):
         self.max_resource = max_resource
         self.eta = eta
         self.direction = direction  # "maximize" / "minimize"
+        # P5 P1-G：独立 RNG，与 RandomSampler 对称，不受全局 set_seed 周期性重置影响
+        self._rng = np.random.default_rng(seed)
         # rung_index -> [(value, trial_id)]
         self._rungs: Dict[int, List[Tuple[float, str]]] = {}
 
     def sample(self, search_space: SearchSpace, history: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """随机采样（与 RandomSampler 相同，ASHA 的区别仅在 should_prune）。"""
-        import random
+        """随机采样（与 RandomSampler 相同，ASHA 的区别仅在 should_prune）。
+
+        P5 P1-G：使用独立 self._rng 替代全局 random 模块，消费 ParameterSpec.step 字段。
+        """
         params = {}
         for p in search_space.parameters:
             if p.type == "float":
                 if p.log and p.low and p.high:
-                    import math
-                    params[p.name] = math.exp(random.uniform(math.log(p.low), math.log(p.high)))
+                    # log-uniform 采样（numpy 2.x 兼容）
+                    params[p.name] = float(
+                        np.exp(self._rng.uniform(np.log(p.low), np.log(p.high)))
+                    )
                 else:
-                    params[p.name] = random.uniform(p.low or 0, p.high or 1)
+                    params[p.name] = float(self._rng.uniform(p.low or 0, p.high or 1))
             elif p.type == "int":
-                params[p.name] = random.randint(int(p.low or 0), int(p.high or 100))
+                low, high = int(p.low or 0), int(p.high or 100)
+                if p.step:
+                    # P5 P1-G：消费 step 字段——采样值必须是 low + k*step 的形式
+                    step_int = int(p.step)
+                    n_steps = (high - low) // step_int + 1
+                    params[p.name] = low + int(self._rng.integers(0, n_steps)) * step_int
+                else:
+                    params[p.name] = int(self._rng.integers(low, high + 1))
             elif p.type == "categorical" and p.choices:
-                params[p.name] = random.choice(p.choices)
+                params[p.name] = str(self._rng.choice(p.choices))
         return params
 
     def should_prune(self, trial_id: str, intermediate_values: Dict[int, float], rung: int) -> bool:
@@ -483,13 +498,17 @@ class HyperbandSampler:
         max_resource: 最大资源量（epoch 数），默认 81
         eta: 降比率，默认 3
         direction: 优化方向，"maximize" 或 "minimize"
+        seed: 随机种子（P5 P1-H：独立 RNG，不受全局 set_seed 影响）
     """
     name = "hyperband"
 
-    def __init__(self, max_resource: int = 81, eta: int = 3, direction: str = "maximize"):
+    def __init__(self, max_resource: int = 81, eta: int = 3, direction: str = "maximize",
+                 seed: Optional[int] = None):
         self.max_resource = max_resource
         self.eta = eta
         self.direction = direction
+        # P5 P1-H：独立 RNG，与 RandomSampler 对称，不受全局 set_seed 周期性重置影响
+        self._rng = np.random.default_rng(seed)
         # bracket 数: floor(log_η(R)) + 1，至少为 1
         import math
         if max_resource > 1 and eta > 1:
@@ -512,20 +531,31 @@ class HyperbandSampler:
         return self._trial_bracket[trial_id]
 
     def sample(self, search_space: SearchSpace, history: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """随机采样（与 RandomSampler 相同，Hyperband 的区别仅在 should_prune）。"""
-        import random
+        """随机采样（与 RandomSampler 相同，Hyperband 的区别仅在 should_prune）。
+
+        P5 P1-H：使用独立 self._rng 替代全局 random 模块，消费 ParameterSpec.step 字段。
+        """
         params = {}
         for p in search_space.parameters:
             if p.type == "float":
                 if p.log and p.low and p.high:
-                    import math
-                    params[p.name] = math.exp(random.uniform(math.log(p.low), math.log(p.high)))
+                    # log-uniform 采样（numpy 2.x 兼容）
+                    params[p.name] = float(
+                        np.exp(self._rng.uniform(np.log(p.low), np.log(p.high)))
+                    )
                 else:
-                    params[p.name] = random.uniform(p.low or 0, p.high or 1)
+                    params[p.name] = float(self._rng.uniform(p.low or 0, p.high or 1))
             elif p.type == "int":
-                params[p.name] = random.randint(int(p.low or 0), int(p.high or 100))
+                low, high = int(p.low or 0), int(p.high or 100)
+                if p.step:
+                    # P5 P1-H：消费 step 字段——采样值必须是 low + k*step 的形式
+                    step_int = int(p.step)
+                    n_steps = (high - low) // step_int + 1
+                    params[p.name] = low + int(self._rng.integers(0, n_steps)) * step_int
+                else:
+                    params[p.name] = int(self._rng.integers(low, high + 1))
             elif p.type == "categorical" and p.choices:
-                params[p.name] = random.choice(p.choices)
+                params[p.name] = str(self._rng.choice(p.choices))
         return params
 
     def should_prune(self, trial_id: str, intermediate_values: Dict[int, float], rung: int) -> bool:

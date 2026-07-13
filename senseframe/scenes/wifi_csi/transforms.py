@@ -23,6 +23,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from ...common.transforms import ComposedTransform
+
 
 # ============================================================
 # 去噪原语
@@ -334,7 +336,7 @@ def time_jitter(x: np.ndarray, sigma: float = 0.01, rng: Optional[np.random.Gene
         增强后的数据
     """
     x = np.asarray(x, dtype=np.float64)
-    r = rng if rng is not None else np.random
+    r = rng if rng is not None else np.random.default_rng()
     noise = r.normal(0, sigma, x.shape)
     return x + noise
 
@@ -354,7 +356,7 @@ def freq_masking(x: np.ndarray, mask_ratio: float = 0.1, rng: Optional[np.random
     result = x.copy()
     if mask_ratio <= 0 or x.size == 0:
         return result
-    r = rng if rng is not None else np.random
+    r = rng if rng is not None else np.random.default_rng()
     if x.ndim >= 1:
         n = x.shape[-1]
         n_mask = max(1, int(n * mask_ratio))
@@ -378,7 +380,7 @@ def amplitude_rotation(x: np.ndarray, angle_range: float = 5.0, rng: Optional[np
         增强后的数据
     """
     x = np.asarray(x, dtype=np.float64)
-    r = rng if rng is not None else np.random
+    r = rng if rng is not None else np.random.default_rng()
     angle = r.uniform(-angle_range, angle_range)
     rad = np.deg2rad(angle)
     cos_a, sin_a = np.cos(rad), np.sin(rad)
@@ -442,41 +444,6 @@ def compose_transforms(names: list, seed: Optional[int] = None, **kwargs) -> cal
         transforms.append((name, fn))
 
     return ComposedTransform(transforms, kwargs, seed=seed)
-
-
-class ComposedTransform:
-    """组合多个 transform 原语的 callable 类（可 pickle）。
-
-    替代旧 composed 闭包，确保 DataLoader num_workers>0 时序列化不失败。
-    依次对输入应用 (name, fn) 列表中的原语，处理 torch.Tensor ↔ numpy 转换。
-
-    P3 上策：持有独立 np.random.Generator，在 __call__ 中注入到原语，
-    消除对全局 np.random 状态的依赖。Generator 可 pickle，随对象传递到 worker。
-    """
-
-    def __init__(self, transforms, kwargs, seed: Optional[int] = None):
-        # transforms: List[Tuple[str, Callable]]；kwargs: Dict[str, dict]
-        import inspect
-        self.transforms = list(transforms)
-        self.kwargs = dict(kwargs)
-        # 独立 Generator：相同 seed 产生相同序列，不同 ComposedTransform 实例独立
-        self.rng = np.random.default_rng(seed) if seed is not None else None
-        # 预计算每个原语是否接受 rng 参数，避免 try/except 误吞原语内部 TypeError
-        self._accepts_rng = [
-            'rng' in inspect.signature(fn).parameters for _, fn in self.transforms
-        ]
-
-    def __call__(self, x, y=None):
-        import torch
-        x_np = x.numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
-        for (name, fn), accepts_rng in zip(self.transforms, self._accepts_rng):
-            params = self.kwargs.get(name, {})
-            if accepts_rng:
-                x_np = fn(x_np, rng=self.rng, **params)
-            else:
-                x_np = fn(x_np, **params)
-        x_out = torch.from_numpy(x_np).float() if isinstance(x, torch.Tensor) else x_np
-        return x_out, y
 
 
 __all__ = [

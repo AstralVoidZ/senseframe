@@ -127,6 +127,67 @@ def get_augment_op(name: str) -> Optional[Callable[[np.ndarray, float], np.ndarr
 
 
 # ============================================================
+# P5 P1-A：module-level callable 类（可 pickle，替代闭包）
+# ============================================================
+
+class IdentityTransform:
+    """Identity transform（module-level callable 类，可 pickle）。
+
+    替代旧代码中的 ``lambda x, y: (x, y)`` 闭包。
+    """
+
+    def __call__(self, x, y=None):
+        return x, y
+
+
+class AutoAugmentTransform:
+    """AutoAugment transform（module-level callable 类，可 pickle）。
+
+    P5 P1-A：替代旧闭包实现，确保 DataLoader num_workers>0 时可序列化。
+    旧代码在 build() 中返回 lambda/嵌套函数，导致 PicklingError。
+
+    Args:
+        ops_chain: [(op_name, magnitude, probability), ...] 增强算子链
+        rng: 随机数生成器（None 时创建独立实例）
+    """
+
+    def __init__(self, ops_chain: list, rng: Optional[np.random.Generator] = None):
+        self.ops_chain = list(ops_chain)
+        self._rng = rng if rng is not None else np.random.default_rng()
+
+    def __call__(self, x, y=None):
+        if not self.ops_chain:
+            return x, y
+
+        # 转为 numpy（若输入是 torch.Tensor）
+        is_tensor = hasattr(x, "numpy")
+        if is_tensor:
+            x_np = x.numpy()
+        elif isinstance(x, np.ndarray):
+            x_np = x
+        else:
+            x_np = np.asarray(x)
+
+        # 按顺序应用增强原语
+        for op_name, magnitude, probability in self.ops_chain:
+            if self._rng.random() > probability:
+                continue
+            op_fn = _AUGMENT_OPS.get(op_name)
+            if op_fn is None:
+                logger.warning(f"Unknown augment op: {op_name}, skip")
+                continue
+            x_np = op_fn(x_np, magnitude)
+
+        # 转回原类型
+        if is_tensor:
+            import torch
+            result_x = torch.from_numpy(x_np)
+        else:
+            result_x = x_np
+        return result_x, y
+
+
+# ============================================================
 # 策略构建器
 # ============================================================
 
@@ -186,41 +247,12 @@ class AutoAugmentPolicyBuilder:
             i += 1
 
         if not ops_chain:
-            # 空策略：返回 identity
-            return lambda x, y: (x, y)
+            # 空策略：返回 identity（module-level callable 类，可 pickle）
+            return IdentityTransform()
 
-        # 构造 transform 函数
-        def transform(x, y):
-            # 转为 numpy（若输入是 torch.Tensor）
-            is_tensor = False
-            if hasattr(x, "numpy"):
-                is_tensor = True
-                x_np = x.numpy()
-            elif isinstance(x, np.ndarray):
-                x_np = x
-            else:
-                # 其他类型（如 list），转为 numpy
-                x_np = np.asarray(x)
-
-            # 按顺序应用增强原语
-            for op_name, magnitude, probability in ops_chain:
-                if random.random() > probability:
-                    continue  # 按概率跳过
-                op_fn = _AUGMENT_OPS.get(op_name)
-                if op_fn is None:
-                    logger.warning(f"Unknown augment op: {op_name}, skip")
-                    continue
-                x_np = op_fn(x_np, magnitude)
-
-            # 转回原类型
-            if is_tensor:
-                import torch
-                result_x = torch.from_numpy(x_np)
-            else:
-                result_x = x_np
-            return result_x, y
-
-        return transform
+        # P5 P1-A：返回 AutoAugmentTransform 实例（module-level callable 类，可 pickle）
+        # 旧代码返回闭包函数，DataLoader num_workers>0 时 PicklingError
+        return AutoAugmentTransform(ops_chain)
 
     def build_eval_transform(
         self,
@@ -236,7 +268,7 @@ class AutoAugmentPolicyBuilder:
         Returns:
             identity transform fn(x, y) -> (x, y)
         """
-        return lambda x, y: (x, y)
+        return IdentityTransform()
 
 
 def make_policy_from_params(

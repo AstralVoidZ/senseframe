@@ -420,7 +420,7 @@ def _run_direct(test_case, run_id, output_base):
                 # RFC-004 方案 C：final_eval 字段统一 val_ 前缀
                 "macro_f1": out.final_eval.get("val_macro_f1") or out.final_eval.get("macro_f1"),
                 "accuracy": out.final_eval.get("val_accuracy") or out.final_eval.get("accuracy"),
-                "epochs_trained": out.training["epochs_trained"],
+                "epochs_trained": out.training.epochs_trained if hasattr(out.training, "epochs_trained") else out.training["epochs_trained"],
                 "output_dir": out.output_dir,
                 "elapsed": round(elapsed, 2),
                 "error": None,

@@ -546,6 +546,9 @@ def _run_dynamic_validation(config: ExperimentConfig) -> dict:
         # 准备 scene_kwargs（与 stage_load 一致）
         scene_kwargs = {}
         if config.scene.params:
+            # P5 P3-4 选项 B：入口校验 scene.params 已知键类型，捕获类型污染
+            from .schemas import validate_scene_params
+            validate_scene_params(config.scene.params)
             scene_kwargs["params"] = config.scene.params
 
         # 1. 获取 dataset_info（num_classes）
@@ -961,18 +964,19 @@ def _cmd_export(args):
 
     metadata_path = Path(args.metadata)
     if not metadata_path.exists():
+        # P5 P3-13：错误输出到 stderr；P5 P2-13：code 映射到标准 ERROR_CODES
         print(json.dumps({
             "error": f"Metadata file not found: {args.metadata}",
-            "code": "METADATA_NOT_FOUND",
-        }, ensure_ascii=False))
+            "code": "DATA_NOT_FOUND",
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():
         print(json.dumps({
             "error": f"Checkpoint file not found: {args.checkpoint}",
-            "code": "CHECKPOINT_NOT_FOUND",
-        }, ensure_ascii=False))
+            "code": "CHECKPOINT_ERROR",
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
     formats = [f.strip() for f in args.formats.split(",") if f.strip()]
@@ -980,8 +984,8 @@ def _cmd_export(args):
         if fmt not in SUPPORTED_FORMATS:
             print(json.dumps({
                 "error": f"Unsupported format '{fmt}'. Supported: {SUPPORTED_FORMATS}",
-                "code": "UNSUPPORTED_FORMAT",
-            }, ensure_ascii=False))
+                "code": "CONFIG_VALIDATION_ERROR",
+            }, ensure_ascii=False), file=sys.stderr)
             sys.exit(1)
 
     # Phase 12.2：CLI 输出激活参数
@@ -993,8 +997,8 @@ def _cmd_export(args):
         print(json.dumps({
             "error": f"Unsupported output_activation '{output_activation}'. "
                      f"Supported: {list_supported_activations()}",
-            "code": "UNSUPPORTED_ACTIVATION",
-        }, ensure_ascii=False))
+            "code": "CONFIG_VALIDATION_ERROR",
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -1012,19 +1016,18 @@ def _cmd_export(args):
             # 与其他错误路径（metadata/checkpoint/format 不存在）的输出格式一致。
             # 旧代码仅 exit(1) 无额外输出，自动化测试无法区分"成功但有部分错误"
             # 与"完全失败"，且错误埋在 result.errors 子字段中不易发现。
-            import sys as _sys
             error_msg = "; ".join(f"{k}: {v}" for k, v in result.errors.items())
             print(json.dumps({
                 "error": f"Export completed with errors: {error_msg}",
-                "code": "EXPORT_DEP_MISSING",
+                "code": "SAVE_ERROR",
                 "format_errors": result.errors,
-            }, ensure_ascii=False), file=_sys.stderr)
+            }, ensure_ascii=False), file=sys.stderr)
             sys.exit(1)
     except Exception as e:
         print(json.dumps({
             "error": str(e),
-            "code": type(e).__name__,
-        }, ensure_ascii=False))
+            "code": "UNKNOWN_ERROR",
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
 
@@ -1615,8 +1618,8 @@ def main():
                           help="模型权重路径 (.pth)")
     p_export.add_argument("--formats", type=str, default="onnx,torchscript,state_dict",
                           help="导出格式，逗号分隔（默认 onnx,torchscript,state_dict）")
-    p_export.add_argument("--output-dir", type=str, default="exports",
-                          help="导出目录（默认 exports/）")
+    p_export.add_argument("--output-dir", type=str, default=str(Path(__file__).resolve().parents[2] / "exports"),
+                          help="导出目录（默认 <project_root>/exports/）")
     p_export.add_argument("--validate", action="store_true",
                           help="Phase 8.4：导出后验证精度对齐（需 onnxruntime 验证 ONNX）")
     # Phase 12.2：输出激活

@@ -16,7 +16,7 @@
 
 import logging
 import threading
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .base import DefaultConfig, SceneContainer, SceneMeta, SearchSpace, TransformConfig
 
@@ -168,8 +168,15 @@ def get_scene(name: str) -> SceneContainer:
     raise ValueError(f"Unknown scene: '{name}'. Available: {available}")
 
 
-def list_scenes() -> Dict[str, Any]:
+def list_scenes(
+    task_type: Optional[str] = None,
+    learning_mode: Optional[str] = None,
+    modality: Optional[str] = None,
+    include_unavailable: bool = False,
+) -> Dict[str, Any]:
     """列出所有已注册场景及其元数据（含延迟注册场景）。
+
+    P5 P3-1：与 list_models/list_datasets 的过滤维度对称，支持按 task_type/learning_mode/modality 筛选。
 
     防御性查询：若 _REGISTRY 中某容器的 .meta() 抛异常（如外部依赖缺失
     导致半激活容器），回退到 _LAZY_SCENES 中的静态元数据，不阻塞其他
@@ -182,8 +189,11 @@ def list_scenes() -> Dict[str, Any]:
     注意：调用方迭代返回值时应跳过 "_unavailable" key（其 value 是 List[str]
     而非 SceneMeta）。
 
-    修复（问题 4.7）：_REGISTRY / _LAZY_SCENES 读操作加锁；container.meta()
-    调用外部代码，在锁外执行。
+    Args:
+        task_type: 按任务类型过滤（如 "classification"，None=不过滤）
+        learning_mode: 按学习模式过滤（None=不过滤）
+        modality: 按数据模态过滤（None=不过滤）
+        include_unavailable: 是否包含激活失败的场景（默认 False 排除）
     """
     result: Dict[str, Any] = {}
     unavailable: List[str] = []
@@ -206,8 +216,21 @@ def list_scenes() -> Dict[str, Any]:
     for name, meta in lazy_items:
         if name not in result:
             result[name] = meta
+    # P5 P3-1：过滤维度
+    def _matches(meta) -> bool:
+        if task_type is not None and task_type not in (getattr(meta, "supported_tasks", None) or []):
+            return False
+        if learning_mode is not None and learning_mode not in (getattr(meta, "supported_learning_modes", None) or ["supervised"]):
+            return False
+        if modality is not None and getattr(meta, "modality", "unknown") != modality:
+            return False
+        return True
+    result = {k: v for k, v in result.items() if k == "_unavailable" or _matches(v)}
     if unavailable:
-        result["_unavailable"] = unavailable
+        if include_unavailable:
+            result["_unavailable"] = unavailable
+        else:
+            result.pop("_unavailable", None)
     return result
 
 

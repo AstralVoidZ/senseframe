@@ -26,23 +26,30 @@ class CSIMatLoader(DatasetLoader):
     def load_splits(self, root: str, dataset_name: str,
                     learning_mode: str = "supervised") -> DatasetSplits:
         # P0-1.7: 从 DatasetSpec.layout 读取目录结构声明，传给 CSIDataset
-        # 框架不猜测 layout，数据集必须已注册，未注册则 raise
+        # P5 P2-2: 目录名从 spec.dir_names 派生（单一数据源），禁止硬编码
+        # 框架不猜测 layout/dir_names，数据集必须已注册，未注册则 raise
         from ...registry import get_dataset_spec
         try:
             spec = get_dataset_spec(dataset_name)
         except KeyError:
             raise KeyError(
-                f"CSIMatLoader: 数据集 '{dataset_name}' 未注册，无法派生 layout。"
-                f"请先通过场景注册声明该数据集的 layout（'nested' / 'flat'）。"
+                f"CSIMatLoader: 数据集 '{dataset_name}' 未注册，无法派生 layout/dir_names。"
+                f"请先通过场景注册声明该数据集的 layout 和 dir_names。"
+            )
+        if not spec.dir_names:
+            raise ValueError(
+                f"CSIMatLoader: 数据集 '{dataset_name}' 的 DatasetSpec.dir_names 为空。"
+                f"请在注册时声明 dir_names。"
             )
         layout = spec.layout
+        dir_name = spec.dir_names[0]
         if dataset_name == "NTU-Fi-HumanID":
-            splits = self._load_humanid(root, learning_mode, layout)
+            splits = self._load_humanid(root, layout, dir_name)
         elif dataset_name == "NTU-Fi_HAR":
-            splits = self._load_ntu_har(root, learning_mode, layout)
+            splits = self._load_ntu_har(root, learning_mode, layout, dir_name, spec)
         else:
             # 通用 .mat 加载：假设 train_amp / test_amp 子目录
-            splits = self._load_generic(root, dataset_name, learning_mode, layout)
+            splits = self._load_generic(root, layout, dir_name)
         # 修复（5.9）：load_splits 返回前 log 样本数/形状/类别分布
         self._log_splits(dataset_name, learning_mode, splits)
         return splits
@@ -76,31 +83,56 @@ class CSIMatLoader(DatasetLoader):
             train_n, train_shape, test_n, unsup_n, sup_n,
         )
 
-    def _load_humanid(self, root: str, learning_mode: str, layout: str) -> DatasetSplits:
-        train_dir = resolve_data_path(root, "NTU-Fi-HumanID", "test_amp")
-        test_dir = resolve_data_path(root, "NTU-Fi-HumanID", "train_amp")
+    def _load_humanid(self, root: str, layout: str, dir_name: str) -> DatasetSplits:
+        # P5 P2-2: 目录名从 spec.dir_names 派生，禁止硬编码 "NTU-Fi-HumanID"
+        # 注意：NTU-Fi-HumanID 的 test_amp 目录实际存训练数据，train_amp 存测试数据
+        # （数据集原始约定，非 bug，不改）
+        train_dir = resolve_data_path(root, dir_name, "test_amp")
+        test_dir = resolve_data_path(root, dir_name, "train_amp")
         return DatasetSplits(
             train=CSIDataset(train_dir, layout=layout),
             test=CSIDataset(test_dir, layout=layout),
         )
 
-    def _load_ntu_har(self, root: str, learning_mode: str, layout: str) -> DatasetSplits:
-        train_dir = resolve_data_path(root, "NTU-Fi_HAR", "train_amp")
-        test_dir = resolve_data_path(root, "NTU-Fi_HAR", "test_amp")
+    def _load_ntu_har(self, root: str, learning_mode: str, layout: str,
+                      dir_name: str, spec) -> DatasetSplits:
+        # P5 P2-2: 目录名从 spec.dir_names 派生，禁止硬编码 "NTU-Fi_HAR"
+        train_dir = resolve_data_path(root, dir_name, "train_amp")
+        test_dir = resolve_data_path(root, dir_name, "test_amp")
 
         if learning_mode == "self_supervised":
             unsupervised = ConcatDataset([
                 CSIDataset(train_dir, layout=layout),
                 CSIDataset(test_dir, layout=layout),
             ])
+            # P5 P2-2: 监督数据集从 spec.supervised_source 派生（单一数据源），
+            # 禁止硬编码 "NTU-Fi-HumanID"
+            if not spec.supervised_source:
+                raise ValueError(
+                    f"CSIMatLoader: 数据集 '{spec.name}' 声明 self_supervised 模式"
+                    f"但 supervised_source 为空。请在注册时声明 supervised_source。"
+                )
+            from ...registry import get_dataset_spec
+            try:
+                supervised_spec = get_dataset_spec(spec.supervised_source)
+            except KeyError:
+                raise KeyError(
+                    f"CSIMatLoader: supervised_source '{spec.supervised_source}' 未注册。"
+                    f"请先注册该数据集的 spec（含 dir_names 和 layout）。"
+                )
+            if not supervised_spec.dir_names:
+                raise ValueError(
+                    f"CSIMatLoader: supervised_source '{spec.supervised_source}'"
+                    f"的 dir_names 为空。"
+                )
+            supervised_dir_name = supervised_spec.dir_names[0]
+            supervised_layout = supervised_spec.layout
             # 修复连带 bug：HumanID 应使用自己的 layout，而非沿用 NTU-Fi_HAR 的
             # NTU-Fi_HAR=nested, NTU-Fi-HumanID=flat，两者目录结构不同
-            from ...registry import get_dataset_spec
-            humanid_layout = get_dataset_spec("NTU-Fi-HumanID").layout
-            humanid_dir = resolve_data_path(root, "NTU-Fi-HumanID", "test_amp")
-            supervised = CSIDataset(humanid_dir, layout=humanid_layout)
-            humanid_test_dir = resolve_data_path(root, "NTU-Fi-HumanID", "train_amp")
-            test = CSIDataset(humanid_test_dir, layout=humanid_layout)
+            supervised_dir = resolve_data_path(root, supervised_dir_name, "test_amp")
+            supervised = CSIDataset(supervised_dir, layout=supervised_layout)
+            supervised_test_dir = resolve_data_path(root, supervised_dir_name, "train_amp")
+            test = CSIDataset(supervised_test_dir, layout=supervised_layout)
             return DatasetSplits(
                 unsupervised=unsupervised,
                 supervised=supervised,
@@ -112,10 +144,10 @@ class CSIMatLoader(DatasetLoader):
             test=CSIDataset(test_dir, layout=layout),
         )
 
-    def _load_generic(self, root: str, dataset_name: str,
-                      learning_mode: str, layout: str) -> DatasetSplits:
-        train_dir = resolve_data_path(root, dataset_name, "train_amp")
-        test_dir = resolve_data_path(root, dataset_name, "test_amp")
+    def _load_generic(self, root: str, layout: str, dir_name: str) -> DatasetSplits:
+        # P5 P2-2: 目录名从 spec.dir_names 派生，禁止硬编码 dataset_name
+        train_dir = resolve_data_path(root, dir_name, "train_amp")
+        test_dir = resolve_data_path(root, dir_name, "test_amp")
         return DatasetSplits(
             train=CSIDataset(train_dir, layout=layout),
             test=CSIDataset(test_dir, layout=layout),

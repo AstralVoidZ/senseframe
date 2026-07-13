@@ -104,6 +104,8 @@ from .artifacts import (
     sha256_str,
     verify_artifacts as _verify_artifacts,
     verify_artifacts_recursive as _verify_artifacts_recursive,
+    verify_manifest_schema as _verify_manifest_schema,
+    verify_artifacts_full as _verify_artifacts_full,
 )
 from .callbacks import StageAwareCallback, FrozenDict
 
@@ -1009,13 +1011,19 @@ def stage_load(ctx: PipelineContext) -> PipelineContext:
 
     # 创建输出目录（在数据画像前，便于落盘）
     # M2 修复：model_id / dataset 来自配置（不可信），清洗后再拼接，避免路径逃逸
-    from ...common.path_safe import sanitize_path_component
-    safe_model_id = sanitize_path_component(ctx.model_id)
-    safe_dataset = sanitize_path_component(ctx.dataset)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    pid = os.getpid()
-    ctx.output_dir = Path(ctx.config.output_dir) / f"{safe_model_id}_{safe_dataset}_{timestamp}_{pid}"
-    ctx.output_dir.mkdir(parents=True, exist_ok=True)
+    # P5 P2-9：dry_run 使用 tempfile.mkdtemp 隔离临时产物，run() finally 中 rmtree
+    import tempfile
+    if ctx.dry_run:
+        ctx.output_dir = Path(tempfile.mkdtemp(prefix="senseframe_dryrun_"))
+        ctx.config.save_model = False
+    else:
+        from ...common.path_safe import sanitize_path_component
+        safe_model_id = sanitize_path_component(ctx.model_id)
+        safe_dataset = sanitize_path_component(ctx.dataset)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pid = os.getpid()
+        ctx.output_dir = Path(ctx.config.output_dir).resolve() / f"{safe_model_id}_{safe_dataset}_{timestamp}_{pid}"
+        ctx.output_dir.mkdir(parents=True, exist_ok=True)
     if ctx.output:
         ctx.output.output_dir = str(ctx.output_dir)
 
@@ -2411,6 +2419,11 @@ def stage_eval(ctx: PipelineContext) -> PipelineContext:
     replace_stage("eval", fn) 的语义是完全取代 stage 函数，原 stage_eval 不执行。
     若需"eval 后钩子"，应使用 after("eval", hook) 且 hook 内部不调用 trainer.validate()。
     """
+    # P5 P1-N：dry_run 模式下跳过评估（ctx.trainer 为 None，trainer.validate() 会崩溃）
+    if ctx.dry_run:
+        _logger.info("Skipping stage_eval in dry_run mode")
+        return ctx
+
     is_self_supervised = (ctx.learning_mode == "self_supervised")
 
     # 修复（2.7）：_is_final_validation 标志在 trainer.validate() 完成后必须 reset，
@@ -2472,6 +2485,12 @@ def stage_eval(ctx: PipelineContext) -> PipelineContext:
         best_epoch=ctx.best_epoch,
         n_classes=ctx.num_classes,
     )
+
+    # P5 P2-7 阶段2：在 analyze_training_result 出口做类型校验并切换为 FeedbackResult 实例。
+    # 下游消费方已迁移为属性访问 + to_dict() 序列化兼容。
+    # hpo.py 在传给 tracker 时会调用 .to_dict() 转为 dict。
+    from ...schemas import validate_feedback
+    ctx.feedback = validate_feedback(ctx.feedback)
 
     # RFC-002 阶段 R：feedback 回写到最近一次探索试验，闭合"训练→反馈→推荐"回路
     # recommend_next 将基于此 feedback 调整优先级
@@ -2578,6 +2597,11 @@ def _merge_metrics_csv(csv_path: Path) -> None:
 )
 def stage_export(ctx: PipelineContext) -> PipelineContext:
     """Stage 8: 导出。"""
+    # P5 P1-N：dry_run 模式下跳过导出
+    if ctx.dry_run:
+        _logger.info("Skipping stage_export in dry_run mode")
+        return ctx
+
     final_eval = ctx.final_eval
     training_log = ctx.training_log
     early_stopped = ctx.early_stopped
@@ -2666,6 +2690,24 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
             "epoch_utilization": round(ctx.best_epoch / ctx.config.trainer.epochs, 3) if ctx.best_epoch and ctx.config.trainer.epochs else None,
             "created_at": datetime.now().isoformat(),
         }
+        # P5 P2-6：strict_schema=True 时对 metadata 关键字段做类型校验
+        # 旧代码 strict_schema 仅控制 training_log，metadata 无类型校验，
+        # 允许 num_classes=str / best_epoch=float 等类型污染传播到下游
+        if getattr(ctx.config, "strict_schema", False):
+            _type_checks = [
+                ("model_id", ctx.model_id, str),
+                ("dataset", ctx.dataset, str),
+                ("num_classes", ctx.num_classes, int),
+                ("best_epoch", ctx.best_epoch, (type(None), int)),
+                ("best_model_score", ctx.best_model_score, (type(None), float, int)),
+                ("created_at", metadata["created_at"], str),
+            ]
+            for field_name, value, expected in _type_checks:
+                if not isinstance(value, expected):
+                    raise TypeError(
+                        f"metadata.{field_name} type error: expected {expected}, "
+                        f"got {type(value).__name__}={value!r}"
+                    )
         (ctx.output_dir / "metadata.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2, default=str),
             encoding="utf-8",
@@ -2678,7 +2720,11 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
     # 构建 TrainOutput
     if ctx.output:
         ctx.output.status = "success"
-        ctx.output.training = {
+        # P5 P2-7 阶段2：构造 TrainingSummary dataclass 实例（不再还原为 dict）。
+        # 下游消费方已迁移为属性访问 + to_dict() 序列化兼容。
+        # TrainOutput.to_dict() 已有多态序列化 helper，会自动调用 .to_dict()。
+        from ...schemas import validate_training_summary, validate_env_snapshot
+        ctx.output.training = validate_training_summary({
             "epochs_trained": len(training_log),
             "early_stopped": early_stopped,
             "log": training_log,
@@ -2686,10 +2732,11 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
             "best_val_loss": ctx.best_model_score,
             "best_checkpoint": ctx.best_model_path,
             "intermediate_values": ctx.intermediate_values,  # P2.3: ε5 Multi-fidelity
-        }
+        })
         ctx.output.final_eval = final_eval
         ctx.output.model_path = model_path
-        ctx.output.env_snapshot = build_env_snapshot(ctx.resolved, {"seed": ctx.config.trainer.seed})
+        env_snapshot_dict = build_env_snapshot(ctx.resolved, {"seed": ctx.config.trainer.seed})
+        ctx.output.env_snapshot = validate_env_snapshot(env_snapshot_dict)
 
     # 可选多格式导出
     export_formats = getattr(ctx.config, "export_formats", None)
@@ -2749,9 +2796,12 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
                 if k.startswith("test_") and not k.startswith("test_confusion")
             }
             if _test_metrics_summary:
-                feedback["test_metrics"] = _test_metrics_summary
+                # P5 P2-7 阶段2：feedback 现在是 FeedbackResult dataclass，
+                # test_metrics 是可选字段，直接属性赋值
+                feedback.test_metrics = _test_metrics_summary
+        # P5 P2-7 阶段2：feedback.json 写入时调用 to_dict() 序列化
         (ctx.output_dir / "feedback.json").write_text(
-            json.dumps(feedback, ensure_ascii=False, indent=2),
+            json.dumps(feedback.to_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
@@ -2773,7 +2823,8 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
             _logger.warning(f"recommend_next failed: {e}")
 
         # P1.8：success status 自动沉淀技能（闭合 Voyager 检索复用回路）
-        if feedback and feedback.get("status") == "success":
+        # P5 P2-7 阶段2：feedback 是 FeedbackResult dataclass，用属性访问
+        if feedback and feedback.status == "success":
             try:
                 from ...skills import save_skill as _save_skill
                 skill_name = f"{ctx.model_id}_{ctx.dataset}"
@@ -2905,7 +2956,7 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
 # P0.2：不可序列化 stage — 产出对象引用（bundle/model/trainer）无法从 JSON checkpoint 恢复。
 # resume 时这些 stage 必须强制重跑，仅跳过纯计算 stage（validate/preflight/resolve）。
 # probe_vram 依赖 ctx.model/ctx.datamodule 对象引用，同样不可序列化恢复。
-_NON_SERIALIZABLE_STAGES = frozenset({"load", "build", "probe_vram", "train"})
+_NON_SERIALIZABLE_STAGES = frozenset({"load", "build", "probe_vram", "train", "eval"})
 
 # P2：pipeline checkpoint 版本号，结构变更时递增
 _PIPELINE_VERSION = "2.0"
@@ -3305,9 +3356,14 @@ class Pipeline:
                     continue
 
                 # P0-1: 在 stage 边界设置 callback active 状态
-                # 仅对要执行的 stage 设置（被跳过的 stage 不需要）
+                # P5 P3-15：dry_run 下 ctx.trainer 为 None，需同时检查 ctx.callbacks
+                callback_lists = []
                 if ctx.trainer is not None and hasattr(ctx.trainer, "callbacks"):
-                    for cb in ctx.trainer.callbacks:
+                    callback_lists.append(ctx.trainer.callbacks)
+                if getattr(ctx, "callbacks", None):
+                    callback_lists.append(ctx.callbacks)
+                for cb_list in callback_lists:
+                    for cb in cb_list:
                         if isinstance(cb, StageAwareCallback):
                             cb.set_active(name)
                             _logger.debug(
@@ -3420,6 +3476,14 @@ class Pipeline:
                 self._write_checkpoint(ctx)
             except Exception as e:
                 _logger.warning(f"Failed to write post-release checkpoint: {e}")
+            # P5 P2-9：dry_run 模式清理临时目录
+            if ctx.dry_run and ctx.output_dir is not None:
+                import shutil
+                try:
+                    shutil.rmtree(ctx.output_dir)
+                    _logger.info(f"dry_run cleanup: removed temp dir {ctx.output_dir}")
+                except Exception as e:
+                    _logger.warning(f"dry_run cleanup failed: {e}")
 
     def _write_checkpoint(self, ctx: PipelineContext, failed_stage: Optional[str] = None) -> None:
         """P1：写 stage checkpoint 到 output_dir/pipeline_checkpoint.json。
@@ -3509,6 +3573,36 @@ class Pipeline:
                 except (TypeError, ValueError):
                     serializable_eval[k] = repr(v)
             snapshot["final_eval"] = serializable_eval
+
+        # P5 P2-8：feedback 序列化（FeedbackResult dataclass，调用 to_dict() 后逐项处理）
+        if ctx.feedback is not None:
+            # P5 P2-7 阶段2：ctx.feedback 现在是 FeedbackResult dataclass
+            _feedback_dict = ctx.feedback.to_dict()
+            serializable_feedback: Dict[str, Any] = {}
+            for k, v in _feedback_dict.items():
+                try:
+                    json.dumps(v)
+                    serializable_feedback[k] = v
+                except (TypeError, ValueError):
+                    serializable_feedback[k] = repr(v)
+            snapshot["feedback"] = serializable_feedback
+
+        # P5 P2-8：training_log 序列化（list，逐项 try/except，可能含 tensor）
+        if ctx.training_log:
+            serializable_log: List[Any] = []
+            for entry in ctx.training_log:
+                try:
+                    json.dumps(entry)
+                    serializable_log.append(entry)
+                except (TypeError, ValueError):
+                    if hasattr(entry, "to_dict"):
+                        try:
+                            serializable_log.append(entry.to_dict())
+                        except Exception:
+                            serializable_log.append(repr(entry))
+                    else:
+                        serializable_log.append(repr(entry))
+            snapshot["training_log"] = serializable_log
 
         # completed_stages: list[str]，必可序列化
         if ctx.completed_stages:
@@ -3679,6 +3773,8 @@ __all__ = [
     "load_manifest",
     "verify_artifacts",
     "verify_artifacts_recursive",
+    "verify_manifest_schema",
+    "verify_artifacts_full",
 ]
 
 
@@ -3723,3 +3819,31 @@ def verify_artifacts_recursive(output_dir, max_depth: int = 3) -> Dict[str, Dict
         {子目录相对路径: {产物名: hash 是否匹配}}，根目录用 "." 表示
     """
     return _verify_artifacts_recursive(Path(output_dir), max_depth=max_depth)
+
+
+def verify_manifest_schema(manifest_path) -> List[str]:
+    """校验 manifest.json schema 完整性，返回缺失字段列表（P5 P3-11）。
+
+    Args:
+        manifest_path: manifest.json 路径
+
+    Returns:
+        缺失的 manifest 字段名列表（空列表表示完整）
+    """
+    return _verify_manifest_schema(Path(manifest_path))
+
+
+def verify_artifacts_full(output_dir) -> Dict[str, Any]:
+    """完整校验：hash + schema + 必填产物（P5 P3-11）。
+
+    Args:
+        output_dir: 训练输出目录
+
+    Returns:
+        {
+            "hash_check": {产物名: bool},
+            "manifest_schema_missing": [缺失字段],
+            "missing_artifacts": [缺失产物名],
+        }
+    """
+    return _verify_artifacts_full(Path(output_dir))

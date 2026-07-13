@@ -235,10 +235,13 @@ def manifest_from_dict(
         try:
             resolve_under(default_data_root, raw_data_root)
         except ValueError:
-            # 逃逸则回退到 default_data_root（保守策略，不阻断加载）
-            data_root = default_data_root
-        else:
-            data_root = raw_data_root
+            # P5 P1-C：逃逸时 raise，不再静默回退到 default_data_root。
+            # 旧代码的 fallback 违反"消除所有 fallback"原则，且掩盖恶意 manifest 配置。
+            raise ValueError(
+                f"manifest data_root '{raw_data_root}' escapes "
+                f"default_data_root '{default_data_root}'"
+            )
+        data_root = raw_data_root
     else:
         data_root = raw_data_root
 
@@ -409,13 +412,12 @@ def _resolve_path(path: str, data_root: Optional[str]) -> Path:
     from ..common.path_safe import resolve_under
 
     if data_root is None:
-        # 无 data_root：相对路径相对 CWD（向后兼容），但拒绝绝对路径
-        p = Path(path)
-        if p.is_absolute():
-            raise ValueError(
-                f"absolute path not allowed without data_root: {path!r}"
-            )
-        return p
+        # P5 P0-1：无 data_root 时 raise，强制要求显式 data_root。
+        # 旧代码允许相对路径相对 CWD 解析，构成路径穿越漏洞（如 ../../etc/passwd）。
+        # 来自 manifest 的路径是不可信输入，必须用 resolve_under 校验。
+        raise ValueError(
+            f"data_root is required to resolve manifest path: {path!r}"
+        )
 
     # 有 data_root：强制校验不逃逸
     return resolve_under(data_root, path)

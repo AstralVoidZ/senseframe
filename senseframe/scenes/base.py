@@ -12,10 +12,13 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch.nn as nn
 from torch.utils.data import Dataset
+
+if TYPE_CHECKING:
+    from senseframe.core.params import SceneParams
 
 
 @dataclass
@@ -435,5 +438,25 @@ class SceneContainer(ABC):
         Returns:
             技术目录条目列表，每项含 name/category/description/applicable/
             params/implemented 等字段；无目录时返回 None
+        """
+        return None
+
+    def get_scene_params(self, dataset_name: str, **kwargs) -> Optional["SceneParams"]:
+        """返回场景参数（可选实现）。
+
+        P5 P3-2：基类显式声明此方法，消除文档-代码契约违规。
+        默认返回 None 表示本场景不使用 SceneParams 概念；
+        需后处理参数的场景（如 detection）可覆写返回 SceneParams 实例。
+
+        注意：当前引擎层 scene.params 仍为 Dict[str, Any]，
+        SceneParams 仅服务于场景内部的后处理流程。Phase 11.4
+        正交化落地后，此方法将成为场景参数的统一入口。
+
+        Args:
+            dataset_name: 数据集名
+            **kwargs: 场景特定参数上下文
+
+        Returns:
+            SceneParams 实例，无场景参数则返回 None
         """
         return None

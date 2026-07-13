@@ -40,7 +40,7 @@ class MetaLearner:
         from senseframe.search_protocol import StudyManager
 
         sm = StudyManager()
-        store = HistoryStore(base_dir=Path("/tmp/sf_history"))
+        store = HistoryStore(base_dir=Path(tempfile.gettempdir()) / "sf_history")
 
         # 创建新 study 并从源数据集 warm-start
         study_id = sm.create_study(

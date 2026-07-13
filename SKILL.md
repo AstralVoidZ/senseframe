@@ -119,9 +119,9 @@ sf.list_losses()
 | `register_task_type(name, default_loss, default_metrics, ...)` | 注册任务类型 | True |
 | `register_loss(name)` | 注册损失函数，装饰器 | True |
 | `register_metric(name)` | 注册指标，装饰器 | True |
-| `register_model(name, spec)` | 注册模型 | True |
-| `register_dataset(name, spec)` | 注册数据集 | True |
-| `register_normalization(name, strategy)` | 注册归一化策略 | True |
+| `register_model(name, spec)` | 注册模型 | False |
+| `register_dataset(name, spec)` | 注册数据集 | False |
+| `register_normalization(name, strategy)` | 注册归一化策略 | False |
 | `register_scene(name, container)` | 注册场景容器 | False |
 
 查询：`list_task_types()` / `has_task_type()` / `get_task_type_default_loss()` / `list_losses()` / `has_loss()` / `get_loss()` 等。
@@ -237,10 +237,11 @@ manifest = load_manifest("runs/<exp>/artifact_manifest.json")
 for name, desc in manifest.artifacts.items():
     print(f"{name}: {desc.path} sha256={desc.sha256[:16]}...")
 
-# 校验产物完整性（检测缺失/篡改）
-report = verify_artifacts("runs/<exp>/")
-if report.dangling_refs:
-    print(f"缺失产物: {report.dangling_refs}")
+# 校验产物完整性（检测缺失/篡改）— 返回 {产物名: hash 是否匹配}
+result = verify_artifacts("runs/<exp>/")
+tampered = [name for name, ok in result.items() if not ok]
+if tampered:
+    print(f"产物校验失败（缺失/篡改）: {tampered}")
 ```
 
 ### 步骤 9：释放资源（RFC-005）
@@ -277,17 +278,34 @@ python -m senseframe.cli export \
 
 ## 输出格式
 
-`TrainOutput` 关键字段：
+`TrainOutput` 关键字段（P5 dataclass 化后，training/env_snapshot/feedback 为类型化 dataclass）：
 
-| 字段 | 说明 |
-|------|------|
-| `status` | `"success"` / `"error"` |
-| `final_eval` | 最终验证指标 |
-| `training.epochs_trained` | 实际训练轮数 |
-| `model_path` | 最佳 checkpoint 路径 |
-| `output_dir` | 输出目录 |
-| `error_code` | 结构化错误码（Agent 可程序化分支） |
-| `error` / `error_traceback` | 失败时的错误信息 |
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `status` | `str` | `"success"` / `"error"` |
+| `final_eval` | `Dict[str, Any]` | 最终验证指标 |
+| `training` | `Optional[TrainingSummary]` | 训练摘要 dataclass（`.epochs_trained`/`.early_stopped`/`.duration_s`/`.best_val_loss`/`.log`/`.intermediate_values`） |
+| `env_snapshot` | `Optional[EnvSnapshot]` | 环境快照 dataclass（`.torch`/`.pytorch_lightning`/`.cuda`/`.python`/`.deterministic`/`.seed`） |
+| `feedback` | `Optional[FeedbackResult]` | 训练反馈 dataclass（`.status` 6 值枚举 / `.diagnosis` / `.suggestions` / `.test_metrics`） |
+| `model_path` | `Optional[str]` | 最佳 checkpoint 路径 |
+| `output_dir` | `Optional[str]` | 输出目录 |
+| `error_code` | `Optional[str]` | 结构化错误码（Agent 可程序化分支） |
+| `error` / `error_traceback` | `Optional[str]` | 失败时的错误信息 |
+
+**序列化**：`TrainOutput.to_dict()` 内置多态序列化 helper，自动调用 dataclass 的 `to_dict()`；`summary()` 兼容 dict 和 dataclass 两种形态。
+
+**类型校验**：构造点调用 `validate_feedback`/`validate_training_summary`/`validate_env_snapshot` 捕获类型污染（如 status 非法枚举值、epochs_trained 误传 str）。
+
+```python
+output = sf.run_experiment(config)
+if output.status == "success":
+    # 属性访问（P5 dataclass 化后推荐）
+    print(f"epochs: {output.training.epochs_trained}")
+    print(f"feedback: {output.feedback.status}")
+    # to_dict() 序列化（跨进程/JSON 场景）
+    import json
+    print(json.dumps(output.to_dict(), indent=2))
+```
 
 ## 错误处理（RFC-003 结构化异常）
 
@@ -715,6 +733,23 @@ class MyScene(SceneContainer):
 
 参考：[场景开发指南](./reference/scene_development.md)
 
+## Agent 提示词（commands/）
+
+`commands/` 目录下的 4 个 `.md` 文件是 **Agent 提示词**，不是 SenseFrame CLI 子命令。
+
+| 文件 | slash 命令 | 场景 |
+|------|-----------|------|
+| `senseframe-train.md` | `/senseframe-train` | 简单：单模型监督训练 |
+| `senseframe-hpo.md` | `/senseframe-hpo` | 中等：HPO 超参搜索 |
+| `senseframe-full.md` | `/senseframe-full` | 困难：完整闭环 + 自监督 + 断点续跑 |
+| `senseframe-auto.md` | `/senseframe-auto` | 多轮自主调优 |
+
+**定位说明**：
+- 这些 `.md` 文件部署到 `.opencode/.claude/.agents/commands/` 供 AI Agent CLI 工具（opencode/Claude Code）调用
+- slash 命令（如 `/senseframe-train`）由 Agent CLI 工具解析，不是 SenseFrame CLI 子命令
+- 文件内容是标准 Agent 提示词模板（Role/Objective/Context/Protocol），内部调用 SenseFrame CLI 子命令作为执行原语
+- 部署逻辑见 `tests/pack_code.py` 的 `deploy_commands()` 函数
+
 ## CLI 命令
 
 所有命令输出结构化 JSON。
@@ -750,6 +785,9 @@ class MyScene(SceneContainer):
 - **OP 编排必释放**：`Orchestrator` 用完必调 `shutdown()`，避免 ThreadPool 泄露；`subscribe` 返回的 unsubscribe 函数用 try/finally 确保调用
 - **stage 名不带前缀**：调用 `sf.stage_io()` / `pipeline.check_readiness()` 时用 `"train"`/`"eval"`（无 `stage_` 前缀）；`ctx.filled_at()` 用带前缀名 `"stage_load"`
 - **NAS 资源管理**：DARTSPipelineRun 用 try/finally 释放 supernet/optimizer/iterator；DARTSSampler 用 `.detach().clone()` 切断计算图引用
+- **类型安全（P5）**：`TrainOutput.training/env_snapshot/feedback` 是 dataclass 实例，用属性访问（`.epochs_trained`/`.status`）；序列化用 `.to_dict()`；构造点有 `validate_*` 校验捕获类型污染
+- **SceneParams 正交化（P5）**：`SceneConfig.params` 是 `Optional[SceneParams]`，提供 dict-like 兼容层（`[]/= /in/.get()/.items()`）；HPO 赋值前检查 `is None` 创建空实例
+- **接口契约优先于消费者数量（P5）**：即使字段当前无消费者也定义清楚（SceneParams 10 个标准字段），为未来场景扩展铺路
 
 ## 参考资源
 

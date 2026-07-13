@@ -208,13 +208,14 @@ class OptunaReportingCallback(StageAwareCallback):
         else:
             return
         try:
-            self.trial.report(value, step=trainer.current_epoch)
+            # P5 P3-14：1-indexed step，与 training_log/CSV/IntermediateMetricLogger 的 epoch 对齐
+            self.trial.report(value, step=trainer.current_epoch + 1)
         except Exception as e:
             # trial.report 异常不应阻断训练，降级为 warning
             logger.warning(
                 "OptunaReportingCallback: trial.report failed for "
                 "metric='%s' at epoch=%d: %s",
-                self.metric, trainer.current_epoch, e,
+                self.metric, trainer.current_epoch + 1, e,
             )
 
 

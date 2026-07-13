@@ -174,12 +174,18 @@ def _do_probe(
     # 导致 NTU-Fi_HAR/Widar 等需要 transform 的数据集前向传播失败
     # （shape 不匹配 + dtype 不匹配：raw float64 vs 16-mixed 的 Half 权重）。
     # UT_HAR_data 不受影响（tensor_loader 直接返回正确 shape，无 transform）。
+    # P5 P3-10：transform 失败时记录 warning 而非静默 pass。
+    # 旧代码 except Exception: pass 吞掉所有错误（含归一化注册表丢失），
+    # 导致 raw sample 进入 probe，VRAM 测量结果偏离实际训练场景。
+    transform_applied = True
+    transform_warning = None
     try:
         tc = scene.get_transforms(dataset, **(scene_kwargs or {}))
         if tc.train_transform is not None and y_sample is not None:
             x_sample, y_sample = tc.train_transform(x_sample, y_sample)
-    except Exception:
-        pass  # transform 应用失败时用 raw sample（UT_HAR_data 无 transform）
+    except Exception as e:
+        transform_applied = False
+        transform_warning = f"probe_worker: transform failed ({type(e).__name__}: {e}), using raw sample"
 
     # 防御性 float()：确保 float32（raw sample 可能是 float64，16-mixed 权重是 Half）
     x = x_sample.float().unsqueeze(0).repeat(batch_size, *[1] * x_sample.dim()).to(device)
@@ -245,6 +251,8 @@ def _do_probe(
             "gradient": round(gradient_mb, 1),
             "optimizer_state": round(optimizer_state_mb, 1),
         },
+        "transform_applied": transform_applied,
+        "warnings": [transform_warning] if transform_warning else [],
     }
 
 

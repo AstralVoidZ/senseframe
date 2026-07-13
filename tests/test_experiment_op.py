@@ -99,11 +99,14 @@ def _make_mock_train_output(status: str = "success"):
     mock.error = None
     mock.error_code = None
     mock.final_eval = {"val_accuracy": 0.8, "val_loss": 0.5}
-    mock.training = {
-        "duration_s": 10.0,
-        "epochs_trained": 2,
-        "intermediate_values": {0: 0.5, 1: 0.8},
-    }
+    # P5 P2-7 阶段2：training 现在是 TrainingSummary dataclass
+    from senseframe.schemas import TrainingSummary
+    mock.training = TrainingSummary(
+        epochs_trained=2,
+        early_stopped=False,
+        duration_s=10.0,
+        intermediate_values={0: 0.5, 1: 0.8},
+    )
     return mock
 
 

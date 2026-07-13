@@ -21,7 +21,7 @@
 |------|---------|---------|
 | `get_task_spec()` | 从 `get_dataset_info` 派生分类 TaskSpec | 需支持回归/检测/分割等非分类任务时 |
 | `get_feature_spec()` | 从 `get_dataset_info` 派生 FeatureSpec | 需提供场景特定的特征元信息时 |
-| `get_scene_params()` | 返回空 SceneParams | 需提供场景特定参数时 |
+| `get_scene_params()` | 返回 None | 需提供场景特定参数（如 detection 的 NMS 阈值）时 |
 | `postprocess()` | 直接返回输入（无后处理） | 需 NMS / CRF / 阈值化等后处理时 |
 | `get_default_config()` | 返回训练默认配置 | 需调优超参默认值时 |
 | `get_search_space()` | 返回空 HPO 空间 | 需支持 HPO 搜索时 |
@@ -96,9 +96,9 @@ def get_feature_spec(self, dataset_name: str, **kwargs) -> FeatureSpec:
     )
 ```
 
-### 2.3 `SceneParams` — 场景参数正交化
+### 2.3 `SceneParams` — 场景参数正交化（P5 P3-4 已落地）
 
-`SceneParams` 替代了原 `params: dict`，提供标准字段 + 自定义扩展：
+`SceneParams` 是场景参数的类型化 dataclass，替代 `params: dict`，提供 11 个标准字段 + 自定义扩展 + dict-like 兼容层：
 
 ```python
 from senseframe.core.params import SceneParams
@@ -114,18 +114,23 @@ params = SceneParams(
     extra={"custom_field": 42},   # 场景特定扩展
 )
 
-# 标准字段直接读
+# 属性访问（推荐）
 print(params.target_frames)   # 128
 print(params.get("n_antennas", 3))  # 从 extra 读，缺省返回 3
 
-# 通过 SceneContext 自动升级（dict → SceneParams）
-ctx = SceneContext(params={"target_frames": 200})  # 自动转为 SceneParams
+# dict-like 兼容访问（下游零改动）
+params["resume"] = "/path/to/ckpt"  # __setitem__ 委托给 .set()
+"resume" in params                   # __contains__
+for k, v in params.items(): ...      # 标准字段 + extra 合并遍历
+params.to_flat_dict()                # 扁平 dict（JSON 序列化用）
 ```
 
-**子类覆写 `get_scene_params()`** 标准化场景参数：
+**`SceneConfig.params` 类型**：`Optional[SceneParams]`（P5 P3-4 完整正交化后从 `Dict[str, Any]` 收窄）。YAML 配置中的 `scene.params` dict 会在 `ExperimentConfig.from_dict` 时自动转为 `SceneParams` 实例。
+
+**子类覆写 `get_scene_params()`** 标准化场景参数（基类默认返回 `None`）：
 
 ```python
-def get_scene_params(self, dataset_name: str, **kwargs) -> SceneParams:
+def get_scene_params(self, dataset_name: str) -> SceneParams:
     return SceneParams(
         target_frames=200,
         window_size=128,
@@ -205,7 +210,7 @@ from torch.utils.data import Dataset, TensorDataset
 
 from ..base import (
     DefaultConfig, SceneContainer, SceneMeta, SearchSpace, TransformConfig,
-    DatasetBundle, SceneContext,
+    DatasetBundle,
 )
 from ...core.task import TaskType, TaskSpec
 from ...core.features import FeatureSpec

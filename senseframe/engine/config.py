@@ -331,7 +331,9 @@ class SceneConfig:
     model_id: str                                # 模型 ID
     learning_mode: str = "supervised"            # 见 SUPPORTED_LEARNING_MODES
     data_root: str = ""                          # 数据根目录，必填（YAML/CLI/env 三选一）
-    params: Dict[str, Any] = field(default_factory=dict)  # 场景特定参数
+    # P5 P3-4 完整正交化：params 从 Dict[str, Any] 收窄为 Optional[SceneParams]
+    # SceneParams 提供 dict-like 兼容层（[]/= /in/.get()/.items()），下游零改动
+    params: Optional[Any] = None  # 运行时为 Optional[SceneParams]，用 Any 避免 import cycle
     # Phase 12.3：task_spec 字段，None 表示用 scene 默认
     task_spec: Optional[TaskSpecField] = None
 
@@ -425,6 +427,13 @@ class ExperimentConfig:
             scene_dict["task_spec"] = _parse_dataclass(
                 TaskSpecField, scene_dict["task_spec"]
             )
+        # P5 P3-4 完整正交化：params dict → SceneParams 实例
+        if "params" in scene_dict and scene_dict["params"] is not None:
+            from ..core.params import SceneParams
+            if isinstance(scene_dict["params"], dict):
+                scene_dict["params"] = SceneParams.from_dict(scene_dict["params"])
+            elif isinstance(scene_dict["params"], SceneParams):
+                pass  # 已是 SceneParams，无需转换
         scene = _parse_dataclass(SceneConfig, scene_dict)
 
         # input_features
@@ -525,6 +534,9 @@ def _parse_dataclass(cls, data: Any):
 
 def _dataclass_to_dict(obj: Any) -> Any:
     """递归将 dataclass 实例转为 dict（含嵌套 dataclass 与 list）。"""
+    # P5 P3-4：SceneParams 用 to_flat_dict() 序列化（扁平结构，而非 asdict 嵌套）
+    if hasattr(obj, "to_flat_dict") and callable(obj.to_flat_dict):
+        return obj.to_flat_dict()
     if is_dataclass(obj) and not isinstance(obj, type):
         return {f.name: _dataclass_to_dict(getattr(obj, f.name)) for f in fields(obj)}
     if isinstance(obj, list):

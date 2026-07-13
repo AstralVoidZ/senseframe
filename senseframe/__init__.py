@@ -29,6 +29,7 @@ from .registry import (
     get_model_spec,
     get_dataset_spec,
     get_normalization,
+    get_normalization_or_none,
     is_model_registered,
     is_dataset_registered,
     has_normalization,
@@ -98,6 +99,8 @@ from .engine.runner import (
     load_manifest,
     verify_artifacts,
     verify_artifacts_recursive,
+    verify_manifest_schema,
+    verify_artifacts_full,
 )
 
 # RFC Phase F：代码注入 — load_extension API

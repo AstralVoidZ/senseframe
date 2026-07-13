@@ -191,47 +191,53 @@ def main():
                   f"不支持自监督模式", file=sys.stderr)
             sys.exit(1)
 
-    # 确定默认 epochs：方案 B 去静态化后，完全由 _compute_epochs_budget(n_samples) 动态计算
+    # P5 P2-18：epochs 计算删除 catch-then-None，精准校验注册状态和 n_samples 字段
     if args.epochs is None:
+        from senseframe.registry import (
+            get_default_epochs, get_dataset_spec, is_dataset_registered,
+        )
+        if not is_dataset_registered(args.dataset):
+            print(f"错误：数据集 '{args.dataset}' 未注册，无法派生 n_samples。"
+                  f"请通过 --epochs 显式指定，或先注册该数据集。",
+                  file=sys.stderr)
+            sys.exit(1)
+        spec = get_dataset_spec(args.dataset)
+        if spec.n_samples is None or spec.n_samples <= 0:
+            print(f"错误：数据集 '{args.dataset}' 已注册但 n_samples={spec.n_samples}。"
+                  f"请在注册时声明 n_samples>0，或通过 --epochs 显式指定。",
+                  file=sys.stderr)
+            sys.exit(1)
         try:
-            from senseframe.registry import get_default_epochs, get_dataset_spec
-            # 方案 B：epochs 完全动态，必须传入 n_samples。
-            # 数据集未注册时 spec 查询失败 → n_samples=None → get_default_epochs raise
-            # （框架不猜测、不回退默认值）
-            try:
-                n_samples = get_dataset_spec(args.dataset).n_samples
-            except Exception:
-                n_samples = None
             default_epochs = get_default_epochs(
                 args.model, args.dataset, scene_name="wifi_csi",
-                n_samples=n_samples)
+                n_samples=spec.n_samples)
         except Exception as e:
             print(f"错误：get_default_epochs 失败 ({e})。"
-                  f"请通过 --epochs 显式指定，或确保数据集已注册默认 epochs。",
-                  file=sys.stderr)
+                  f"请通过 --epochs 显式指定。", file=sys.stderr)
             sys.exit(1)
     else:
         default_epochs = args.epochs
 
-    # P1-3 修复：解析 data_root（优先级：CLI > env > 默认路径探测）
-    # P4-6 修复：探测到的路径转为相对路径写入 YAML，提升配置可移植性。
-    # 训练期的 resolve_data_root 会将相对路径 .resolve() 为绝对路径，功能不受影响。
+    # P5 P3-9：data_root 探测失败时 raise 而非返回空字符串
     import os
     if args.data_root is not None:
         data_root = args.data_root
     elif os.environ.get("SENSEFRAME_DATA_ROOT"):
         data_root = os.environ["SENSEFRAME_DATA_ROOT"]
     else:
-        # 探测默认路径 resource/CSI_DATASETS（相对于 cwd 或项目根）
-        _candidate = Path.cwd() / "resource" / "CSI_DATASETS"
-        if _candidate.exists():
-            data_root = os.path.relpath(_candidate, Path.cwd())
-        else:
-            _candidate = _PROJECT_ROOT / "resource" / "CSI_DATASETS"
-            if _candidate.exists():
-                data_root = os.path.relpath(_candidate, Path.cwd())
-            else:
-                data_root = ""
+        candidates = [
+            Path.cwd() / "resource" / "CSI_DATASETS",
+            _PROJECT_ROOT / "resource" / "CSI_DATASETS",
+        ]
+        found = next((c for c in candidates if c.exists()), None)
+        if found is None:
+            print(
+                f"错误：未找到数据根目录。已探测: {[str(c) for c in candidates]}。"
+                f"请通过 --data-root 显式指定，或设置 SENSEFRAME_DATA_ROOT 环境变量。",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        data_root = os.path.relpath(found, Path.cwd())
 
     # 构建配置
     config = build_config(

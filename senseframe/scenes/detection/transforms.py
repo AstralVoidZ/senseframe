@@ -23,6 +23,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from ...common.transforms import ComposedTransform
+
 
 # ============================================================
 # 图像增强原语
@@ -75,7 +77,7 @@ def hsv_jitter(
         # 非 RGB 三通道图像，直接返回（不做 HSV 变换）
         return x.copy()
 
-    r = rng if rng is not None else np.random
+    r = rng if rng is not None else np.random.default_rng()
 
     # 归一化到 [0, 1] 用于 HSV 转换
     h, w = x_chw.shape[1], x_chw.shape[2]
@@ -167,7 +169,7 @@ def cutout(x: np.ndarray, n_holes: int = 1, length: int = 16, rng: Optional[np.r
     if x_chw.ndim != 3:
         return x.copy()
 
-    r = rng if rng is not None else np.random
+    r = rng if rng is not None else np.random.default_rng()
     c, h, w = x_chw.shape
     result = x_chw.copy()
     for _ in range(n_holes):
@@ -219,7 +221,7 @@ def mixup(
     if alpha <= 0:
         return x.copy(), y.copy()
 
-    r = rng if rng is not None else np.random
+    r = rng if rng is not None else np.random.default_rng()
     # 从 Beta(alpha, alpha) 采样混合系数
     lam = r.beta(alpha, alpha)
     # 随机打乱索引
@@ -274,7 +276,7 @@ def random_erasing(
     if x_chw.ndim != 3:
         return x.copy()
 
-    r = rng if rng is not None else np.random
+    r = rng if rng is not None else np.random.default_rng()
     c, h, w = x_chw.shape
     img_area = float(h * w)
     # 最多尝试 10 次找到合法的擦除区域
@@ -406,48 +408,6 @@ def compose_transforms(names: list, seed: Optional[int] = None, **kwargs) -> cal
         transforms.append((name, fn))
 
     return ComposedTransform(transforms, kwargs, seed=seed)
-
-
-class ComposedTransform:
-    """组合多个 transform 原语的 callable 类（可 pickle）。
-
-    替代旧 composed 闭包，确保 DataLoader num_workers>0 时序列化不失败。
-    处理 mixup 原语需要同时变换 x 和 y 的特殊情况。
-    P3 上策：持有独立 np.random.Generator，在 __call__ 中注入到原语，
-    消除对全局 np.random 状态的依赖。
-    """
-
-    def __init__(self, transforms, kwargs, seed: Optional[int] = None):
-        import inspect
-        self.transforms = list(transforms)
-        self.kwargs = dict(kwargs)
-        self.rng = np.random.default_rng(seed) if seed is not None else None
-        self._accepts_rng = [
-            'rng' in inspect.signature(fn).parameters for _, fn in self.transforms
-        ]
-
-    def __call__(self, x, y=None):
-        import torch
-        x_np = x.numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
-        y_np = y.numpy() if isinstance(y, torch.Tensor) else (
-            np.asarray(y) if y is not None else None
-        )
-        for (name, fn), accepts_rng in zip(self.transforms, self._accepts_rng):
-            params = self.kwargs.get(name, {})
-            rng_kw = {'rng': self.rng} if accepts_rng else {}
-            # mixup 需要同时处理 x 和 y
-            if name == "mixup":
-                if y_np is not None:
-                    x_np, y_np = fn(x_np, y_np, **rng_kw, **params)
-                else:
-                    x_np = fn(x_np, **rng_kw, **params)
-            else:
-                x_np = fn(x_np, **rng_kw, **params)
-        x_out = torch.from_numpy(x_np).float() if isinstance(x, torch.Tensor) else x_np
-        y_out = None
-        if y_np is not None:
-            y_out = torch.from_numpy(y_np).float() if isinstance(y, torch.Tensor) else y_np
-        return x_out, y_out
 
 
 __all__ = [

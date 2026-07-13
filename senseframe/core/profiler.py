@@ -322,15 +322,24 @@ class DataProfiler:
             DataProfile 数据画像
         """
         if learning_mode == "self_supervised":
-            # 自监督模式：训练用 unsupervised 集，从其采样画像
-            ds = getattr(bundle, "unsupervised", None) or getattr(bundle, "test", None)
+            # P5 P2-3：自监督模式必须从 unsupervised 集采样画像。
+            # 旧代码回退到 test 集，导致 normalization 常量来自测试集（数据泄露）。
+            ds = getattr(bundle, "unsupervised", None)
+            if ds is None:
+                raise ValueError(
+                    f"profile_bundle: learning_mode='self_supervised' but "
+                    f"bundle.unsupervised is None. 禁止回退到 test 集以避免数据泄露。"
+                    f"dataset={dataset_name}"
+                )
             profile_source = "unsupervised"
         else:
-            # 监督模式：训练用 train 集
-            ds = getattr(bundle, "train", None) or getattr(bundle, "test", None)
+            ds = getattr(bundle, "train", None)
+            if ds is None:
+                raise ValueError(
+                    f"profile_bundle: bundle.train is None. "
+                    f"dataset={dataset_name}"
+                )
             profile_source = "train"
-        if ds is None:
-            return DataProfile(dataset_name=dataset_name)
         return self.profile_dataset(
             ds, dataset_name=dataset_name, profile_source=profile_source,
             modality_hint=modality_hint,
@@ -353,19 +362,21 @@ class DataProfiler:
     ) -> str:
         """推断数据模态。
 
-        P0 修复：modality_hint 非 None 时优先使用场景显式声明，
-        覆盖 shape 启发式（CSI 与 image 在 shape 上不可区分）。
+        P5 P1-D：消除 shape-based fallback。旧代码在 modality_hint 为 None/unknown 时
+        回退到 shape 启发式（3D→image, 2D→sequence, 1D→tabular），但 CSI (1,250,90)
+        与 image (1,H,W) 在 shape 上不可区分，导致 CSI 被误判为 image。
+
+        现在强制要求场景通过 SceneMeta.modality 显式声明模态，未声明时 raise。
         """
-        # P0 修复：场景显式声明优先于 shape 启发式
         if modality_hint is not None and modality_hint != "unknown":
             return modality_hint
-        if is_spatial:
-            return "image"
-        if is_temporal:
-            return "sequence"
-        if len(input_shape) <= 1:
-            return "tabular"
-        return "unknown"
+        raise ValueError(
+            f"modality_hint is required (got {modality_hint!r}). "
+            f"Scene must declare modality via SceneMeta.modality "
+            f"(e.g., 'csi', 'image', 'sequence', 'tabular'). "
+            f"Shape-based inference is unreliable: CSI (1,250,90) and "
+            f"image (1,H,W) are indistinguishable by shape alone."
+        )
 
     def _recommend(
         self,

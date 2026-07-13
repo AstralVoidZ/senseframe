@@ -5,6 +5,10 @@ subtask: false
 
 <!--
 
+本文件是 Agent 提示词，部署到 .opencode/.claude/.agents/commands/ 供 AI Agent CLI 工具调用。
+slash 命令 /senseframe-full 由 Agent CLI 工具（opencode/Claude Code）解析，不是 SenseFrame CLI 子命令。
+SenseFrame CLI 子命令清单见 SKILL.md 或 `python -m senseframe.cli --help`。
+
 command: /senseframe-full
 场景: 困难 (30-90 min)
 目的: 全面压力测试 SenseFrame 架构能力

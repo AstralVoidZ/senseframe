@@ -90,10 +90,12 @@ def _record_output(test_id, config, out):
 
     if out.status == "success":
         record["final_eval"] = out.final_eval
+        # P5 P2-7 阶段2：training 现在是 TrainingSummary dataclass，用属性访问
+        training = out.training
         record["training"] = {
-            "epochs_trained": out.training["epochs_trained"],
-            "early_stopped": out.training["early_stopped"],
-            "best_val_loss": out.training.get("best_val_loss"),
+            "epochs_trained": training.epochs_trained if hasattr(training, "epochs_trained") else training["epochs_trained"],
+            "early_stopped": training.early_stopped if hasattr(training, "early_stopped") else training["early_stopped"],
+            "best_val_loss": training.best_val_loss if hasattr(training, "best_val_loss") else training.get("best_val_loss"),
         }
         record["output_dir"] = out.output_dir
 
@@ -226,7 +228,9 @@ def main():
             report["results"].append(record)
 
             if out.status == "success":
-                print(f"  -> 成功: epochs={out.training['epochs_trained']}, "
+                # P5 P2-7 阶段2：training 是 TrainingSummary dataclass，用属性访问
+                _et = out.training.epochs_trained if hasattr(out.training, "epochs_trained") else out.training["epochs_trained"]
+                print(f"  -> 成功: epochs={_et}, "
                       f"final_eval={out.final_eval}")
             else:
                 print(f"  -> 预期错误: {out.error}")
@@ -249,14 +253,19 @@ def main():
         ckpts = list(ckpt_dir.glob("*.ckpt"))
         if ckpts:
             config_t12_p2 = _make_config("T12_phase2", "MLP", "UT_HAR_data", epochs=2)
-            config_t12_p2.scene.params = config_t12_p2.scene.params or {}
+            # P5 P3-4：params 现在是 Optional[SceneParams]，用 SceneParams.from_dict 构造
+            from senseframe.core.params import SceneParams
+            if config_t12_p2.scene.params is None:
+                config_t12_p2.scene.params = SceneParams()
             config_t12_p2.scene.params["resume"] = str(ckpts[0])
             try:
                 out = run_experiment(config_t12_p2)
                 record = _record_output("T12_phase2", config_t12_p2, out)
                 report["results"].append(record)
                 if out.status == "success":
-                    print(f"  -> 成功: epochs={out.training['epochs_trained']}")
+                    # P5 P2-7 阶段2：training 是 TrainingSummary dataclass，用属性访问
+                    _et = out.training.epochs_trained if hasattr(out.training, "epochs_trained") else out.training["epochs_trained"]
+                    print(f"  -> 成功: epochs={_et}")
                 else:
                     print(f"  -> 失败: {out.error}")
             except Exception as e:

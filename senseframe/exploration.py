@@ -425,7 +425,7 @@ class HistoryStore:
     Usage:
         from senseframe.exploration import HistoryStore, ExplorationTracker
 
-        store = HistoryStore(base_dir=Path("/tmp/sf_history"))
+        store = HistoryStore(base_dir=Path(tempfile.gettempdir()) / "sf_history")
         store.save_history("UT_HAR_data", tracker)
         history = store.load_history("UT_HAR_data")  # 加载成功则返回 list
         history = store.load_history("nonexistent")  # 不存在则返回空 list

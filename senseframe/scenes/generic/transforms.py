@@ -20,6 +20,8 @@ from typing import Optional
 
 import numpy as np
 
+from ...common.transforms import ComposedTransform
+
 
 # ============================================================
 # 特征工程原语
@@ -237,7 +239,7 @@ def jitter(x: np.ndarray, sigma: float = 0.01, rng: Optional[np.random.Generator
     x = np.asarray(x, dtype=np.float64)
     if x.size == 0:
         return x.copy()
-    r = rng if rng is not None else np.random
+    r = rng if rng is not None else np.random.default_rng()
     noise = r.normal(0, sigma, x.shape)
     return x + noise
 
@@ -258,7 +260,7 @@ def scaling(x: np.ndarray, sigma: float = 0.1, rng: Optional[np.random.Generator
     x = np.asarray(x, dtype=np.float64)
     if x.size == 0:
         return x.copy()
-    r = rng if rng is not None else np.random
+    r = rng if rng is not None else np.random.default_rng()
     factor = 1.0 + r.normal(0, sigma)
     return x * factor
 
@@ -279,7 +281,7 @@ def window_warp(x: np.ndarray, ratio: float = 0.1, rng: Optional[np.random.Gener
     x = np.asarray(x, dtype=np.float64)
     if x.size == 0:
         return x.copy()
-    r = rng if rng is not None else np.random
+    r = rng if rng is not None else np.random.default_rng()
 
     def _warp_1d(sig: np.ndarray) -> np.ndarray:
         n = len(sig)
@@ -331,7 +333,7 @@ def magnitude_warp(x: np.ndarray, sigma: float = 0.1, knot: int = 4, rng: Option
     x = np.asarray(x, dtype=np.float64)
     if x.size == 0:
         return x.copy()
-    r = rng if rng is not None else np.random
+    r = rng if rng is not None else np.random.default_rng()
 
     def _warp_1d(sig: np.ndarray) -> np.ndarray:
         n = len(sig)
@@ -398,36 +400,6 @@ def compose_transforms(names: list, seed: Optional[int] = None, **kwargs) -> cal
         transforms.append((name, fn))
 
     return ComposedTransform(transforms, kwargs, seed=seed)
-
-
-class ComposedTransform:
-    """组合多个 transform 原语的 callable 类（可 pickle）。
-
-    替代旧 composed 闭包，确保 DataLoader num_workers>0 时序列化不失败。
-    P3 上策：持有独立 np.random.Generator，在 __call__ 中注入到原语，
-    消除对全局 np.random 状态的依赖。
-    """
-
-    def __init__(self, transforms, kwargs, seed: Optional[int] = None):
-        import inspect
-        self.transforms = list(transforms)
-        self.kwargs = dict(kwargs)
-        self.rng = np.random.default_rng(seed) if seed is not None else None
-        self._accepts_rng = [
-            'rng' in inspect.signature(fn).parameters for _, fn in self.transforms
-        ]
-
-    def __call__(self, x, y=None):
-        import torch
-        x_np = x.numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
-        for (name, fn), accepts_rng in zip(self.transforms, self._accepts_rng):
-            params = self.kwargs.get(name, {})
-            if accepts_rng:
-                x_np = fn(x_np, rng=self.rng, **params)
-            else:
-                x_np = fn(x_np, **params)
-        x_out = torch.from_numpy(x_np).float() if isinstance(x, torch.Tensor) else x_np
-        return x_out, y
 
 
 __all__ = [

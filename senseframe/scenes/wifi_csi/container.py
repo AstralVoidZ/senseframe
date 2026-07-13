@@ -111,11 +111,6 @@ def _make_widar_transform(reshape=(22, 20, 20), norm_name: str = "Widar"):
     return WidarTransform(reshape=reshape, norm_name=norm_name)
 
 
-# 向后兼容：保留原硬编码变量（默认参数）
-_ntu_fi_transform = _make_ntu_fi_transform()
-_widar_transform = _make_widar_transform()
-
-
 class WiFiCSIContainer(SceneContainer):
     """
     WiFi CSI 动作识别场景容器。

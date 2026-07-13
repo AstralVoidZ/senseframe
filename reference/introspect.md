@@ -204,7 +204,7 @@ pipeline.stages_with_spec()  # 含 my_eval 的 StageSpec
 | `trial_id` | `Optional[str]` | 当前试验 ID |
 | `parent_trial_id` | `Optional[str]` | 父试验 ID（支持回溯） |
 | `exploration_history` | `List[Dict]` | 探索历史列表 |
-| `feedback` | `Optional[Dict]` | stage_eval 产出的结构化反馈（first-class 字段） |
+| `feedback` | `Optional[FeedbackResult]` | stage_eval 产出的结构化反馈 dataclass（`.status` 6 值枚举 / `.diagnosis` / `.suggestions` / `.test_metrics`） |
 
 ### record_trial()
 

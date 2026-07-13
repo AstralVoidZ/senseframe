@@ -61,25 +61,21 @@ def generate_artifact_manifest(
 
     manifest_path = output_dir / "manifest.json"
 
-    # 1. 读取框架训练阶段生成的 manifest（schema A）
+    # P5 P3-6：manifest 加载失败时 raise 而非静默降级。
+    # 旧代码用空字段构造 manifest，丢失 run_id/config_hash/data_hash 等溯源元数据，
+    # 破坏 verify_artifacts 链路。
     try:
         manifest = ArtifactManifest.load(manifest_path)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(
+            f"postprocess: 训练阶段 manifest.json 不存在: {manifest_path}。"
+            f"请确认 output_dir 指向已完成训练的输出目录。"
+        ) from e
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(
-            f"generate_artifact_manifest: failed to load framework manifest, "
-            f"starting with empty manifest: {e}"
-        )
-        from datetime import datetime as _dt
-        manifest = ArtifactManifest(
-            run_id="",
-            created_at=_dt.now().isoformat(),
-            senseframe_version="unknown",
-            pipeline_version="",
-            config_hash="",
-            data_hash="",
-            artifacts=[],
-        )
+        raise RuntimeError(
+            f"postprocess: 加载 manifest.json 失败: {type(e).__name__}: {e}。"
+            f"manifest 可能已损坏，请检查 {manifest_path} 或重新运行训练。"
+        ) from e
 
     # 2. 追加后处理产物（相对路径存储，无 output_dir 外路径）
     # 幂等：同名产物已存在则跳过
@@ -221,11 +217,11 @@ def main():
     try:
         summary = postprocess(args.output_dir)
         print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
-    except FileNotFoundError as e:
+    except (FileNotFoundError, RuntimeError) as e:
         print(json.dumps({
             "status": "error",
             "error": str(e),
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
 
