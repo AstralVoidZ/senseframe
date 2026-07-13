@@ -94,12 +94,58 @@ class ExplorationTracker:
             return list(self.history)
         return [t for t in self.history if t.get("status") == status]
 
+    def update_trial(
+        self,
+        trial_id: str,
+        result: Optional[Dict[str, Any]] = None,
+        status: Optional[str] = None,
+        feedback: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """更新 trial 结果（P0.3：SP tell 的公共 API）。
+
+        替代 SP 中 `with tracker._lock` + `tracker.history` 直接改写的 hack，
+        维持封装完整性。锁粒度与原 hack 一致（with self._lock）。
+
+        Args:
+            trial_id: 试验 ID
+            result: 试验结果（如 {"value": 0.85, "intermediate_values": {...}}），
+                    None 时不更新
+            status: 新状态（completed/failed/pruned），None 时不更新
+            feedback: 结构化反馈，None 时不更新
+
+        Raises:
+            KeyError: trial_id 不存在
+        """
+        with self._lock:
+            for trial in self.history:
+                if trial.get("trial_id") == trial_id:
+                    if result is not None:
+                        trial["result"] = result
+                    if status is not None:
+                        trial["status"] = status
+                    if feedback is not None:
+                        trial["feedback"] = feedback
+                    return
+            raise KeyError(f"trial not found: {trial_id}")
+
     def get_trial(self, trial_id: str) -> Optional[Dict[str, Any]]:
         """按 ID 获取试验。"""
         for t in self.history:
             if t["trial_id"] == trial_id:
                 return t
         return None
+
+    def get_history(self) -> List[Dict[str, Any]]:
+        """返回 trial 历史的浅拷贝（P0.4：SP 公共 API）。
+
+        替代外部直接访问 tracker.history，维持封装完整性。
+        返回浅拷贝避免外部修改影响内部状态。
+
+        Returns:
+            trial 历史列表的浅拷贝
+        """
+        with self._lock:
+            return list(self.history)
 
     def best_trial(self, metric: str = "val_accuracy", mode: str = "max") -> Optional[Dict[str, Any]]:
         """获取指定指标最优的试验。

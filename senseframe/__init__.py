@@ -112,6 +112,45 @@ from .skills import (
 # RFC-002 阶段 L/P：探索状态管理 + 搜索空间地图
 from .exploration import ExplorationTracker, SearchSpaceMap
 
+# RFC-003 SP：搜索协议 — Ask-Tell 标准化接口（P0.5 顶层导出）
+from .search_protocol import (
+    ParameterSpec,
+    SearchSpace,
+    StudySpec,
+    TrialSpec,
+    TrialResult,
+    StudyManager,
+    get_study_manager,
+    Sampler,
+    register_sampler,
+    get_sampler,
+    list_samplers,
+    RandomSampler,
+    GridSampler,
+)
+
+# RFC-003 ε1：损失函数搜索（P1，SP 应用层）
+from .automl import (
+    build_loss_search_space,
+    run_loss_search,
+    LossSearchResult,
+)
+
+# RFC-003 ε6：对比实验模块（P1，过渡形态，DSP 合规）
+from .experiment import (
+    TrialGroup,
+    TrialStatus,
+    TrialResult as ExperimentTrialResult,  # 避免与 SP TrialResult 冲突
+    ExperimentBudget,
+    MethodConfig,
+    BaselineConfig,
+    ExperimentDesign,
+    MethodRunner,
+    BaselineRunner,
+    ExperimentRunner,
+    ComparisonReport,
+)
+
 # P3：推理服务 + 模型版本管理
 from .inference import (
     PredictionResult,

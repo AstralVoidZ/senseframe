@@ -29,6 +29,8 @@ class FeatureSpec:
     - feature_dim: 展平后特征维度（MLP 入口友好）
     - dtype: 输入 dtype（默认 float32）
     - modality: 输入模态标签（"wifi_csi" / "image" / "tabular" / "text" / ...）
+    - feature_names: 各特征维度的命名（P0.2：RFC-003 DSP-4 / FeatureSpecProtocol 契约）
+    - dtypes: 各特征维度的 dtype 字符串（P0.2：与 feature_names 键长一致）
     - extra: 场景特定扩展（如天线对数、采样点数）
     """
 
@@ -38,6 +40,9 @@ class FeatureSpec:
     feature_dim: Optional[int] = None
     dtype: str = "float32"
     modality: Optional[str] = None
+    # P0.2：RFC-003 DSP-4 / FeatureSpecProtocol 契约字段
+    feature_names: List[str] = field(default_factory=list)
+    dtypes: List[str] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -58,6 +63,9 @@ class FeatureSpec:
                 for dim in self.input_shape:
                     total *= dim
                 self.feature_dim = total
+        # P0.2：dtypes 默认填充（若未指定，用 dtype 填满 feature_dim 长度，保持键一致）
+        if not self.dtypes and self.feature_dim is not None and self.feature_dim > 0:
+            self.dtypes = [self.dtype] * self.feature_dim
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -67,6 +75,8 @@ class FeatureSpec:
             "feature_dim": self.feature_dim,
             "dtype": self.dtype,
             "modality": self.modality,
+            "feature_names": list(self.feature_names),
+            "dtypes": list(self.dtypes),
             "extra": self.extra,
         }
 

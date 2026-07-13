@@ -69,20 +69,61 @@ class PipelineDef:
 
     @classmethod
     def default(cls, name: str = "default") -> "PipelineDef":
-        """默认 Pipeline 定义（8 stage）。"""
+        """默认 Pipeline 定义（8 stage）。
+
+        P0.7：stage 顺序与 Pipeline.default() 对齐，
+        使 PipelineDef.default().materialize() 与 Pipeline.default() 等价。
+        """
         return cls(
             name=name,
             stages=[
                 StageTemplate("validate", reads=["config"], writes=["scene", "meta", "model_id", "dataset", "learning_mode"]),
                 StageTemplate("preflight", reads=["config", "scene"], writes=["report", "route_level", "route_config", "output"]),
-                StageTemplate("resolve", reads=["config", "scene", "dataset"], writes=["task_spec", "feature_spec", "resolved", "lightning_params"]),
                 StageTemplate("load", reads=["config", "scene", "dataset"], writes=["bundle", "data_profile", "output_dir"]),
+                StageTemplate("resolve", reads=["config", "scene", "dataset"], writes=["task_spec", "feature_spec", "resolved", "lightning_params"]),
                 StageTemplate("build", reads=["config", "scene", "model_id", "bundle"], writes=["model", "datamodule", "module", "callbacks"]),
                 StageTemplate("train", reads=["config", "model", "datamodule", "module"], writes=["trainer", "output"]),
                 StageTemplate("eval", reads=["config", "trainer", "module", "datamodule"], writes=["output"]),
                 StageTemplate("export", reads=["config", "model", "module", "output"], writes=["output"]),
             ],
         )
+
+    def materialize(self) -> "Pipeline":
+        """将声明式定义物化为可执行 Pipeline（P0.7，OP-1）。
+
+        按 stages 列表查找 stage 函数，构造 Pipeline 执行器。
+        复用 Pipeline.default() 内部结构，不引入新全局表。
+
+        仅支持内置 8 个 stage（validate/preflight/load/resolve/build/train/eval/export）。
+        自定义 stage 需通过 Pipeline.replace_stage 注入。
+
+        Returns:
+            Pipeline: 可执行 Pipeline 实例，stages 列表与 PipelineDef.stages 顺序一致
+
+        Raises:
+            ValueError: 若 stages 中含未知 stage 名
+
+        验证（P0.9 test_pipelinedef_materialize）：
+            PipelineDef.default().materialize().stages 名列表与
+            Pipeline.default().stages 名列表一致
+        """
+        # 局部导入避免循环依赖（pipeline.py 不依赖 orchestration.py）
+        from .engine.runner.pipeline import Pipeline
+
+        # 复用 Pipeline.default() 内部结构作为 stage 函数查找表
+        builtin_stages: Dict[str, Any] = dict(Pipeline.default().stages)
+
+        stages: List[tuple] = []
+        for stage_tmpl in self.stages:
+            stage_fn = builtin_stages.get(stage_tmpl.name)
+            if stage_fn is None:
+                raise ValueError(
+                    f"unknown stage: {stage_tmpl.name!r}; "
+                    f"builtin stages: {list(builtin_stages.keys())}. "
+                    f"自定义 stage 请用 Pipeline.replace_stage 注入。"
+                )
+            stages.append((stage_tmpl.name, stage_fn))
+        return Pipeline(stages=stages)
 
 
 # ============================================================
@@ -366,13 +407,58 @@ class Orchestrator:
 
     def save_checkpoint(self, run_id: str, stage_name: str, checkpoint_uri: str,
                         stage_snapshot: Optional[Dict[str, Any]] = None) -> None:
-        """保存 Checkpoint（OP-4/6）。"""
+        """保存 Checkpoint（OP-4/6）。
+
+        P0.8：建议改用 save_checkpoint_from_file，以 pipeline_checkpoint.json
+        为唯一真源，避免两套快照并行。此方法保留向后兼容（外部调用方可用）。
+        """
         ckpt = CheckpointSpec(
             run_id=run_id, stage_name=stage_name, checkpoint_uri=checkpoint_uri,
             stage_snapshot=stage_snapshot or {}, timestamp=datetime.now().isoformat(),
         )
         with self._lock:
             self._checkpoints.setdefault(run_id, []).append(ckpt)
+
+    def save_checkpoint_from_file(self, run_id: str, stage_name: str,
+                                   output_dir: Any) -> Optional[CheckpointSpec]:
+        """从 pipeline_checkpoint.json 构造 CheckpointSpec（P0.8，OP-4 唯一真源）。
+
+        以 pipeline_checkpoint.json 为唯一真源，避免 CheckpointSpec 内存快照
+        与文件快照并行存在的不一致问题。
+
+        Args:
+            run_id: PipelineRun ID
+            stage_name: 当前 stage 名
+            output_dir: PipelineContext.output_dir（pipeline_checkpoint.json 所在目录）
+
+        Returns:
+            CheckpointSpec 或 None（文件不存在时返回 None，不抛异常）
+
+        验证（P0.9 test_checkpoint_unified）：
+            get_checkpoints(run_id) 返回的 stage_snapshot 含 stage_outputs 字段，
+            且与 pipeline_checkpoint.json 内容一致
+        """
+        ckpt_path = Path(output_dir) / "pipeline_checkpoint.json"
+        if not ckpt_path.exists():
+            return None
+
+        try:
+            data = json.loads(ckpt_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            # 文件损坏不阻断主流程，仅记录
+            self._checkpoints.setdefault(run_id, [])
+            return None
+
+        ckpt = CheckpointSpec(
+            run_id=run_id,
+            stage_name=stage_name,
+            checkpoint_uri=str(ckpt_path),
+            stage_snapshot=data,  # 完整快照（含 stage_outputs）
+            timestamp=data.get("timestamp", datetime.now().isoformat()),
+        )
+        with self._lock:
+            self._checkpoints.setdefault(run_id, []).append(ckpt)
+        return ckpt
 
     def get_checkpoints(self, run_id: str) -> List[CheckpointSpec]:
         """获取 Checkpoint 列表（OP-4）。"""
@@ -489,18 +575,18 @@ class Orchestrator:
         """包装 stage 函数：执行前标记 running，执行后标记 succeeded + 保存 checkpoint。
 
         异常由 Pipeline.run() 统一捕获（不在此处理），
-        reconcile 在 pipeline.run() 返回后从 ctx.extra["failed_stage"] 读取失败 stage。
+        reconcile 在 pipeline.run() 返回后从 ctx.failed_stage 读取失败 stage。
+
+        P0.8：checkpoint 改用 save_checkpoint_from_file，以 pipeline_checkpoint.json
+        为唯一真源，消除两套快照并行。
         """
         def wrapped(ctx):
             self.update_stage(run_id, name, "running")
             result = fn(ctx)
             self.update_stage(run_id, name, "succeeded")
+            # P0.8：从 pipeline_checkpoint.json 读取完整快照作为唯一真源
             if hasattr(ctx, "output_dir") and ctx.output_dir:
-                self.save_checkpoint(
-                    run_id, name,
-                    checkpoint_uri=str(ctx.output_dir / "pipeline_checkpoint.json"),
-                    stage_snapshot={"completed_stages": list(ctx.completed_stages)},
-                )
+                self.save_checkpoint_from_file(run_id, name, ctx.output_dir)
             return result
         return wrapped
 

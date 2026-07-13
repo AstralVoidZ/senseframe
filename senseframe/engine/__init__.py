@@ -17,7 +17,7 @@ from .datamodule import GenericDataModule
 from .hpo import (
     OPTUNA_AVAILABLE,
     HPOOutput,
-    TrialResult,
+    HPOTrialResult,
     apply_params,
     extract_metric,
     run_hpo,
@@ -40,7 +40,7 @@ __all__ = [
     "gaussian_noise",
     "run_hpo",
     "HPOOutput",
-    "TrialResult",
+    "HPOTrialResult",
     "apply_params",
     "extract_metric",
     "sample_params",

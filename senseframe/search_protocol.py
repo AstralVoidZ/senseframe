@@ -9,7 +9,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 from .exploration import ExplorationTracker
 
@@ -111,6 +111,24 @@ class TrialResult:
 # ============================================================
 # SP-3: Sampler 注册表 + 内置 Random/Grid
 # ============================================================
+
+@runtime_checkable
+class Sampler(Protocol):
+    """Sampler 契约（SP-3，P0.5 新增）。
+
+    所有 Sampler 必须满足此 Protocol：拥有 `name` 类属性与 `sample` 方法。
+    `@runtime_checkable` 使 `isinstance(sampler, Sampler)` 可用，
+    仅校验属性/方法存在性，不校验签名。
+    """
+    name: str  # 类属性（采样策略名）
+
+    def sample(
+        self,
+        search_space: "SearchSpace",
+        history: List[Dict[str, Any]],
+    ) -> Dict[str, Any]: ...
+
+
 _SAMPLERS: Dict[str, type] = {}
 
 
@@ -246,7 +264,8 @@ class StudyManager:
         tracker = self._trackers[study_id]
         sampler_cls = get_sampler(study.sampler) or RandomSampler
         sampler = sampler_cls()
-        params = sampler.sample(study.search_space, tracker.history)
+        # P0.4：改用 ExplorationTracker.get_history 公共 API，不直接访问 tracker.history
+        params = sampler.sample(study.search_space, tracker.get_history())
 
         trial_id = f"trial_{uuid.uuid4().hex[:8]}"
         trial = TrialSpec(
@@ -277,16 +296,14 @@ class StudyManager:
         if intermediate_values:
             result["intermediate_values"] = intermediate_values
 
-        # 更新 tracker 中的 trial（add_trial 已创建 pending 记录，现在补 result）
-        # ExplorationTracker 没有 update 方法，需直接操作 history
-        with tracker._lock:
-            for entry in tracker.history:
-                if entry["trial_id"] == trial_id:
-                    entry["result"] = result
-                    entry["status"] = state
-                    if feedback:
-                        entry["feedback"] = feedback
-                    break
+        # P0.4：改用 ExplorationTracker.update_trial 公共 API，
+        # 消除 with tracker._lock + tracker.history 直接改写的封装破裂
+        tracker.update_trial(
+            trial_id=trial_id,
+            result=result,
+            status=state,
+            feedback=feedback,
+        )
 
         # 从 pending 移除
         with self._lock:
@@ -316,8 +333,10 @@ class StudyManager:
         tracker = self._trackers.get(study_id)
         if tracker is None:
             return []
+        # P0.4：改用 ExplorationTracker.get_history 公共 API，不直接访问 tracker.history
+        history = tracker.get_history()
         results = []
-        for entry in tracker.history:
+        for entry in history:
             result_val = 0.0
             if entry.get("result") and "value" in entry["result"]:
                 result_val = entry["result"]["value"]
@@ -363,6 +382,7 @@ __all__ = [
     "ParameterSpec", "SearchSpace", "StudySpec",
     "TrialSpec", "TrialResult",
     "StudyManager", "get_study_manager",
+    "Sampler",  # P0.5：Sampler Protocol
     "register_sampler", "get_sampler", "list_samplers",
     "RandomSampler", "GridSampler",
 ]

@@ -498,14 +498,17 @@ class TestEpsilon4OPProtocol:
     """
 
     def test_pipeline_def_default_has_8_stages(self):
-        """验证 PipelineDef.default() 生成 8 个 stage。"""
+        """验证 PipelineDef.default() 生成 8 个 stage。
+
+        P0.7：stage 顺序与 Pipeline.default() 对齐（load 在 resolve 前）。
+        """
         from senseframe.orchestration import PipelineDef
         pdef = PipelineDef.default(name="test_pipeline")
         assert pdef.name == "test_pipeline"
         assert len(pdef.stages) == 8
         names = [s.name for s in pdef.stages]
         assert names == [
-            "validate", "preflight", "resolve", "load",
+            "validate", "preflight", "load", "resolve",
             "build", "train", "eval", "export",
         ]
 
@@ -978,3 +981,292 @@ class TestEpsilon5FullClosedLoop:
         # 验证事件流含 FAILED
         event_types = [e.type for e in events]
         assert EVENT_PIPELINE_FAILED in event_types
+
+
+# ============================================================
+# P0 协议栈地基加固验收测试
+# ============================================================
+class TestP0ProtocolFoundationAcceptance:
+    """P0 协议栈地基加固的验收测试。
+
+    覆盖 P0.2 / P0.3 / P0.5 / P0.7 / P0.8 五个工作项的验收标准：
+    - P0.2 FeatureSpec 满足 FeatureSpecProtocol
+    - P0.3 ExplorationTracker.update_trial 公共 API
+    - P0.5 SP 顶层导出 + Sampler Protocol
+    - P0.7 PipelineDef.materialize() 物化
+    - P0.8 Checkpoint 统一（pipeline_checkpoint.json 唯一真源）
+
+    反假绿原则：
+    - test_pipelinedef_materialize 实际执行 stage 函数查找，不只用名列表比较
+    - test_checkpoint_unified 实际读写文件，不只用 to_dict 比较
+    """
+
+    # ---------- P0.2 FeatureSpec 满足 Protocol ----------
+
+    def test_feature_spec_satisfies_protocol(self):
+        """FeatureSpec 必须满足 FeatureSpecProtocol 契约。
+
+        P0.2 修复前：FeatureSpec 缺 feature_names/dtypes 字段，
+        isinstance 检查会失败
+        P0.2 修复后：补齐字段，自动填充 dtypes
+
+        注意：FeatureSpecProtocol 定义在 pipeline.py（DSP-1 契约先行声明），
+        FeatureSpec 实现在 core/features.py。
+        """
+        from senseframe.core.features import FeatureSpec
+        from senseframe.engine.runner.pipeline import FeatureSpecProtocol
+
+        # 构造 FeatureSpec 实例
+        fs = FeatureSpec(
+            feature_dim=10,
+            dtype="float32",
+        )
+
+        # 1. isinstance 检查通过
+        assert isinstance(fs, FeatureSpecProtocol), \
+            "FeatureSpec 不满足 FeatureSpecProtocol 契约"
+
+        # 2. feature_names/dtypes 字段存在
+        assert hasattr(fs, "feature_names"), "FeatureSpec 缺 feature_names 字段"
+        assert hasattr(fs, "dtypes"), "FeatureSpec 缺 dtypes 字段"
+
+        # 3. dtypes 自动填充（feature_dim > 0 时）
+        assert len(fs.dtypes) == 10, \
+            f"dtypes 应自动填充为 10 项，实际: {len(fs.dtypes)}"
+        assert all(d == "float32" for d in fs.dtypes), \
+            f"dtypes 应全部为 'float32'，实际: {fs.dtypes}"
+
+        # 4. to_dict 序列化包含新字段
+        d = fs.to_dict()
+        assert "feature_names" in d, "to_dict 缺 feature_names"
+        assert "dtypes" in d, "to_dict 缺 dtypes"
+
+    # ---------- P0.3 ExplorationTracker.update_trial 公共 API ----------
+
+    def test_exploration_tracker_update_trial(self):
+        """ExplorationTracker.update_trial 公共 API 可用 + KeyError。
+
+        P0.3 修复前：SP tell 中 with tracker._lock + tracker.history 改写
+        P0.3 修复后：update_trial 公共方法封装锁与字段更新
+        """
+        from senseframe.exploration import ExplorationTracker
+
+        tracker = ExplorationTracker()
+
+        # 1. 更新不存在 trial 应抛 KeyError
+        with pytest.raises(KeyError):
+            tracker.update_trial("ghost_trial", result={"value": 0.5})
+
+        # 2. 添加 trial 后可更新 result/status/feedback
+        tracker.add_trial(strategy={"lr": 0.01}, result=None, trial_id="t1")
+        tracker.update_trial(
+            "t1",
+            result={"value": 0.85},
+            status="completed",
+            feedback={"note": "best so far"},
+        )
+
+        entry = tracker.get_trial("t1")
+        assert entry is not None
+        assert entry["result"] == {"value": 0.85}
+        assert entry["status"] == "completed"
+        assert entry["feedback"] == {"note": "best so far"}
+
+        # 3. 部分更新（仅 result，status/feedback 不变）
+        tracker.update_trial("t1", result={"value": 0.90})
+        entry_after = tracker.get_trial("t1")
+        assert entry_after["result"] == {"value": 0.90}
+        assert entry_after["status"] == "completed"  # 未被覆盖
+        assert entry_after["feedback"] == {"note": "best so far"}  # 未被覆盖
+
+    # ---------- P0.5 SP 顶层导出 + Sampler Protocol ----------
+
+    def test_sp_top_level_export(self):
+        """SP 协议符号在 senseframe 顶层可达。
+
+        P0.5 修复前：senseframe/__init__.py 未导出 SP 符号
+        P0.5 修复后：13 个 SP 符号在顶层可达
+        """
+        import senseframe
+
+        # 核心类型
+        expected_symbols = [
+            "ParameterSpec", "SearchSpace", "StudySpec",
+            "TrialSpec", "TrialResult",
+            "StudyManager", "get_study_manager",
+            "Sampler",
+            "register_sampler", "get_sampler", "list_samplers",
+            "RandomSampler", "GridSampler",
+        ]
+        for name in expected_symbols:
+            assert hasattr(senseframe, name), \
+                f"senseframe 顶层未导出 SP 符号: {name}"
+
+        # 反向验证：StudyManager 是类，可实例化
+        sm = senseframe.StudyManager()
+        assert sm is not None
+
+    def test_sampler_protocol_compliance(self):
+        """RandomSampler/GridSampler 满足 Sampler Protocol 契约。
+
+        P0.5 修复前：无 Sampler Protocol 基类
+        P0.5 修复后：@runtime_checkable Sampler Protocol，isinstance 可用
+        """
+        from senseframe.search_protocol import (
+            Sampler, RandomSampler, GridSampler,
+        )
+
+        # 1. RandomSampler 实例 isinstance Sampler
+        rs = RandomSampler()
+        assert isinstance(rs, Sampler), \
+            "RandomSampler 不满足 Sampler Protocol"
+
+        # 2. GridSampler 实例 isinstance Sampler
+        gs = GridSampler()
+        assert isinstance(gs, Sampler), \
+            "GridSampler 不满足 Sampler Protocol"
+
+        # 3. Protocol 契约字段：name 类属性 + sample 方法
+        assert hasattr(RandomSampler, "name"), "RandomSampler 缺 name 类属性"
+        assert hasattr(RandomSampler, "sample"), "RandomSampler 缺 sample 方法"
+        assert hasattr(GridSampler, "name"), "GridSampler 缺 name 类属性"
+        assert hasattr(GridSampler, "sample"), "GridSampler 缺 sample 方法"
+
+        # 4. 不满足 Protocol 的对象 isinstance 返回 False
+        class NotASampler:
+            pass
+        assert not isinstance(NotASampler(), Sampler), \
+            "Sampler Protocol 误判：NotASampler 不应通过 isinstance"
+
+    # ---------- P0.7 PipelineDef.materialize() ----------
+
+    def test_pipelinedef_materialize(self):
+        """PipelineDef.default().materialize() 与 Pipeline.default() 等价。
+
+        反假绿：不仅比较 stage 名列表，还实际调用 stages_with_spec()
+        验证 stage 函数被正确解析（带 _stage_spec 属性）。
+
+        P0.7 修复前：PipelineDef 无 materialize 方法
+        P0.7 修复后：materialize 复用 Pipeline.default() 内部结构
+        """
+        from senseframe.orchestration import PipelineDef
+        from senseframe.engine.runner.pipeline import Pipeline
+
+        # 1. materialize 返回 Pipeline 实例
+        pdef = PipelineDef.default()
+        pipeline = pdef.materialize()
+        assert isinstance(pipeline, Pipeline), \
+            "materialize() 应返回 Pipeline 实例"
+
+        # 2. stage 名列表与 Pipeline.default() 一致
+        names_materialized = [n for n, _ in pipeline.stages]
+        names_default = [n for n, _ in Pipeline.default().stages]
+        assert names_materialized == names_default, \
+            f"materialize stage 名列表不一致: {names_materialized} vs {names_default}"
+
+        # 3. 反假绿：实际验证 stage 函数带 _stage_spec 属性（不是占位 None）
+        specs = pipeline.stages_with_spec()
+        assert len(specs) == 8, f"应有 8 个 stage spec，实际: {len(specs)}"
+        # 至少 train stage 应有非空 writes（验证 _stage_spec 被正确附加）
+        # StageSpec.writes 是 List[FieldSpec]，提取 name 字段
+        train_spec = next((s for s in specs if s.name == "train"), None)
+        assert train_spec is not None, "materialize 后未找到 train stage"
+        train_write_names = {fs.name for fs in train_spec.writes}
+        assert "trainer" in train_write_names, \
+            f"train stage writes 缺 trainer，实际: {train_write_names}"
+
+    def test_pipelinedef_materialize_rejects_unknown_stage(self):
+        """materialize 对未知 stage 名抛 ValueError。
+
+        反假绿：实际构造含未知 stage 的 PipelineDef，验证抛异常。
+        """
+        from senseframe.orchestration import PipelineDef, StageTemplate
+
+        pdef = PipelineDef(
+            name="bad",
+            stages=[StageTemplate(name="nonexistent_stage")],
+        )
+        with pytest.raises(ValueError, match="unknown stage"):
+            pdef.materialize()
+
+    # ---------- P0.8 Checkpoint 统一 ----------
+
+    def test_checkpoint_unified(self, tmp_path):
+        """CheckpointSpec 与 pipeline_checkpoint.json 数据一致。
+
+        反假绿：实际写文件 + 实际读文件，不只用 to_dict 比较。
+        验证 save_checkpoint_from_file 读取的 stage_snapshot 含 stage_outputs。
+
+        P0.8 修复前：两套 checkpoint 并行（CheckpointSpec 内存 + JSON 文件）
+        P0.8 修复后：以 pipeline_checkpoint.json 为唯一真源，CheckpointSpec 为镜像
+        """
+        import json
+        from senseframe.orchestration import Orchestrator
+        from senseframe.engine.runner.pipeline import Pipeline, PipelineContext
+
+        # 1. 构造 ctx + output_dir，调用 _write_checkpoint 写文件
+        output_dir = tmp_path / "test_run"
+        output_dir.mkdir()
+
+        # 用最小可用的 ExperimentConfig 构造 ctx（避免真实训练依赖）
+        # 直接构造 PipelineContext，config 用 MagicMock
+        from unittest.mock import MagicMock
+        ctx = PipelineContext(config=MagicMock())
+        ctx.output_dir = output_dir
+        ctx.trial_id = "test_trial_001"
+        ctx.model_id = "test_model"
+        ctx.dataset = "test_dataset"
+        ctx.training_duration_s = 12.34
+        ctx.best_model_score = 0.92
+        ctx.best_model_path = "/tmp/best.ckpt"
+        ctx.early_stopped = False
+        ctx.completed_stages = ["validate", "preflight", "resolve", "load", "build", "train"]
+
+        pipeline = Pipeline()
+        pipeline._write_checkpoint(ctx, failed_stage=None)
+
+        # 2. 验证文件存在且含 stage_outputs
+        ckpt_path = output_dir / "pipeline_checkpoint.json"
+        assert ckpt_path.exists(), "pipeline_checkpoint.json 未写入"
+
+        file_data = json.loads(ckpt_path.read_text(encoding="utf-8"))
+        assert "stage_outputs" in file_data, \
+            "pipeline_checkpoint.json 缺 stage_outputs 字段（P0.8 未实施？）"
+        stage_outputs = file_data["stage_outputs"]
+        assert stage_outputs.get("trial_id") == "test_trial_001"
+        assert stage_outputs.get("training_duration_s") == pytest.approx(12.34)
+        assert stage_outputs.get("best_model_score") == pytest.approx(0.92)
+        assert "completed_stages" in stage_outputs
+
+        # 3. 调用 Orchestrator.save_checkpoint_from_file，验证 CheckpointSpec 镜像
+        orch = Orchestrator()
+        run_id = "test_run_ckpt_001"
+        ckpt = orch.save_checkpoint_from_file(run_id, "train", output_dir)
+
+        assert ckpt is not None, "save_checkpoint_from_file 返回 None（文件应存在）"
+        assert ckpt.run_id == run_id
+        assert ckpt.stage_name == "train"
+        assert "stage_outputs" in ckpt.stage_snapshot, \
+            "CheckpointSpec.stage_snapshot 缺 stage_outputs（未与文件一致）"
+        assert ckpt.stage_snapshot["stage_outputs"]["trial_id"] == "test_trial_001"
+
+        # 4. 验证 get_checkpoints 返回的快照与文件内容一致
+        checkpoints = orch.get_checkpoints(run_id)
+        assert len(checkpoints) == 1
+        assert checkpoints[0].stage_snapshot == file_data, \
+            "CheckpointSpec 快照与 pipeline_checkpoint.json 内容不一致"
+
+    def test_checkpoint_unified_missing_file_returns_none(self, tmp_path):
+        """save_checkpoint_from_file 对不存在的文件返回 None，不抛异常。
+
+        反假绿：实际调用，验证不抛 FileNotFoundError。
+        """
+        from senseframe.orchestration import Orchestrator
+
+        orch = Orchestrator()
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+
+        result = orch.save_checkpoint_from_file("ghost_run", "train", empty_dir)
+        assert result is None, \
+            "文件不存在时应返回 None，不应抛异常"

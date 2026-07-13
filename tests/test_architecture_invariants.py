@@ -812,3 +812,124 @@ class TestRFC004RegressionGuards:
 
 # 在模块级别导入 Pipeline，避免每个测试方法重复导入
 from senseframe.engine.runner.pipeline import Pipeline
+
+
+# ============================================================
+# H. P0 协议栈地基加固回归守卫
+# ============================================================
+
+class TestP0ProtocolFoundationGuards:
+    """P0 协议栈地基加固的回归守卫。
+
+    每个测试对标一个 P0 工作项的验收标准：
+    - P0.1 _FIELD_FILL_STAGE 完整性
+    - P0.1 stage_train writes 完整性
+    - P0.4 SP tell 不再 hack ExplorationTracker 私有字段
+    - P0.6 hpo.TrialResult 已重命名为 HPOTrialResult
+    """
+
+    # ---------- P0.1 DSP 字段标注完整性 ----------
+
+    def test_field_fill_stage_complete(self):
+        """_FIELD_FILL_STAGE 必须覆盖所有 PipelineContext 字段（无 "unknown"）。
+
+        反假绿：用 dataclasses.fields 反射所有字段名，逐一断言在
+        _FIELD_FILL_STAGE 中有记录。若仅检查 schema() 输出，会被
+        "schema() 中 .get(name, 'unknown') 自动兜底" 掩盖空过。
+        """
+        import dataclasses
+        from senseframe.engine.runner.pipeline import (
+            PipelineContext, _FIELD_FILL_STAGE,
+        )
+
+        all_fields = {f.name for f in dataclasses.fields(PipelineContext)}
+        registered = set(_FIELD_FILL_STAGE.keys())
+        missing = all_fields - registered
+        assert not missing, \
+            f"_FIELD_FILL_STAGE 缺失字段: {missing}（schema() 会输出 fill_stage='unknown'）"
+
+        # 反向验证：schema() 输出确实无 "unknown"
+        schema = PipelineContext.schema()
+        unknown_fields = [
+            f["name"] for f in schema["fields"]
+            if f.get("fill_stage") == "unknown"
+        ]
+        assert unknown_fields == [], \
+            f"schema() 仍报 fill_stage='unknown' 的字段: {unknown_fields}"
+
+    def test_stage_train_writes_complete(self):
+        """stage_train 装饰器 writes 必须含 4 字段（trainer + 3 训练结果字段）。
+
+        反假绿：直接读取 stage_train._stage_spec.writes，不用 stage_io() 间接查询。
+        若仅查 stage_io("train")，会被 stage_io 内部的 fallback 掩盖。
+
+        注意：StageSpec.writes 是 List[FieldSpec]，不是 List[str]，
+        需从 FieldSpec.name 提取字段名。
+        """
+        from senseframe.engine.runner.pipeline import stage_train
+
+        spec = getattr(stage_train, "_stage_spec", None)
+        assert spec is not None, "stage_train 缺少 _stage_spec 属性"
+
+        # StageSpec.writes 是 List[FieldSpec]，提取 name 字段
+        actual_names = {fs.name for fs in spec.writes}
+        expected = {"trainer", "training_duration_s", "best_model_path", "best_model_score"}
+        missing = expected - actual_names
+        assert not missing, \
+            f"stage_train.writes 缺失: {missing}，实际: {actual_names}"
+
+    # ---------- P0.4 SP tell 不再 hack 私有字段 ----------
+
+    def test_sp_tell_no_private_access(self):
+        """search_protocol.py 中不应直接访问 ExplorationTracker 私有字段。
+
+        反假绿：用 grep 实证（不用 mock sentinel）。检查源码中是否含
+        'tracker._lock' 或 'tracker.history' 直接访问模式。
+
+        P0.4 修复前：tell 中存在 'with tracker._lock' + 'tracker.history' 改写
+        P0.4 修复后：tell 改用 tracker.update_trial 公共 API
+        """
+        from senseframe import search_protocol as sp_mod
+
+        src = inspect.getsource(sp_mod)
+        # 排除注释行
+        violations = []
+        for i, line in enumerate(src.split("\n"), start=1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            # 检测直接访问私有字段（_lock / history）
+            if "tracker._lock" in stripped or "tracker.history" in stripped:
+                violations.append((i, stripped))
+        assert violations == [], \
+            f"search_protocol.py 仍直接访问 ExplorationTracker 私有字段: {violations}"
+
+    # ---------- P0.6 hpo.TrialResult 已重命名 ----------
+
+    def test_hpo_trial_result_renamed(self):
+        """hpo 模块中应无 TrialResult 类，改为 HPOTrialResult。
+
+        反假绿：用 try/except ImportError 区分"类不存在"（pass）和"类仍存在"（fail）。
+        直接 hasattr 检查会被 __getattr__ 兼容层掩盖。
+        """
+        # 1. hpo.TrialResult 不应存在
+        import senseframe.engine.hpo as hpo_mod
+        assert not hasattr(hpo_mod, "TrialResult"), \
+            "hpo.TrialResult 仍存在，应已重命名为 HPOTrialResult"
+
+        # 2. hpo.HPOTrialResult 必须存在
+        assert hasattr(hpo_mod, "HPOTrialResult"), \
+            "hpo.HPOTrialResult 不存在"
+
+        # 3. engine 顶层导出 HPOTrialResult，不导出 TrialResult
+        import senseframe.engine as engine_mod
+        assert hasattr(engine_mod, "HPOTrialResult"), \
+            "senseframe.engine 未导出 HPOTrialResult"
+        assert "HPOTrialResult" in engine_mod.__all__, \
+            "senseframe.engine.__all__ 未含 HPOTrialResult"
+
+        # 4. senseframe 顶层 TrialResult 应指向 SP 版本（不是 hpo 版本）
+        import senseframe
+        from senseframe.search_protocol import TrialResult as SPTrialResult
+        assert senseframe.TrialResult is SPTrialResult, \
+            "senseframe.TrialResult 应指向 search_protocol.TrialResult（SP 版本）"

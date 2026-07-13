@@ -67,8 +67,8 @@ _TASK_FIELDS = frozenset({
 # 输出数据结构
 # ============================================================
 @dataclass
-class TrialResult:
-    """单次 HPO trial 结果。"""
+class HPOTrialResult:
+    """单次 HPO trial 结果（P0.6：原 TrialResult 重命名，避免与 search_protocol.TrialResult 冲突）。"""
     trial_number: int
     params: Dict[str, Any]
     metric_value: Optional[float]
@@ -95,7 +95,7 @@ class HPOOutput:
     n_complete: int
     n_pruned: int
     n_failed: int
-    trials: List[TrialResult] = field(default_factory=list)
+    trials: List[HPOTrialResult] = field(default_factory=list)
     direction: str = "minimize"
     metric: str = "val_loss"
     tracker: Optional["ExplorationTracker"] = None  # P2: 统一探索视图
@@ -530,7 +530,7 @@ def run_hpo(config: ExperimentConfig,
     )
 
     # 5. 执行 trials（Phase 4.1：仅执行剩余 trial 数）
-    trials: List[TrialResult] = []
+    trials: List[HPOTrialResult] = []
     n_complete = 0
     n_pruned = 0
     n_failed = 0
@@ -552,7 +552,7 @@ def run_hpo(config: ExperimentConfig,
                 metric_val = None
             else:
                 continue  # RUNNING / WAITING
-            trials.append(TrialResult(
+            trials.append(HPOTrialResult(
                 trial_number=t.number,
                 params=dict(t.params),
                 metric_value=metric_val,
@@ -581,7 +581,7 @@ def run_hpo(config: ExperimentConfig,
             futures = [executor.submit(_run_single_trial, i) for i in range(remaining_trials)]
             for future in concurrent.futures.as_completed(futures):
                 trial, value, error_type, error_msg = future.result()
-                trial_result = TrialResult(
+                trial_result = HPOTrialResult(
                     trial_number=trial.number,
                     params={},
                     metric_value=None,
@@ -622,7 +622,7 @@ def run_hpo(config: ExperimentConfig,
                     break
 
             trial = study.ask()
-            trial_result = TrialResult(
+            trial_result = HPOTrialResult(
                 trial_number=trial.number,
                 params={},
                 metric_value=None,
@@ -707,7 +707,7 @@ def run_hpo(config: ExperimentConfig,
 
 
 __all__ = [
-    "TrialResult",
+    "HPOTrialResult",
     "HPOOutput",
     "ObjectiveFn",
     "run_hpo",

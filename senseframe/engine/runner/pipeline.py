@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import (
     Any,
     Callable,
+    ClassVar,
     Dict,
     List,
     Optional,
@@ -308,6 +309,10 @@ _FIELD_FILL_STAGE: Dict[str, str] = {
     "extra": "agent",
     "completed_stages": "agent",
     "stage_checkpoint_path": "agent",
+    "failed_stage": "agent",       # P0.1：Pipeline.run except 块写入（错误路径，agent 可观测）
+    "failed_error": "agent",       # P0.1：同上
+    # RFC-004 方案 G：产物溯源注册表（各 stage 注册，stage_export 是主要注册点）
+    "artifact_registry": "stage_export",  # P0.1：声明填充 stage，消除 schema "unknown"
 }
 
 
@@ -554,7 +559,7 @@ class PipelineContext:
     # 保留可序列化结果字段（training_log/final_eval/best_model_path），
     # 释放不可序列化大对象（bundle/model/trainer/module）。
 
-    _RESOURCE_FIELDS: Tuple[str, ...] = (
+    _RESOURCE_FIELDS: ClassVar[Tuple[str, ...]] = (
         "trainer", "module", "model", "datamodule",
         "bundle", "monitor", "log_writer",
         "pl_logger", "csv_logger", "scene", "meta", "data_profile",
@@ -1197,7 +1202,7 @@ def _fit_with_oom_fallback(
     reads=["config", "model", "datamodule", "module", "callbacks",
            "lightning_params", "pl_logger", "csv_logger", "resolved",
            "route_config", "distributed_kwargs", "learning_mode"],
-    writes=["trainer"],
+    writes=["trainer", "training_duration_s", "best_model_path", "best_model_score"],
     description="Stage 6: 训练执行",
 )
 def stage_train(ctx: PipelineContext) -> PipelineContext:
@@ -2094,6 +2099,8 @@ class Pipeline:
     def _write_checkpoint(self, ctx: PipelineContext, failed_stage: Optional[str] = None) -> None:
         """P1：写 stage checkpoint 到 output_dir/pipeline_checkpoint.json。
 
+        P0.8 扩展：增加 stage_outputs 字段（仅可序列化字段），统一为 OP-4 真源。
+
         Args:
             ctx: PipelineContext（含 completed_stages、trial_id、output_dir）
             failed_stage: 若不为 None，表示在指定 stage 失败，记录到 checkpoint
@@ -2108,6 +2115,8 @@ class Pipeline:
             "completed_stages": ctx.completed_stages,
             "trial_id": ctx.trial_id,
             "timestamp": datetime.now().isoformat(),
+            # P0.8：stage 输出快照（仅可序列化字段），作为 OP-4 唯一真源
+            "stage_outputs": self._serialize_stage_outputs(ctx),
         }
         if failed_stage:
             data["failed_stage"] = failed_stage
@@ -2118,6 +2127,56 @@ class Pipeline:
             )
         except Exception as e:
             _logger.warning(f"Failed to write pipeline checkpoint: {e}")
+
+    def _serialize_stage_outputs(self, ctx: PipelineContext) -> Dict[str, Any]:
+        """序列化 ctx 中可 JSON 化的轻量字段（P0.8，OP-4 真源扩展）。
+
+        仅提取跨 stage 传递的"结果类"字段（str/int/float/bool/list/dict），
+        跳过 torch/lightning 等不可序列化对象。
+        final_eval/training_log 可能含 tensor，逐项 try/except。
+
+        Returns:
+            Dict[str, Any]: 可 JSON 序列化的 stage 输出快照
+        """
+        snapshot: Dict[str, Any] = {}
+        # 简单可序列化字段（str/int/float/bool）
+        simple_fields = [
+            "model_id", "dataset", "learning_mode", "num_classes",
+            "trial_id", "parent_trial_id",
+            "training_duration_s", "best_model_path", "best_model_score",
+            "early_stopped", "failed_stage", "failed_error",
+            "route_level",
+        ]
+        for name in simple_fields:
+            val = getattr(ctx, name, None)
+            if val is None:
+                continue
+            try:
+                json.dumps(val)
+                snapshot[name] = val
+            except (TypeError, ValueError):
+                # 不可序列化字段跳过（如 Path 对象转 str）
+                if isinstance(val, Path):
+                    snapshot[name] = str(val)
+                else:
+                    snapshot[name] = repr(val)
+
+        # final_eval: dict，逐项 try/except
+        if ctx.final_eval:
+            serializable_eval: Dict[str, Any] = {}
+            for k, v in ctx.final_eval.items():
+                try:
+                    json.dumps(v)
+                    serializable_eval[k] = v
+                except (TypeError, ValueError):
+                    serializable_eval[k] = repr(v)
+            snapshot["final_eval"] = serializable_eval
+
+        # completed_stages: list[str]，必可序列化
+        if ctx.completed_stages:
+            snapshot["completed_stages"] = list(ctx.completed_stages)
+
+        return snapshot
 
     @classmethod
     def resume(cls, output_dir, pipeline_run=None) -> Tuple["Pipeline", List[str]]:
