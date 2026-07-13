@@ -56,16 +56,21 @@ except ImportError:
 
 import yaml
 
-from ..config import DEFAULT_DATA_ROOT, ExperimentConfig
+from ..config import ExperimentConfig
 from ...observability import IncrementalLogWriter, Timer, setup_logging as _setup_logging
 from ...observability_otel import (
     record_training_metric, record_trial_metric,
     ML_TRAIN_LOSS, ML_VAL_LOSS, ML_VAL_ACCURACY,
+    # 对称性修复：新增 test 指标常量
+    ML_TEST_LOSS, ML_TEST_ACCURACY,
     ML_STAGE, ML_EPOCH, ML_MODEL_ID, ML_DATASET,
     ML_TRIAL_COUNT, ML_TRIAL_BEST_METRIC,
+    # P2-2: 数据侧 OTel 指标常量
+    ML_DATA_LOAD_DURATION_S, ML_DATA_N_SAMPLES,
+    ML_DATA_N_CLASSES, ML_DATA_IMBALANCE_RATIO,
 )
 from ...routing import ResourceProbe, ResourceRouter
-from ...schemas import TrainOutput
+from ...schemas import TrainOutput, validate_training_log_entry
 from ...scenes import get_scene, has_scene, list_scenes
 
 from .preflight import set_seed, preflight_check, build_env_snapshot, build_logger
@@ -82,6 +87,14 @@ from .errors import (
     DatasetNotSupportedError,
     ModelNotSupportedError,
     ConfigValidationError,
+    # 任务4：Pipeline.run 异常重新分类使用的具体异常类
+    OOMError,
+    ModelBuildError,
+    TrainingError,
+    DataCorruptedError,
+    CheckpointError,
+    SaveError,
+    PreflightError,
 )
 # RFC-004 方案 G：训练产物溯源体系
 from .artifacts import (
@@ -90,7 +103,9 @@ from .artifacts import (
     sha256_file,
     sha256_str,
     verify_artifacts as _verify_artifacts,
+    verify_artifacts_recursive as _verify_artifacts_recursive,
 )
+from .callbacks import StageAwareCallback, FrozenDict
 
 # RFC-003 DSP-1：TYPE_CHECKING 下导入实际类型用于注解，运行时不强制导入
 if TYPE_CHECKING:
@@ -259,6 +274,7 @@ class FeatureSpecProtocol(Protocol):
 _FIELD_FILL_STAGE: Dict[str, str] = {
     # init（构造函数注入）
     "config": "init",
+    "dry_run": "init",
     # stage_validate
     "scene": "stage_validate",
     "meta": "stage_validate",
@@ -284,6 +300,7 @@ _FIELD_FILL_STAGE: Dict[str, str] = {
     "data_profile": "stage_load",
     "output_dir": "stage_load",
     "log_writer": "stage_load",
+    "data_hash": "stage_load",  # 任务2：数据集元数据哈希（路径+大小+mtime）
     # stage_build
     "model": "stage_build",
     "datamodule": "stage_build",
@@ -292,11 +309,14 @@ _FIELD_FILL_STAGE: Dict[str, str] = {
     "pl_logger": "stage_build",
     "csv_logger": "stage_build",
     "monitor": "stage_build",
+    # stage_probe_vram（方案 B：前向+反向+optimizer step 探测实测显存）
+    "vram_probe_result": "stage_probe_vram",
     # stage_train
     "trainer": "stage_train",
     "training_duration_s": "stage_train",
     "best_model_path": "stage_train",
     "best_model_score": "stage_train",
+    "best_epoch": "stage_train",  # 任务1：best checkpoint 的 epoch 号（从 best_model_path 文件名解析）
     "intermediate_values": "stage_train",  # P2.3: ε5 Multi-fidelity（IntermediateMetricLogger 回调写入）
     # stage_eval
     "final_eval": "stage_eval",
@@ -346,6 +366,9 @@ class PipelineContext:
     避免循环导入），新增 completed_fields / filled_at / schema / describe 内省方法。
     """
     config: ExperimentConfig
+    # 任务3：dry-run 标志（True 时 stage_train 跳过 trainer.fit()，仅输出训练 plan）。
+    # 由 Pipeline.run(dry_run=True) 或调用方直接设置 ctx.dry_run=True 注入。
+    dry_run: bool = False
     # stage 间传递的状态
     scene: Optional["SceneProtocol"] = None
     meta: Optional["SceneMetaProtocol"] = None
@@ -372,6 +395,8 @@ class PipelineContext:
     callbacks: List[Any] = field(default_factory=list)  # pl.Callback 列表，类型异构
     pl_logger: Optional["LoggerProtocol"] = None  # P2.1: pl.Logger（LoggerProtocol 契约）
     log_writer: Optional["IncrementalLogWriter"] = None
+    # 任务2：数据集元数据哈希（stage_load 计算，_generate_manifest 写入 manifest）
+    data_hash: str = ""
     csv_logger: Optional["LoggerProtocol"] = None  # P2.1: pl.Logger 实例（LoggerProtocol 契约）
     report: Optional["ResourceReport"] = None
     route_level: str = ""
@@ -384,6 +409,12 @@ class PipelineContext:
     training_duration_s: float = 0.0                # stage_train 写入
     best_model_path: Optional[str] = None           # stage_train 写入（从 ModelCheckpoint 读取）
     best_model_score: Optional[float] = None        # stage_train 写入
+    # 任务1（P0）：best checkpoint 的 epoch 号。
+    # 旧逻辑 feedback 用 final epoch 的 train/val 指标算 gap，但 final_eval 来自
+    # best checkpoint（stage_train 已加载 best 权重到 ctx.model），数据源不一致
+    # 导致过拟合误报。best_epoch 用于在 stage_eval 中让 analyze_training_result
+    # 从 training_log 取 best epoch 那轮的 train 指标，与 final_eval 的 val 指标配对。
+    best_epoch: Optional[int] = None                # stage_train 写入（从 best_model_path 文件名解析）
     final_eval: Dict[str, Any] = field(default_factory=dict)       # stage_eval 写入
     training_log: List[Any] = field(default_factory=list)          # stage_eval 写入
     # P2.3: ε5 Multi-fidelity — epoch 级中间值，IntermediateMetricLogger 回调写入
@@ -401,6 +432,9 @@ class PipelineContext:
     stage_checkpoint_path: Optional[Path] = None  # pipeline_checkpoint.json 路径
     # P2：训练实时监控
     monitor: Optional["TrainingMonitor"] = None  # TrainingMonitor 实例
+    # 方案 B：显存探测结果（stage_probe_vram 写入，stage_export 写入 metadata.resource.vram_probe）
+    # None 表示探测被跳过（CPU/MPS 路由或 dry_run）；dict 含 measured_vram_mb/needed_vram_mb/free_vram_mb/ok/batch_size/precision
+    vram_probe_result: Optional[Dict[str, Any]] = None
     # RFC-004 方案 G：产物溯源注册表 — 各 stage 注册其产出的文件
     artifact_registry: List[ArtifactDescriptor] = field(default_factory=list)
 
@@ -456,14 +490,20 @@ class PipelineContext:
             return None
 
         # 相对路径存储（便于 output_dir 整体迁移）
+        # H3 修复：拒绝存储绝对路径或逃逸 output_dir 的路径
+        # （旧逻辑 fallback 保留绝对路径，被 verify_artifacts 的 pathlib 拼接放大为路径穿越）
+        # 路径双重嵌套修复：先 resolve 成绝对路径，避免相对项目根的路径
+        # （如 output_dir / "data_profile.json"）被 safe_relative_path 当作
+        # 相对 output_dir 的路径处理，导致 output_dir / path 双重嵌套
+        from ...common.path_safe import safe_relative_path
         try:
-            if self.output_dir is not None and path.is_absolute():
-                rel_path = str(path.relative_to(self.output_dir))
-            else:
-                rel_path = str(path)
+            abs_path = path.resolve()
+            rel_path = safe_relative_path(self.output_dir, abs_path)
         except ValueError:
-            # path 不在 output_dir 下，保留绝对路径
-            rel_path = str(path)
+            _logger.warning(
+                f"register_artifact: path escapes output_dir, skipping: {name}={path}"
+            )
+            return None
 
         try:
             desc = ArtifactDescriptor(
@@ -613,17 +653,24 @@ class PipelineContext:
         # pipe 的关闭由 datamodule.py 模块级 patch 在 iterator 析构时负责。
         if self.trainer is not None:
             # 3a. 调用 Lightning 私有 _teardown（清理 accelerator/strategy/loops 状态）
+            # 注意：_teardown 是 Lightning 私有 API，版本升级可能失效或行为变化。
+            # P3 修复：降级为 DEBUG（正常清理路径不应产生 WARNING 噪音）。
+            # 版本兼容性风险已在代码注释记录，无需每次训练都 WARNING 提醒。
             if hasattr(self.trainer, "_teardown"):
+                _logger.debug(
+                    "Calling Lightning private _teardown() for resource cleanup; "
+                    "this private API may break across versions."
+                )
                 try:
                     self.trainer._teardown()
-                except Exception:
-                    pass
+                except Exception as e:
+                    _logger.warning("trainer._teardown() failed: %s", e, exc_info=True)
             # 3b. 兼容：某些 Lightning 版本可能有 teardown 钩子
             if hasattr(self.trainer, "teardown"):
                 try:
                     self.trainer.teardown(stage="fit")
-                except Exception:
-                    pass
+                except Exception as e:
+                    _logger.debug("trainer.teardown(stage='fit') failed: %s", e, exc_info=True)
 
         # 4. DataModule teardown（终止 persistent_workers 子进程）
         if self.datamodule is not None:
@@ -758,7 +805,7 @@ def stage_validate(ctx: PipelineContext) -> PipelineContext:
     if not has_scene(ctx.config.scene.name):
         raise SceneNotRegisteredError(
             f"Scene '{ctx.config.scene.name}' not registered. "
-            f"Available: {list(list_scenes().keys())}"
+            f"Available: {[k for k in list_scenes().keys() if k != '_unavailable']}"
         )
 
     ctx.scene = get_scene(ctx.config.scene.name)
@@ -858,6 +905,32 @@ def stage_resolve(ctx: PipelineContext) -> PipelineContext:
         data_profile=ctx.data_profile,
     )
 
+    # P3-6：class_weight 自动注入桥接。
+    # DataProfile 检测 imbalance_ratio>5 时自动计算 inverse frequency 权重，
+    # 此处注入到 TaskSpec.loss_kwargs["weights"]，并将 loss 切换为 cross_entropy_weighted。
+    # 设计原则：与 recommended_loss → resolver 自动注入是同一架构模式。
+    # 用户显式指定 loss（config.scene.task_spec.loss 非 None）时不覆盖 loss，
+    # 但仍注入 weights（供 cross_entropy_weighted 或 focal 的 alpha 使用）。
+    if (ctx.data_profile is not None
+            and ctx.data_profile.recommended_class_weights is not None
+            and ctx.task_spec is not None):
+        weights = ctx.data_profile.recommended_class_weights
+        current_loss = ctx.task_spec.effective_loss
+        # 仅当当前 loss 为普通 cross_entropy 时自动升级为 cross_entropy_weighted
+        if current_loss == "cross_entropy":
+            from ...core.losses import has_loss
+            if has_loss("cross_entropy_weighted"):
+                ctx.task_spec.loss = "cross_entropy_weighted"
+                _logger.info(
+                    "P3-6 auto-inject class_weight: ratio=%.2f, loss %s→cross_entropy_weighted, "
+                    "weights=%s",
+                    ctx.data_profile.imbalance_ratio, current_loss, weights,
+                )
+        # 注入 weights 到 loss_kwargs（合并已有 kwargs，不覆盖其他 key）
+        existing_kwargs = dict(ctx.task_spec.loss_kwargs or {})
+        existing_kwargs["weights"] = weights
+        ctx.task_spec.loss_kwargs = existing_kwargs
+
     # 解析 FeatureSpec
     ctx.feature_spec = resolve_feature_spec(
         ctx.config, ctx.scene, ctx.dataset, scene_kwargs=ctx.scene_kwargs,
@@ -895,50 +968,165 @@ def stage_resolve(ctx: PipelineContext) -> PipelineContext:
 @stage(
     name="load",
     reads=["config", "scene", "dataset", "learning_mode", "output"],
-    writes=["scene_kwargs", "bundle", "data_profile", "output_dir", "log_writer"],
+    writes=["scene_kwargs", "bundle", "data_profile", "output_dir", "log_writer",
+            "data_hash"],  # 任务2：新增 data_hash 写入声明
     description="Stage 3: 加载数据 + 数据画像",
 )
 def stage_load(ctx: PipelineContext) -> PipelineContext:
     """Stage 3: 加载数据 + 数据画像。"""
+    import time as _time
     from ...core.profiler import DataProfiler
+
+    # P1-4: stage 入口摘要日志
+    _logger.info(
+        "stage_load input: data_root=%s, dataset=%s, learning_mode=%s",
+        ctx.config.scene.data_root or "(default)", ctx.dataset, ctx.learning_mode,
+    )
+
+    # P2-2: 数据加载耗时计时（包含 load_dataset + DataProfiler 全流程）
+    load_timer = _time.time()
 
     # scene_kwargs 前置计算（供 load_dataset 使用，也供后续 resolve 读取）
     ctx.scene_kwargs = {"params": ctx.config.scene.params} if ctx.config.scene.params else {}
 
-    data_root = ctx.config.scene.data_root or DEFAULT_DATA_ROOT
+    # data_root 已由 SceneConfig.validate() 校验非空（YAML/CLI/env 三选一）
+    data_root = ctx.config.scene.data_root
 
     ctx.bundle = ctx.scene.load_dataset(
         ctx.dataset, data_root, learning_mode=ctx.learning_mode,
         **ctx.scene_kwargs,
     )
 
+    # 任务2：计算 data_hash（数据集元数据哈希）。
+    # 不读取文件内容做全量 hash，只 hash 元数据（路径+大小+mtime），
+    # 性能远优于全量 hash，且能检测数据集变更/损坏/缺失。
+    # 存入 ctx.data_hash，供 _generate_manifest 写入 manifest.data_hash。
+    try:
+        ctx.data_hash = _compute_data_hash(data_root)
+    except Exception as e:
+        _logger.warning(f"Failed to compute data_hash: {e}")
+        ctx.data_hash = ""
+
     # 创建输出目录（在数据画像前，便于落盘）
+    # M2 修复：model_id / dataset 来自配置（不可信），清洗后再拼接，避免路径逃逸
+    from ...common.path_safe import sanitize_path_component
+    safe_model_id = sanitize_path_component(ctx.model_id)
+    safe_dataset = sanitize_path_component(ctx.dataset)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     pid = os.getpid()
-    ctx.output_dir = Path(ctx.config.output_dir) / f"{ctx.model_id}_{ctx.dataset}_{timestamp}_{pid}"
+    ctx.output_dir = Path(ctx.config.output_dir) / f"{safe_model_id}_{safe_dataset}_{timestamp}_{pid}"
     ctx.output_dir.mkdir(parents=True, exist_ok=True)
     if ctx.output:
         ctx.output.output_dir = str(ctx.output_dir)
 
     # 数据画像（落盘到 output_dir）
+    # P2-4: 异常不再静默——DataProfiler 失败时记录 error 日志（含 traceback），
+    # 仍降级为 None 不中断 stage_load，但留痕供 Agent 排查。
     try:
         profiler = DataProfiler(max_samples=500)
-        ctx.data_profile = profiler.profile_bundle(ctx.bundle, dataset_name=ctx.dataset)
+        # P0 修复：从 SceneMeta.modality 读取场景显式声明的数据模态，
+        # 覆盖 profiler 的 shape 启发式（CSI (1,250,90) 与 image (1,H,W) 不可区分）
+        modality_hint = getattr(ctx.meta, "modality", None)
+        # P1 修复：透传 learning_mode，让 profile_bundle 按学习模式选择采样源
+        # （自监督用 unsupervised 集，监督用 train 集），避免用 test 集做画像造成数据泄露。
+        ctx.data_profile = profiler.profile_bundle(
+            ctx.bundle, dataset_name=ctx.dataset, modality_hint=modality_hint,
+            learning_mode=ctx.learning_mode,
+        )
         if ctx.data_profile is not None:
             profile_path = ctx.output_dir / "data_profile.json"
             ctx.data_profile.save(profile_path)
             # RFC-004 方案 G：注册 data_profile 产物
+            # P2-4: content_schema 补全 DataProfile 全部字段（与 profiler.py dataclass 对齐）
             ctx.register_artifact(
                 "data_profile", profile_path,
                 kind="profile", producer_stage="stage_load",
-                content_schema={"n_samples": int, "input_shape": list,
-                                "class_distribution": dict},
+                content_schema={
+                    "n_samples": "int",
+                    "input_shape": "list",
+                    "n_features": "int",
+                    "n_classes": "int",
+                    "class_distribution": "dict",
+                    "imbalance_ratio": "float",
+                    "missing_rate": "float",
+                    "value_range": "list",
+                    "mean": "float",
+                    "std": "float",
+                    "is_spatial": "bool",
+                    "is_temporal": "bool",
+                    "modality": "str",
+                    "recommended_task_type": "str",
+                    "recommended_loss": "str",
+                    "recommended_metrics": "list",
+                    "recommended_normalization": "str",
+                    "dataset_name": "str",
+                    "dtypes": "dict",
+                    "feature_names": "list",
+                    "nullable": "dict",
+                    "shapes": "dict",
+                    "profile_source": "str",
+                },
             )
-    except Exception:
+    except Exception as e:
+        # P2-4: 留痕而非静默吞掉（旧逻辑 `except Exception: pass` 完全静默）
+        _logger.error(f"DataProfiler failed: {e}", exc_info=True)
         ctx.data_profile = None
+
+    # P2-2: 数据侧 OTel 指标埋点
+    # 埋点失败不能中断 stage_load（用 try/except 兜底），OTel 未初始化时 no-op。
+    load_duration = _time.time() - load_timer
+    try:
+        record_training_metric(
+            ML_DATA_LOAD_DURATION_S,
+            value=load_duration,
+            stage="load",
+            model_id=ctx.config.scene.model_id,
+            dataset=ctx.config.scene.dataset,
+        )
+        if ctx.data_profile is not None:
+            record_training_metric(
+                ML_DATA_N_SAMPLES,
+                value=ctx.data_profile.n_samples or 0,
+                stage="load",
+                model_id=ctx.config.scene.model_id,
+                dataset=ctx.config.scene.dataset,
+            )
+            # n_classes 可能为 None（回归任务），OTel gauge 需数值，None 时记 0
+            record_training_metric(
+                ML_DATA_N_CLASSES,
+                value=ctx.data_profile.n_classes or 0,
+                stage="load",
+                model_id=ctx.config.scene.model_id,
+                dataset=ctx.config.scene.dataset,
+            )
+            # 类别不平衡比率：根因修复（P2）— 改用 DataProfile.imbalance_ratio
+            # （自监督模式下 class_distribution 为空 → imbalance_ratio 为 None）。
+            # 消费前做 None 守卫，避免对 None 求值。
+            if ctx.data_profile.imbalance_ratio is not None:
+                record_training_metric(
+                    ML_DATA_IMBALANCE_RATIO,
+                    value=float(ctx.data_profile.imbalance_ratio),
+                    stage="load",
+                    model_id=ctx.config.scene.model_id,
+                    dataset=ctx.config.scene.dataset,
+                )
+    except Exception as e:
+        _logger.debug("OTel data metrics recording failed: %s", e)
 
     # 增量日志写入器
     ctx.log_writer = IncrementalLogWriter(ctx.output_dir / "training_log.jsonl")
+
+    # P1-4: stage 出口摘要日志
+    train_samples = len(ctx.bundle.train) if ctx.bundle and getattr(ctx.bundle, "train", None) is not None else 0
+    test_samples = len(ctx.bundle.test) if ctx.bundle and getattr(ctx.bundle, "test", None) is not None else 0
+    _logger.info(
+        "stage_load output: bundle.train_samples=%d, bundle.test_samples=%d, "
+        "data_profile=%s, output_dir=%s, load_duration_s=%.3f",
+        train_samples, test_samples,
+        "present" if ctx.data_profile else "missing",
+        str(ctx.output_dir) if ctx.output_dir else "None",
+        load_duration,
+    )
 
     return ctx
 
@@ -958,7 +1146,18 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
     from ...engine.self_supervised import SelfSupervisedModule
 
     is_self_supervised = (ctx.learning_mode == "self_supervised")
-    data_root = ctx.config.scene.data_root or DEFAULT_DATA_ROOT
+    # data_root 已由 SceneConfig.validate() 校验非空（YAML/CLI/env 三选一）
+    data_root = ctx.config.scene.data_root
+
+    # P1-4: stage 入口摘要日志
+    _input_shape = ctx.scene_info.get("input_shape", []) if ctx.scene_info else []
+    _feature_dim = getattr(ctx.feature_spec, "feature_dim", None) if ctx.feature_spec else None
+    _logger.info(
+        "stage_build input: model_id=%s, dataset=%s, learning_mode=%s, "
+        "input_shape=%s, feature_dim=%s, num_classes=%s",
+        ctx.model_id, ctx.dataset, ctx.learning_mode,
+        _input_shape, _feature_dim, ctx.num_classes,
+    )
 
     # 构建模型
     ctx.model = ctx.scene.build_model_for_dataset(
@@ -969,6 +1168,22 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
         feature_spec=ctx.feature_spec,
         **ctx.scene_kwargs,
     )
+    # 修复（5.11）：stage_build 模型构建无日志
+    # 旧逻辑：模型构造后无任何日志，参数量/输入输出形状/是否 DeviceMap 全无
+    try:
+        n_params = sum(p.numel() for p in ctx.model.parameters())
+        n_trainable_params = sum(p.numel() for p in ctx.model.parameters() if p.requires_grad)
+        # 探测输入形状（从 scene_info 或 feature_spec）
+        input_shape = ctx.scene_info.get("input_shape", [])
+        is_device_map = hasattr(ctx.model, "hf_device_map") or hasattr(ctx.model, "device_map")
+        _logger.info(
+            f"stage_build: model constructed, model_id={ctx.model_id}, "
+            f"dataset={ctx.dataset}, model_class={type(ctx.model).__name__}, "
+            f"total_params={n_params:,}, trainable_params={n_trainable_params:,}, "
+            f"input_shape={input_shape}, is_device_map={is_device_map}"
+        )
+    except Exception as e:
+        _logger.debug(f"stage_build: failed to log model info: {e}")
 
     # metrics
     if ctx.config.scene.task_spec is not None:
@@ -983,12 +1198,20 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
 
     # Callbacks
     ctx.callbacks = []
+    # P2-3 修复：monitor 可配置化（默认 val_loss，支持自定义指标）
+    monitor_metric = getattr(ctx.config.trainer, "early_stopping_monitor", "val_loss")
     ckpt_cb = ModelCheckpoint(
         dirpath=str(ctx.output_dir / "checkpoints"),
-        filename="best-{epoch}-{val_loss:.3f}",
-        monitor="val_loss",
+        filename=f"best-{{epoch}}-{{{monitor_metric}:.3f}}",
+        monitor=monitor_metric,
         save_top_k=1,
         mode="min",
+        # PL 2.6.5: save_on_train_epoch_end=None 默认推断为 True，
+        # 在 on_train_epoch_end 检查 val_loss（此时 validation 尚未执行）
+        # 触发 "could not find the monitored key" 警告。
+        # 显式设 False，只在 on_validation_epoch_end 检查。
+        # 与 EarlyStopping(check_on_train_epoch_end=False) 对称修复。
+        save_on_train_epoch_end=False,
     )
     ctx.callbacks.append(ckpt_cb)
 
@@ -999,10 +1222,14 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
             ctx.config.trainer, "early_stopping_min_delta", 0.0
         )
         ctx.callbacks.append(EarlyStopping(
-            monitor="val_loss",
+            monitor=monitor_metric,
             patience=early_stopping_patience,
             min_delta=early_stopping_min_delta,
             mode="min",
+            # pytorch_lightning 2.6.5: check_on_train_epoch_end=None 默认推断为 True，
+            # 导致 on_train_epoch_end 时 val_loss 不可用而抛 RuntimeError。
+            # 显式设为 False，只在 on_validation_epoch_end 检查（val_loss 在 validation 后才可用）。
+            check_on_train_epoch_end=False,
         ))
 
     # P2: 创建 TrainingMonitor，供 EpochLogCallback 写入实时指标
@@ -1021,16 +1248,41 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
     if ctx.config.extra_callbacks:
         ctx.callbacks.extend(ctx.config.extra_callbacks)
 
+    # 修复（2.8）：若 ctx 含 Optuna trial 对象（通过 extra 传入），注册
+    # OptunaReportingCallback 桥接 Lightning 中间指标到 trial.report()，
+    # 让 Pruner 基于 epoch 级指标剪枝。Optuna 未安装时降级 warning。
+    _optuna_trial = ctx.extra.get("optuna_trial") if ctx.extra else None
+    if _optuna_trial is not None:
+        try:
+            from .orchestrator import OptunaReportingCallback
+            ctx.callbacks.append(
+                OptunaReportingCallback(
+                    trial=_optuna_trial,
+                    metric=ctx.resolved.get("hpo_metric", "val_accuracy"),
+                )
+            )
+        except ImportError:
+            _logger.warning(
+                "ctx.extra['optuna_trial'] set but OptunaReportingCallback "
+                "unavailable (optuna not installed); HPO pruner will not "
+                "receive intermediate values."
+            )
+
     if is_self_supervised:
         # 自监督模式
         unsup_ds = ctx.bundle.unsupervised
         sup_ds = ctx.bundle.supervised_finetune
+        val_ds = ctx.bundle.val  # P2-3 修复：传递独立 val_dataset
         test_ds = ctx.bundle.test
-        transform_cfg = ctx.scene.get_transforms(ctx.dataset)
+        # P0 修复：自监督分支漏传 scene_kwargs，导致 get_transforms 无法读取
+        # params（如 transform.pipeline/augment 配置），与监督分支行为不一致。
+        # 监督分支已透传 **ctx.scene_kwargs，此处对齐。
+        transform_cfg = ctx.scene.get_transforms(ctx.dataset, **ctx.scene_kwargs)
 
         if ctx.config.datamodule_factory is not None:
             ctx.datamodule = ctx.config.datamodule_factory(
                 train_dataset=sup_ds, test_dataset=test_ds,
+                val_dataset=val_ds,
                 batch_size=ctx.resolved["batch_size"],
                 num_workers=ctx.resolved["num_workers"],
                 pin_memory=ctx.resolved.get("pin_memory", False),
@@ -1040,10 +1292,12 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
                 supervised_dataset=sup_ds,
                 train_transform=transform_cfg.train_transform,
                 eval_transform=transform_cfg.eval_transform,
+                supervised_transform=transform_cfg.supervised_transform,
             )
         else:
             ctx.datamodule = GenericDataModule(
                 train_dataset=sup_ds, test_dataset=test_ds,
+                val_dataset=val_ds,
                 batch_size=ctx.resolved["batch_size"],
                 num_workers=ctx.resolved["num_workers"],
                 pin_memory=ctx.resolved.get("pin_memory", False),
@@ -1053,6 +1307,7 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
                 supervised_dataset=sup_ds,
                 train_transform=transform_cfg.train_transform,
                 eval_transform=transform_cfg.eval_transform,
+                supervised_transform=transform_cfg.supervised_transform,
             )
 
         ctx.module = SelfSupervisedModule(
@@ -1066,12 +1321,14 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
     else:
         # 监督模式
         train_ds = ctx.bundle.train
+        val_ds = ctx.bundle.val  # P2-3 修复：传递独立 val_dataset
         test_ds = ctx.bundle.test
         transform_cfg = ctx.scene.get_transforms(ctx.dataset, **ctx.scene_kwargs)
 
         if ctx.config.datamodule_factory is not None:
             ctx.datamodule = ctx.config.datamodule_factory(
                 train_dataset=train_ds, test_dataset=test_ds,
+                val_dataset=val_ds,
                 batch_size=ctx.resolved["batch_size"],
                 num_workers=ctx.resolved["num_workers"],
                 pin_memory=ctx.resolved.get("pin_memory", False),
@@ -1083,6 +1340,7 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
         else:
             ctx.datamodule = GenericDataModule(
                 train_dataset=train_ds, test_dataset=test_ds,
+                val_dataset=val_ds,
                 batch_size=ctx.resolved["batch_size"],
                 num_workers=ctx.resolved["num_workers"],
                 pin_memory=ctx.resolved.get("pin_memory", False),
@@ -1124,7 +1382,341 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
                 task_spec=ctx.task_spec,
             )
 
+    # P2-4: 注入 DataProfile 到 module，供 on_train_start 一致性校验使用
+    # （如 num_classes 与 data_profile.n_classes 不匹配时提前告警）
+    # 自监督和监督模式统一注入；data_profile 为 None 时跳过。
+    if ctx.data_profile is not None and ctx.module is not None:
+        try:
+            ctx.module.data_profile = ctx.data_profile
+            _logger.debug("DataProfile injected into module for on_train_start validation")
+        except Exception as e:
+            # module 可能是 frozen dataclass 或不允许 setattr，留痕不中断
+            _logger.debug(f"Failed to inject DataProfile into module: {e}")
+    else:
+        _logger.debug("DataProfile is None or module is None, skip injection into module")
+
+    # P1-4: stage 出口摘要日志
+    try:
+        _model_class = type(ctx.model).__name__ if ctx.model is not None else "None"
+        _total_params = sum(p.numel() for p in ctx.model.parameters()) if ctx.model is not None else 0
+        _dm_batch_size = getattr(ctx.datamodule, "batch_size", None) if ctx.datamodule is not None else None
+        _module_class = type(ctx.module).__name__ if ctx.module is not None else "None"
+    except Exception:
+        _model_class = "unknown"
+        _total_params = 0
+        _dm_batch_size = None
+        _module_class = "unknown"
+    _logger.info(
+        "stage_build output: model_class=%s, total_params=%d, "
+        "datamodule_batch_size=%s, module_class=%s, callbacks_count=%d",
+        _model_class, _total_params, _dm_batch_size, _module_class,
+        len(ctx.callbacks) if ctx.callbacks else 0,
+    )
+
     return ctx
+
+
+@stage(
+    name="probe_vram",
+    reads=["model", "datamodule", "module", "resolved", "report",
+           "dry_run", "route_level", "model_id"],
+    writes=["vram_probe_result"],
+    description="Stage 5.5: 动态显存探测（方案 B：前向+反向+optimizer step 测峰值显存）",
+)
+def _run_probe_in_subprocess(params: Dict[str, Any]) -> Dict[str, Any]:
+    """在子进程中执行显存探测，隔离 CUDA 计算不影响主进程。
+
+    设计目的：probe 的 CUDA 计算会初始化 cuBLAS/cuDNN handle，这些全局状态
+    无法被 set_seed 重置，会改变后续 trainer.fit() 首步的 CUDA 状态。
+    子进程隔离让 probe 的 CUDA 上下文在子进程退出时销毁，主进程不受影响。
+
+    通信协议：
+    - 主进程 → 子进程：命令行参数（标量）+ JSON 文件（复杂参数）
+    - 子进程 → 主进程：JSON stdout（成功含 measured_vram_mb，失败含 error）
+
+    Args:
+        params: 探测参数 dict，含 model_id/dataset/num_classes/batch_size 等
+
+    Returns:
+        探测结果 dict（含 measured_vram_mb/needed_vram_mb/free_vram_mb/ok/breakdown_mb）
+
+    Raises:
+        PreflightError: 子进程启动失败、超时、退出码非 0 或输出非 JSON
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    # 1. 构造命令行参数
+    cmd = [
+        sys.executable, "-m", "senseframe.engine.runner.probe_worker",
+        "--model-id", str(params["model_id"]),
+        "--dataset", str(params["dataset"]),
+        "--num-classes", str(params["num_classes"]),
+        "--learning-mode", str(params.get("learning_mode", "supervised")),
+        "--batch-size", str(params["batch_size"]),
+        "--precision", str(params.get("precision", "32")),
+        "--optimizer", str(params.get("optimizer", "adam")),
+        "--data-root", str(params["data_root"]),
+        "--scene-name", str(params["scene_name"]),
+    ]
+
+    # 2. 复杂参数写入临时 JSON 文件（feature_spec, scene_kwargs, scene_info）
+    params_file = None
+    complex_params = {}
+    if params.get("feature_spec"):
+        complex_params["feature_spec"] = params["feature_spec"]
+    if params.get("scene_kwargs"):
+        complex_params["scene_kwargs"] = params["scene_kwargs"]
+    if params.get("scene_info"):
+        complex_params["scene_info"] = params["scene_info"]
+    if complex_params:
+        fd, params_file = tempfile.mkstemp(suffix=".json", prefix="probe_params_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(complex_params, f, ensure_ascii=False)
+        cmd.extend(["--params-file", params_file])
+
+    # 3. 启动子进程
+    try:
+        _logger.info(
+            "probe subprocess: model_id=%s, dataset=%s, batch_size=%s",
+            params["model_id"], params["dataset"], params["batch_size"],
+        )
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,  # 2 分钟超时
+            cwd=str(Path.cwd()),
+        )
+    except subprocess.TimeoutExpired:
+        raise PreflightError(
+            f"VRAM probe subprocess timed out (120s). "
+            f"model_id={params['model_id']}, dataset={params['dataset']}"
+        )
+    except FileNotFoundError as e:
+        raise PreflightError(
+            f"VRAM probe subprocess 启动失败（Python 不可用？）: {e}"
+        )
+    finally:
+        # 清理临时文件
+        if params_file and os.path.exists(params_file):
+            os.unlink(params_file)
+
+    # 4. 解析子进程输出
+    if proc.returncode != 0:
+        # 子进程异常退出，尝试解析 stderr
+        stderr_snippet = (proc.stderr or "")[:500]
+        # 也尝试从 stdout 解析 error JSON
+        try:
+            error_result = json.loads(proc.stdout.strip())
+            if "error" in error_result:
+                raise PreflightError(
+                    f"VRAM probe subprocess 失败: {error_result['error']} "
+                    f"(type={error_result.get('error_type', 'unknown')})"
+                )
+        except (json.JSONDecodeError, ValueError):
+            pass
+        raise PreflightError(
+            f"VRAM probe subprocess 退出码 {proc.returncode}: {stderr_snippet}"
+        )
+
+    # 5. 解析结果 JSON
+    try:
+        result = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError as e:
+        stdout_snippet = (proc.stdout or "")[:500]
+        raise PreflightError(
+            f"VRAM probe subprocess 输出非 JSON: {e}. "
+            f"stdout 前 500 字符: {stdout_snippet}"
+        )
+
+    # 6. 检查 error 字段
+    if "error" in result:
+        raise PreflightError(
+            f"VRAM probe subprocess 内部错误: {result['error']} "
+            f"(type={result.get('error_type', 'unknown')})"
+        )
+
+    return result
+
+
+def stage_probe_vram(ctx: PipelineContext) -> PipelineContext:
+    """Stage 5.5: 动态显存探测（子进程隔离）。
+
+    方案 B 完整实现：在 stage_build 构造模型后、stage_train 正式训练前，
+    在子进程中跑 1 个 batch 的前向，测量峰值显存（含参数+梯度+optimizer
+    state+激活），与 gpu_free_vram_mb 比较。
+
+    子进程隔离（2026-07-11）：probe 在独立 Python 进程中运行，子进程退出时
+    CUDA 上下文销毁，主进程的 CUDA 状态不受影响。主进程 trainer.fit() 首步
+    就是进程中首次 CUDA 计算，等同无 probe 路径（N0 基线），不需要 GPU warmup。
+
+    与现有三层防御的关系：
+    - 第一层（stage_resolve.preflight_check）：静态粗筛，快速失败
+    - 第二层（本 stage）：动态精确探测，给 batch_size 建议
+    - 第三层（stage_train._fit_with_oom_fallback）：运行时兜底
+
+    跳过条件（写 vram_probe_result=None）：
+    - dry_run 模式（无实际训练，无需探测）
+    - 非 CUDA 路由（CPU/MPS 无 CUDA 显存测量 API）
+    - ctx.model 或 ctx.datamodule 为 None（无法探测）
+    """
+    # P1-4: stage 入口摘要日志
+    _logger.info(
+        "stage_probe_vram input: dry_run=%s, has_cuda=%s, route_level=%s, "
+        "batch_size=%s, precision=%s",
+        ctx.dry_run,
+        ctx.report.has_cuda if ctx.report else False,
+        ctx.route_level,
+        ctx.resolved.get("batch_size") if ctx.resolved else None,
+        ctx.resolved.get("precision") if ctx.resolved else None,
+    )
+
+    # 跳过条件 1：dry_run 模式无实际训练，探测无意义
+    if ctx.dry_run:
+        ctx.vram_probe_result = {"skipped": "dry_run", "measured_vram_mb": None}
+        _logger.info("stage_probe_vram: skipped (dry_run mode)")
+        return ctx
+
+    # 跳过条件 2：非 CUDA 路由（CPU/MPS 无 CUDA 显存测量 API）
+    has_cuda = ctx.report.has_cuda if ctx.report else False
+    if not has_cuda:
+        ctx.vram_probe_result = {"skipped": "no_cuda", "measured_vram_mb": None}
+        _logger.info("stage_probe_vram: skipped (no CUDA, route_level=%s)", ctx.route_level)
+        return ctx
+
+    # 跳过条件 3：模型或 datamodule 缺失（无法构造探测输入）
+    if ctx.model is None or ctx.datamodule is None:
+        ctx.vram_probe_result = {"skipped": "missing_model_or_data", "measured_vram_mb": None}
+        _logger.warning(
+            "stage_probe_vram: skipped (model=%s, datamodule=%s)",
+            ctx.model is not None, ctx.datamodule is not None,
+        )
+        return ctx
+
+    # 子进程隔离：probe 在独立进程中运行，主进程不执行任何 CUDA 计算，
+    # 因此不需要 set_seed / RNG 保存恢复 / 模式保存恢复 / empty_cache。
+    # 主进程的 CUDA 状态完全干净，trainer.fit() 首步就是首次 CUDA 计算。
+
+    # 构造子进程探测参数
+    from ...common.paths import resolve_data_root
+    data_root = ctx.config.scene.data_root
+    try:
+        data_root = str(resolve_data_root(data_root))
+    except FileNotFoundError:
+        pass  # 子进程会报告具体错误
+
+    # 序列化 feature_spec（如果是 dataclass，转 dict）
+    feature_spec_dict = None
+    if ctx.feature_spec is not None:
+        try:
+            from dataclasses import asdict
+            feature_spec_dict = asdict(ctx.feature_spec)
+        except Exception:
+            feature_spec_dict = None
+
+    probe_params = {
+        "model_id": ctx.model_id,
+        "dataset": ctx.dataset,
+        "num_classes": ctx.num_classes,
+        "learning_mode": ctx.learning_mode,
+        "batch_size": ctx.resolved.get("batch_size", 64),
+        "precision": ctx.resolved.get("precision", "32"),
+        "optimizer": ctx.resolved.get("optimizer", "adam"),
+        "data_root": data_root,
+        "scene_name": ctx.config.scene.name,
+        "feature_spec": feature_spec_dict,
+        "scene_kwargs": ctx.scene_kwargs,
+        "scene_info": ctx.scene_info,
+    }
+
+    # 方案 A：batch_size 自动适配（二分搜索）
+    # 首次探测用当前 batch_size；若超限，按比例降低并重测，直到通过或达到迭代上限。
+    # 每次迭代启动新子进程（子进程 CUDA 上下文已污染，不可复用）。
+    result = _run_probe_in_subprocess(probe_params)
+    original_batch_size = result.get("batch_size")
+    max_iterations = 5
+    iteration = 0
+
+    while not result.get("ok") and result.get("measured_vram_mb") is not None:
+        iteration += 1
+        if iteration > max_iterations:
+            # 超过迭代上限仍未通过，raise 给出最终建议
+            batch_size = result["batch_size"]
+            free_vram_mb = result["free_vram_mb"]
+            needed_vram_mb = result["needed_vram_mb"]
+            suggested_bs = max(4, int(batch_size * free_vram_mb / max(needed_vram_mb, 1)))
+            ctx.vram_probe_result = result
+            raise PreflightError(
+                f"VRAM probe failed after {max_iterations} iterations: "
+                f"measured {result['measured_vram_mb']}MB "
+                f"(needed {needed_vram_mb:.1f}MB with 15% margin) > free {free_vram_mb}MB. "
+                f"建议：batch_size {original_batch_size} → {suggested_bs}，"
+                f"或改 CPU route（device=cpu），或减小模型（当前 {ctx.model_id}）。"
+            )
+
+        # 计算建议 batch_size（激活显存约与 batch_size 成正比）
+        current_bs = result["batch_size"]
+        free_vram_mb = result["free_vram_mb"]
+        needed_vram_mb = result["needed_vram_mb"]
+        suggested_bs = max(4, int(current_bs * free_vram_mb / max(needed_vram_mb, 1)))
+
+        if suggested_bs >= current_bs:
+            # 建议值未降低，无法通过降 batch_size 解决（固定显存部分已超限）
+            ctx.vram_probe_result = result
+            raise PreflightError(
+                f"VRAM probe failed: measured {result['measured_vram_mb']}MB "
+                f"(needed {needed_vram_mb:.1f}MB) > free {free_vram_mb}MB. "
+                f"batch_size 已降至 {current_bs}，无法进一步降低。"
+                f"建议：改 CPU route（device=cpu），或减小模型（当前 {ctx.model_id}）。"
+            )
+
+        # 应用新 batch_size，重新探测（新子进程）
+        _logger.info(
+            "stage_probe_vram: batch_size %d → %d (iteration %d/%d, "
+            "measured=%.1fMB > free=%.1fMB)",
+            current_bs, suggested_bs, iteration, max_iterations,
+            result["measured_vram_mb"], free_vram_mb,
+        )
+        ctx.resolved["batch_size"] = suggested_bs
+        if hasattr(ctx.datamodule, "batch_size"):
+            ctx.datamodule.batch_size = suggested_bs
+        probe_params["batch_size"] = suggested_bs
+        result = _run_probe_in_subprocess(probe_params)
+
+    # 探测通过（或本就通过），记录最终结果
+    if result.get("batch_size") != original_batch_size:
+        _logger.info(
+            "stage_probe_vram: batch_size auto-fitted %d → %d "
+            "(measured=%.1fMB, needed=%.1fMB, free=%.1fMB)",
+            original_batch_size, result["batch_size"],
+            result["measured_vram_mb"], result["needed_vram_mb"],
+            result["free_vram_mb"],
+        )
+
+    ctx.vram_probe_result = result
+    _logger.info(
+        "stage_probe_vram: measured=%.1fMB, needed=%.1fMB (15%% margin), "
+        "free=%.1fMB, ok=%s, batch_size=%s, precision=%s",
+        result.get("measured_vram_mb", 0),
+        result.get("needed_vram_mb", 0),
+        result.get("free_vram_mb", 0),
+        result.get("ok"),
+        result.get("batch_size"),
+        result.get("precision"),
+    )
+
+    return ctx
+
+
+# _run_vram_probe 已移除（2026-07-12）：
+# 旧方案使用 deepcopy 副本在主进程中探测显存，已被子进程隔离方案取代。
+# 当前 stage_probe_vram 调用 _run_probe_in_subprocess，probe 逻辑在
+# probe_worker._do_probe 中独立实现（不依赖 PipelineContext）。
+# 保留 _run_probe_in_subprocess 作为子进程隔离入口。
 
 
 # ============================================================
@@ -1163,24 +1755,28 @@ def _fit_with_oom_fallback(
     Returns:
         成功完成 fit 的 Trainer 实例
     """
-    import logging
-    _log = logging.getLogger(__name__)
-
     trainer = build_trainer()
     try:
         fit_fn(trainer)
         return trainer
     except Exception as e:
         if not _is_oom_error(e):
+            # 修复（2.10）：非 OOM 异常时 teardown trainer，避免资源泄露
+            # （Trainer 内部持有 CUDA/dataloader worker 等资源，不 teardown 会泄露）
+            if hasattr(trainer, "_teardown"):
+                try:
+                    trainer._teardown()
+                except Exception:
+                    pass
             raise
         current_bs = ctx.resolved.get("batch_size", 64)
         if current_bs <= min_batch_size:
-            _log.warning(
+            _logger.warning(
                 f"OOM at batch_size={current_bs} (<= min {min_batch_size}), not retrying"
             )
             raise
         new_bs = max(min_batch_size, current_bs // 2)
-        _log.warning(
+        _logger.warning(
             f"OOM at batch_size={current_bs}, retrying with batch_size={new_bs}"
         )
         ctx.resolved["batch_size"] = new_bs
@@ -1195,6 +1791,10 @@ def _fit_with_oom_fallback(
             except Exception:
                 pass
         del trainer
+        # 修复（2.9）：del 后需 gc.collect() 打断 Trainer/LightningModule 内部循环引用，
+        # 否则 empty_cache() 时引用计数未归零，显存未真正释放。
+        import gc
+        gc.collect()
         if torch.cuda.is_available():
             try:
                 torch.cuda.synchronize()
@@ -1212,7 +1812,8 @@ def _fit_with_oom_fallback(
     reads=["config", "model", "datamodule", "module", "callbacks",
            "lightning_params", "pl_logger", "csv_logger", "resolved",
            "route_config", "distributed_kwargs", "learning_mode"],
-    writes=["trainer", "training_duration_s", "best_model_path", "best_model_score"],
+    writes=["trainer", "training_duration_s", "best_model_path", "best_model_score",
+            "intermediate_values"],  # 任务3：补报 intermediate_values（FrozenDict 冻结写入）
     description="Stage 6: 训练执行",
 )
 def stage_train(ctx: PipelineContext) -> PipelineContext:
@@ -1222,6 +1823,13 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
     """
     is_self_supervised = (ctx.learning_mode == "self_supervised")
     deterministic = ctx.config.trainer.deterministic
+
+    # 子进程隔离方案（2026-07-11）：probe 在独立子进程中运行，主进程不消耗 RNG，
+    # 不需要在 stage_train 入口重新 set_seed。set_seed 仅在 stage_preflight 调用
+    # 一次，之后 RNG 自然流经 stage_load/resolve/build，与 N0 基线（无 probe）
+    # 路径一致。在 stage_train 入口额外 set_seed 会重置 RNG，导致 DataLoader
+    # shuffle 顺序与 N0 基线不同（实测 ep0 从 1.210943 变为 1.258861）。
+
     enable_progress_bar = ctx.config.trainer.enable_progress_bar
     max_time = ctx.config.trainer.max_time or "00:02:00:00"
 
@@ -1230,8 +1838,101 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
     if resume_ckpt is None and ctx.config.scene.params:
         resume_ckpt = ctx.config.scene.params.get("resume")
 
+    # P1-4: stage 入口摘要日志
+    _epochs = ctx.config.trainer.epochs
+    _batch_size = ctx.resolved.get("batch_size") if ctx.resolved else None
+    _lr = ctx.resolved.get("learning_rate") if ctx.resolved else None
+    _optimizer = ctx.resolved.get("optimizer") if ctx.resolved else None
+    _scheduler = ctx.resolved.get("scheduler") if ctx.resolved else None
+    _logger.info(
+        "stage_train input: epochs=%s, batch_size=%s, learning_rate=%s, "
+        "optimizer=%s, scheduler=%s, learning_mode=%s, resume_ckpt=%s",
+        _epochs, _batch_size, _lr, _optimizer, _scheduler,
+        ctx.learning_mode, resume_ckpt,
+    )
+
+    # 修复（任务3 / P0）：dry-run 模式跳过 trainer.fit()，仅输出训练 plan。
+    # 旧逻辑用 limit_train_batches=1 近似 dry-run，但仍执行完整 fit/validation/
+    # checkpoint，产生副作用（写 checkpoint、占显存、跑验证）。改为入口直接短路。
+    if ctx.dry_run:
+        plan = {
+            "epochs": _epochs,
+            "batch_size": _batch_size,
+            "learning_rate": _lr,
+            "optimizer": _optimizer,
+            "scheduler": _scheduler,
+            "device": ctx.lightning_params.get("accelerator") if ctx.lightning_params else None,
+            "devices": ctx.lightning_params.get("devices") if ctx.lightning_params else None,
+            "precision": ctx.lightning_params.get("precision") if ctx.lightning_params else None,
+            "max_time": max_time,
+            "learning_mode": ctx.learning_mode,
+            "resume_ckpt": resume_ckpt,
+        }
+        _logger.info("stage_train dry-run plan: %s", json.dumps(plan, default=str))
+
+        # 修复（任务2 / P1）：dry-run 短路改为前向传播验证。
+        # 旧逻辑 dry-run 完全跳过 fit()，不执行任何前向传播，无法验证模型可前向。
+        # CLI 的 _cmd_dry_run 动态校验需要"1 epoch + 1 batch 前向"验证模型可前向。
+        # 方案：从 datamodule 取 1 个 batch，验证模型可前向。失败不阻断 dry-run
+        # （只 warning），因为前向验证的目的是验证模型可前向，非阻断性校验。
+        try:
+            if hasattr(ctx.datamodule, 'setup'):
+                try:
+                    ctx.datamodule.setup()
+                except Exception:
+                    pass
+            train_dl = ctx.datamodule.train_dataloader() if hasattr(ctx.datamodule, 'train_dataloader') else None
+            if train_dl is not None and ctx.model is not None:
+                batch = next(iter(train_dl))
+                if isinstance(batch, (list, tuple)):
+                    x = batch[0]
+                elif isinstance(batch, dict):
+                    x = batch.get('x') or batch.get('input') or list(batch.values())[0]
+                else:
+                    x = batch
+                with torch.no_grad():
+                    output = ctx.model(x)
+                _logger.info(
+                    "stage_train dry-run: forward pass OK, output shape=%s",
+                    output.shape if hasattr(output, 'shape') else type(output).__name__,
+                )
+        except Exception as e:
+            _logger.warning("stage_train dry-run: forward pass failed: %s", e)
+            # 前向失败不阻断 dry-run，只在报告中标记
+
+        ctx.training_duration_s = 0.0
+        ctx.best_model_path = None
+        ctx.best_model_score = None
+        ctx.best_epoch = None  # 任务1：dry-run 无训练，best_epoch 置 None
+        _logger.info(
+            "stage_train dry-run: skipped trainer.fit(), forward validation done"
+        )
+        return ctx
+
     timer = Timer("training")
     timer.__enter__()
+
+    # P1-5.8: 训练入口 log 显存占用 + 梯度裁剪配置（可观测性补全）
+    try:
+        import torch as _torch
+        _grad_clip_val = ctx.resolved.get("gradient_clip_val")
+        _grad_clip_algo = ctx.resolved.get("gradient_clip_algorithm", "norm")
+        if _grad_clip_val is not None:
+            _logger.info(
+                "stage_train: gradient_clip configured (val=%s, algorithm=%s)",
+                _grad_clip_val, _grad_clip_algo,
+            )
+        else:
+            _logger.info("stage_train: gradient_clip disabled (val=None)")
+        if _torch.cuda.is_available():
+            _allocated = _torch.cuda.memory_allocated() / (1024 ** 3)
+            _reserved = _torch.cuda.memory_reserved() / (1024 ** 3)
+            _logger.info(
+                "stage_train: GPU memory before fit (allocated=%.3f GB, reserved=%.3f GB)",
+                _allocated, _reserved,
+            )
+    except Exception as _e:
+        _logger.debug("stage_train: failed to log GPU memory / gradient config: %s", _e)
 
     # RFC-002 阶段 K：Trainer 构造参数
     def _build_trainer_kwargs(**overrides):
@@ -1248,6 +1949,18 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
             "accumulate_grad_batches": ctx.resolved.get("accumulate_grad_batches", 1),
             **ctx.distributed_kwargs,
         }
+        # P2-3: 从 config 读取 limit_train_batches / limit_val_batches
+        # 仅在非 None 时添加（默认 None 保持向后兼容，dry-run 动态校验时设为 1）
+        # 调用方可通过 overrides 覆盖（如自监督阶段 limit_val_batches=0）
+        _limit_train = getattr(ctx.config.trainer, "limit_train_batches", None)
+        _limit_val = getattr(ctx.config.trainer, "limit_val_batches", None)
+        if _limit_train is not None:
+            kwargs["limit_train_batches"] = _limit_train
+        if _limit_val is not None:
+            kwargs["limit_val_batches"] = _limit_val
+        # Part 4：自动 LR 标定注入 Trainer 构造参数
+        if ctx.config.trainer.auto_lr_find:
+            kwargs["auto_lr_find"] = True
         kwargs.update(overrides)
         return kwargs
 
@@ -1263,34 +1976,37 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
                     max_epochs=ss_epochs,
                     logger=ctx.csv_logger,
                     enable_checkpointing=False,
-                    limit_val_batches=0,
-                    **_build_trainer_kwargs(),
+                    **_build_trainer_kwargs(limit_val_batches=0),
                 )
             return pl.Trainer(
                 max_epochs=ss_epochs,
                 logger=ctx.csv_logger,
                 enable_checkpointing=False,
-                limit_val_batches=0,
-                **_build_trainer_kwargs(),
+                **_build_trainer_kwargs(limit_val_batches=0),
             )
         def _fit_ss(trainer):
             # 每次重新获取 dataloader，OOM 重试时反映新 batch_size
             trainer.fit(ctx.module, train_dataloaders=ctx.datamodule.train_dataloader())
         # RFC-005：存 SS Phase 1 Trainer 返回值，fit 后显式 _teardown 释放
+        # 修复（2.10）：非 OOM 异常时 ss_trainer 资源泄露——用 try/finally 确保
+        # 异常路径也 teardown。同时修复（2.9）：del 后加 gc.collect() 打断循环引用。
         ss_trainer = _fit_with_oom_fallback(ctx, _build_ss_trainer, _fit_ss)
-        if hasattr(ss_trainer, "_teardown"):
-            try:
-                ss_trainer._teardown()
-            except Exception:
-                pass
-        del ss_trainer
-
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-            torch.cuda.empty_cache()
+        try:
+            if hasattr(ss_trainer, "_teardown"):
+                try:
+                    ss_trainer._teardown()
+                except Exception:
+                    pass
+        finally:
+            del ss_trainer
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                torch.cuda.empty_cache()
 
         # Phase 2: 监督微调（P3: OOM 回退）
         ctx.module.phase = "supervised"
@@ -1347,6 +2063,62 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
         def _fit_supervised(trainer):
             trainer.fit(ctx.module, datamodule=ctx.datamodule, ckpt_path=resume_ckpt)
 
+        # Part 4（风险推演 R3）：自动 LR 标定。
+        # 用独立 tune_trainer 隔离副作用——trainer.tune() 内部跑 1 epoch 训练，
+        # 会触发回调写入 training_log、更新 metric 状态、可能触发 checkpoint。
+        # 用独立 Trainer（关闭 checkpoint/validation/logger）隔离，tune 后清理状态。
+        if ctx.config.trainer.auto_lr_find:
+            _logger.info("stage_train: auto_lr_find enabled, running LR Range Test...")
+            try:
+                tune_trainer = pl.Trainer(
+                    **_build_trainer_kwargs(
+                        max_epochs=1,
+                        enable_checkpointing=False,
+                        limit_val_batches=0,
+                        logger=False,
+                        enable_progress_bar=False,
+                        enable_model_summary=False,
+                    ),
+                    auto_lr_find=True,
+                )
+                tune_result = tune_trainer.tune(ctx.module, datamodule=ctx.datamodule)
+                suggestion = tune_result.get("lr_find", {}).get("suggestion")
+                if suggestion is not None:
+                    ctx.module.learning_rate = suggestion
+                    ctx.resolved["learning_rate"] = suggestion
+                    _logger.info(
+                        "stage_train: auto_lr_find suggested lr=%.6f", suggestion
+                    )
+                else:
+                    _logger.warning(
+                        "stage_train: auto_lr_find failed to suggest lr, using default"
+                    )
+                # 清理 tune_trainer（释放显存）
+                del tune_trainer
+                import gc; gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # 清理 tune 期间的副作用：清空 training_log + 重置累加器
+                # tune_trainer.tune() 会触发 on_train_epoch_end 写入 epoch 0 entry
+                ctx.module.training_log.clear()
+                ctx.module._current_epoch_loss = 0.0
+                ctx.module._current_epoch_steps = 0
+                ctx.module._current_val_epoch_loss = 0.0
+                ctx.module._current_val_epoch_steps = 0
+                ctx.module._has_validation_run = False
+                # 重置 metric 状态（tune 期间更新了 torchmetrics）
+                for metric_dict in [ctx.module.train_metrics, ctx.module.val_metrics]:
+                    for name in metric_dict:
+                        try:
+                            metric_dict[name].reset()
+                        except Exception:
+                            pass
+                _logger.info("stage_train: auto_lr_find done, training_log cleared, starting fit")
+            except Exception as e:
+                _logger.warning(
+                    "stage_train: auto_lr_find failed: %s, using default lr", e
+                )
+
         ctx.trainer = _fit_with_oom_fallback(ctx, _build_supervised_trainer, _fit_supervised)
 
     # 训练结束：停止计时器 + 提取 checkpoint 信息到 first-class 字段
@@ -1356,7 +2128,82 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
         if isinstance(cb, ModelCheckpoint):
             ctx.best_model_path = cb.best_model_path or None
             ctx.best_model_score = float(cb.best_model_score) if cb.best_model_score is not None else None
+            # 任务1（P0）：从 best_model_path 文件名解析 best_epoch。
+            # ModelCheckpoint filename 格式 "best-{epoch}-{val_loss:.3f}" 实际生成
+            # "best-epoch=14-val_loss=0.066.ckpt"，用正则 r"epoch=(\d+)" 解析 epoch 号。
+            # 解析失败时回退到 len(module.training_log)（最后完成的 epoch 号，1-based）。
+            # best_epoch 用于 stage_eval 的 analyze_training_result 取 best epoch 那轮
+            # train 指标，与 final_eval 的 val 指标配对算 gap，避免数据源不一致的过拟合误报。
+            if ctx.best_model_path:
+                import re as _re
+                _m = _re.search(r"epoch=(\d+)", ctx.best_model_path)
+                if _m:
+                    ctx.best_epoch = int(_m.group(1))
+                else:
+                    _tl = getattr(ctx.module, "training_log", None) if ctx.module else None
+                    ctx.best_epoch = len(_tl) if _tl else None
+            else:
+                ctx.best_epoch = None
             break
+
+    # 修复：best model 加载回 ctx.model。
+    # 旧逻辑训练结束后 ctx.model 仍是最后一代权重，导出的 model.pth 是最后一代
+    # 而非最优，final_eval 反映最后一代性能（可能因 early stopping 远差于 best）。
+    # 改为：若有 best checkpoint，加载回 ctx.model，确保后续 export/eval 用最优权重。
+    if ctx.best_model_path:
+        import os
+        if os.path.exists(ctx.best_model_path):
+            try:
+                # Lightning checkpoint 含 state_dict + optimizer + scheduler 等，
+                # 加载时只取 state_dict，避免 optimizer/scheduler 状态覆盖
+                ckpt = torch.load(ctx.best_model_path, map_location="cpu", weights_only=False)
+                state_dict_key = "state_dict"
+                if state_dict_key in ckpt:
+                    # LightningModule 的 state_dict 键前缀是 "model."，去掉后加载到裸 model
+                    raw_state = {k[len("model."):]: v for k, v in ckpt[state_dict_key].items()
+                                 if k.startswith("model.")}
+                    if raw_state:
+                        ctx.model.load_state_dict(raw_state)
+                        _logger.info(
+                            f"stage_train: loaded best model weights from {ctx.best_model_path} "
+                            f"into ctx.model (best_score={ctx.best_model_score})"
+                        )
+                    else:
+                        _logger.warning(
+                            f"stage_train: best checkpoint {ctx.best_model_path} has no "
+                            f"'model.' prefixed keys in state_dict, skip loading"
+                        )
+                else:
+                    _logger.warning(
+                        f"stage_train: best checkpoint {ctx.best_model_path} missing "
+                        f"'state_dict' key, skip loading"
+                    )
+            except Exception as e:
+                _logger.warning(
+                    f"stage_train: failed to load best checkpoint {ctx.best_model_path}: {e}",
+                    exc_info=True,
+                )
+        else:
+            _logger.warning(
+                f"stage_train: best_model_path does not exist: {ctx.best_model_path}"
+            )
+
+    # P0-1 防御性兜底：stage_train 后冻结 intermediate_values
+    # 防止 stage_eval 的 trainer.validate() 触发 IntermediateMetricLogger 写入
+    ctx.intermediate_values = FrozenDict(ctx.intermediate_values)
+    _logger.info(
+        "intermediate_values frozen with %d entries after stage_train",
+        len(ctx.intermediate_values),
+    )
+
+    # P1-4: stage 出口摘要日志
+    _logger.info(
+        "stage_train output: best_model_score=%s, best_model_path=%s, "
+        "training_duration_s=%s, intermediate_values_count=%d",
+        ctx.best_model_score, ctx.best_model_path,
+        ctx.training_duration_s,
+        len(ctx.intermediate_values),
+    )
 
     return ctx
 
@@ -1366,10 +2213,29 @@ def analyze_training_result(
     training_log: List[Any],
     early_stopped: bool,
     task_type: str = "classification",
+    best_epoch: Optional[int] = None,
 ) -> Dict[str, Any]:
     """分析训练结果，输出结构化反馈（RFC-002 阶段 L）。
 
     闭合探索-反馈回路：eval 结果 → 失败分类 + 改进建议 → Agent 调整策略。
+
+    任务1（P0）修复：新增 best_epoch 参数。旧逻辑反向遍历 training_log 找
+    **最后一轮**的 train/val 指标算 gap，但 final_eval 来自 best checkpoint
+    （stage_train 已加载 best 权重到 ctx.model），两个数据源不一致导致过拟合误报
+    （实测 best epoch val=0.982 但末轮 val=0.823，gap=0.161 误报 overfitting）。
+    修复后：若 best_epoch 提供，从 training_log 找 entry["epoch"] == best_epoch
+    的条目，用该条目的 train/val 指标算 gap，数据源与 final_eval 一致。
+
+    对称性修复：新增 val-test gap 泛化分析。P2-3 修复后 val/test 分离，
+    final_eval 同时含 val_* 和 test_* 指标。val-test gap 过大表示
+    模型在 val 上调参（early_stopping）后在 test 上泛化能力下降。
+
+    Args:
+        final_eval: 最终评估指标（含 val_* 和 test_* 前缀）
+        training_log: 训练日志（每 epoch 1 条）
+        early_stopped: 是否早停
+        task_type: 任务类型（classification/regression）
+        best_epoch: best checkpoint 的 epoch 号（None 时回退到末轮逻辑）
 
     Returns:
         {"status", "diagnosis", "suggestions"}
@@ -1390,18 +2256,43 @@ def analyze_training_result(
                 ],
             }
 
-    # 2. 从 training_log 提取末轮 train/val metric
+    # 2. 从 training_log 提取 train/val metric
+    # 修复（任务1 / P0）：feedback 基于 best epoch 而非 final epoch。
+    # 旧逻辑反向遍历找最后一轮的 train/val 指标算 gap，但 final_eval 来自 best
+    # checkpoint（stage_train 已加载 best 权重），两数据源不一致导致过拟合误报。
+    # 修复：若 best_epoch 提供，从 training_log 找 entry["epoch"] == best_epoch
+    # 的条目，用该条目的 train/val 指标算 gap，数据源与 final_eval 一致。
+    # best_epoch 为 None 或找不到对应条目时回退原逻辑（反向遍历找最后一轮）。
+    # Part 3（风险推演 R1）：过滤掉 final_eval 行，避免回退反向遍历取到
+    # final validation 的 val_accuracy（来自 best checkpoint）与 epoch N 的
+    # train_accuracy 错配，重新引入数据源不一致问题。
+    # phase 字段可选，默认 "train_val"（向后兼容无 phase 字段的旧 entry）。
+    trainable_log = [
+        e for e in (training_log if isinstance(training_log, list) else [])
+        if isinstance(e, dict) and e.get("phase", "train_val") != "final_eval"
+    ]
     last_train_acc = None
     last_val_acc = None
-    for entry in reversed(training_log) if isinstance(training_log, list) else []:
-        if not isinstance(entry, dict):
-            continue
-        if last_train_acc is None:
-            last_train_acc = entry.get("train_accuracy") or entry.get("train_acc")
-        if last_val_acc is None:
-            last_val_acc = entry.get("val_accuracy") or entry.get("val_acc")
-        if last_train_acc is not None and last_val_acc is not None:
-            break
+    best_entry = None
+    if best_epoch is not None:
+        for entry in trainable_log:
+            if isinstance(entry, dict) and entry.get("epoch") == best_epoch:
+                best_entry = entry
+                break
+    if best_entry is not None:
+        last_train_acc = best_entry.get("train_accuracy") or best_entry.get("train_acc")
+        last_val_acc = best_entry.get("val_accuracy") or best_entry.get("val_acc")
+    else:
+        # 回退：反向遍历找最后一轮
+        for entry in reversed(trainable_log):
+            if not isinstance(entry, dict):
+                continue
+            if last_train_acc is None:
+                last_train_acc = entry.get("train_accuracy") or entry.get("train_acc")
+            if last_val_acc is None:
+                last_val_acc = entry.get("val_accuracy") or entry.get("val_acc")
+            if last_train_acc is not None and last_val_acc is not None:
+                break
 
     val_acc = final_eval.get("val_accuracy") or final_eval.get("accuracy") or last_val_acc
 
@@ -1434,6 +2325,27 @@ def analyze_training_result(
                 ],
             }
 
+    # 对称性修复：val-test gap 泛化分析
+    # P2-3 修复后 val/test 分离，final_eval 同时含 val_* 和 test_* 指标
+    # val-test gap 过大表示模型在 val 上调参（early_stopping）后在 test 上泛化能力下降
+    _test_acc = final_eval.get("test_accuracy") or final_eval.get("test_acc")
+    if (val_acc is not None and _test_acc is not None
+            and task_type == "classification"):
+        val_test_gap = val_acc - _test_acc
+        if val_test_gap > 0.10:
+            return {
+                "status": "generalization_gap",
+                "diagnosis": (f"val-test gap {val_test_gap:.3f}"
+                              f"（val={val_acc:.3f}, test={_test_acc:.3f}），"
+                              f"模型在 val 上调参后 test 泛化能力下降"),
+                "suggestions": [
+                    "增大 val_split_ratio（如 0.1 → 0.2）以获得更稳健的 val 估计",
+                    "检查 val/test 分布是否一致（domain shift）",
+                    "使用 k-fold 交叉验证替代单次 split",
+                    "增大 early_stopping patience 容忍 val 波动",
+                ],
+            }
+
     # 5. 已收敛：早停
     if early_stopped:
         return {
@@ -1461,7 +2373,8 @@ def analyze_training_result(
     name="eval",
     reads=["config", "trainer", "module", "datamodule",
            "task_spec", "exploration_history", "learning_mode"],
-    writes=["output", "exploration_history"],  # P2.1: 对齐函数体（写 exploration_history.feedback）
+    writes=["output", "exploration_history",  # P2.1: 对齐函数体（写 exploration_history.feedback）
+            "final_eval", "training_log", "early_stopped", "feedback"],  # 任务3：补报 stage_eval 写入字段
     description="Stage 7: 评估",
 )
 def stage_eval(ctx: PipelineContext) -> PipelineContext:
@@ -1471,19 +2384,49 @@ def stage_eval(ctx: PipelineContext) -> PipelineContext:
     """
     is_self_supervised = (ctx.learning_mode == "self_supervised")
 
+    # 修复（2.7）：_is_final_validation 标志在 trainer.validate() 完成后必须 reset，
+    # 否则模块复用时（如 HPO 多 trial 复用同一 module）状态污染，后续训练中验证
+    # 误走 final_validation 路径。用 try/finally 确保异常时也 reset。
     ctx.module._is_final_validation = True
-    if is_self_supervised:
-        ctx.trainer.validate(ctx.module, dataloaders=ctx.datamodule.val_dataloader())
-    else:
-        ctx.trainer.validate(ctx.module, datamodule=ctx.datamodule)
+    try:
+        if is_self_supervised:
+            ctx.trainer.validate(ctx.module, dataloaders=ctx.datamodule.val_dataloader())
+        else:
+            ctx.trainer.validate(ctx.module, datamodule=ctx.datamodule)
+    finally:
+        ctx.module._is_final_validation = False
 
-    # 收集结果
+    # 对称性修复：在 trainer.validate() 后新增 trainer.test() 调用
+    # P2-3 修复后 val/test 分离，test 集需要独立评估以报告泛化能力
+    # trainer.test() 触发 test_step → on_test_epoch_end，存储 _last_test_metrics
+    # get_final_metrics 会合并 val_* 和 test_* 指标
+    ctx.module._is_final_test = True
+    try:
+        if is_self_supervised:
+            ctx.trainer.test(ctx.module, dataloaders=ctx.datamodule.test_dataloader())
+        else:
+            ctx.trainer.test(ctx.module, dataloaders=ctx.datamodule.test_dataloader())
+    finally:
+        ctx.module._is_final_test = False
+
+    # 收集结果（get_final_metrics 现在合并 val_* 和 test_* 指标）
     final_eval = ctx.module.get_final_metrics()
     training_log = ctx.module.training_log
     early_stopped = any(
         isinstance(cb, EarlyStopping) and cb.stopped_epoch >= 0
         for cb in ctx.trainer.callbacks
     )
+    # 修复（5.8）：early stopping 触发时无日志，加 INFO 留痕
+    if early_stopped:
+        stopped_epoch = -1
+        for cb in ctx.trainer.callbacks:
+            if isinstance(cb, EarlyStopping) and cb.stopped_epoch >= 0:
+                stopped_epoch = cb.stopped_epoch
+                break
+        _logger.info(
+            f"early stopping triggered at epoch {stopped_epoch} "
+            f"(monitor={getattr(cb, 'monitor', 'val_loss')})"
+        )
 
     # 保存结果到 first-class 字段
     ctx.final_eval = final_eval
@@ -1492,8 +2435,12 @@ def stage_eval(ctx: PipelineContext) -> PipelineContext:
 
     # RFC-002 阶段 L：结构化反馈（失败分类 + 改进建议），闭合探索-反馈回路
     task_type = ctx.task_spec.task_type if ctx.task_spec else "classification"
+    # 任务1（P0）：传入 best_epoch，让 analyze_training_result 从 training_log
+    # 取 best epoch 那轮的 train 指标，与 final_eval 的 val 指标配对算 gap，
+    # 避免数据源不一致（final epoch train vs best checkpoint val）导致过拟合误报。
     ctx.feedback = analyze_training_result(
         final_eval, training_log, early_stopped, task_type=task_type,
+        best_epoch=ctx.best_epoch,
     )
 
     # RFC-002 阶段 R：feedback 回写到最近一次探索试验，闭合"训练→反馈→推荐"回路
@@ -1519,6 +2466,17 @@ def stage_eval(ctx: PipelineContext) -> PipelineContext:
         record_training_metric(ML_VAL_LOSS, value=float(_val_loss),
                                stage="eval", model_id=ctx.config.scene.model_id,
                                dataset=ctx.config.scene.dataset)
+    # 对称性修复：test 指标 OTel 埋点（与 val 对称）
+    _test_acc = final_eval.get("test_accuracy") or final_eval.get("test_acc")
+    _test_loss = final_eval.get("test_loss")
+    if _test_acc is not None:
+        record_training_metric(ML_TEST_ACCURACY, value=float(_test_acc),
+                               stage="eval", model_id=ctx.config.scene.model_id,
+                               dataset=ctx.config.scene.dataset)
+    if _test_loss is not None:
+        record_training_metric(ML_TEST_LOSS, value=float(_test_loss),
+                               stage="eval", model_id=ctx.config.scene.model_id,
+                               dataset=ctx.config.scene.dataset)
     # 记录 trial count
     record_trial_metric(
         ML_TRIAL_COUNT, value=len(ctx.exploration_history),
@@ -1528,14 +2486,64 @@ def stage_eval(ctx: PipelineContext) -> PipelineContext:
     return ctx
 
 
+def _merge_metrics_csv(csv_path: Path) -> None:
+    """合并 Lightning CSVLogger 的 train+val 分行为 1 行/epoch（任务4 / P2）。
+
+    根因：Lightning CSVLogger 在 on_train_epoch_end 和 on_validation_epoch_end
+    分别写入一行，导致每 epoch 有 2 行（train 行含 train_* 指标但 val_* 为空，
+    val 行含 val_* 指标但 train_* 为空）。这与 training_log.jsonl 的 1 行/epoch
+    格式不一致，下游消费者（如 Agent 分析、manifest 校验）难以对齐。
+
+    合并后：每 epoch 1 行，train_* 和 val_* 在同一行，与 training_log.jsonl 对齐。
+    同一 epoch 的多行合并时，非空值覆盖空值（train 行的 train_* + val 行的 val_*）。
+    """
+    import csv
+    lines = csv_path.read_text(encoding='utf-8').splitlines()
+    if not lines:
+        return
+    reader = csv.DictReader(lines)
+    fieldnames = reader.fieldnames
+    if not fieldnames:
+        return
+
+    # 按 epoch 聚合：同一 epoch 的多行合并，非空值覆盖空值
+    merged = {}  # epoch -> row dict
+    epoch_order = []
+    for row in reader:
+        try:
+            ep = int(float(row.get('epoch', 0)))
+        except (ValueError, TypeError):
+            continue
+        if ep not in merged:
+            merged[ep] = {'epoch': ep}
+            epoch_order.append(ep)
+        for k, v in row.items():
+            if k == 'epoch':
+                continue
+            if v is not None and v != '':
+                merged[ep][k] = v
+
+    # 覆写 csv 文件
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for ep in epoch_order:
+            writer.writerow(merged[ep])
+
+
 @stage(
     name="export",
     reads=["config", "model", "module", "output", "output_dir",
            "scene", "scene_info", "scene_kwargs", "meta", "report",
            "route_level", "task_spec", "feature_spec", "resolved",
            "log_writer", "exploration_history", "num_classes",
-           "model_id", "dataset", "learning_mode"],
-    writes=["output"],
+           "model_id", "dataset", "learning_mode",
+           # 任务3：补报 stage_export 读取字段（函数体实际访问的 ctx.xxx）
+           "bundle", "data_profile",
+           "training_duration_s", "best_model_path", "best_model_score",
+           # 方案 B：显存探测结果写入 metadata.resource.vram_probe
+           "vram_probe_result"],
+    writes=["output", "artifact_registry"],  # 任务3：补报 artifact_registry（register_artifact 写入）
     description="Stage 8: 导出",
 )
 def stage_export(ctx: PipelineContext) -> PipelineContext:
@@ -1543,6 +2551,24 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
     final_eval = ctx.final_eval
     training_log = ctx.training_log
     early_stopped = ctx.early_stopped
+
+    # P1-1: training_log schema 校验（拦截 LR 污染等类型错误）
+    # strict_schema=True 时校验失败直接抛错；False 时降级保留原始 entry
+    validated_log: List[Any] = []
+    for entry in training_log:
+        try:
+            validated_entry = validate_training_log_entry(entry)
+            validated_log.append(validated_entry.to_dict())
+        except (ValueError, TypeError) as e:
+            _logger.error(
+                f"training_log entry failed schema validation: {e}",
+                exc_info=True,
+            )
+            if getattr(ctx.config, "strict_schema", False):
+                raise
+            validated_log.append(entry)  # 保留原始（可能含污染）
+    # 后续产物写入（ctx.output.training["log"] / metrics.csv）使用校验后的版本
+    training_log = validated_log
 
     # 保存模型 + metadata
     model_path = None
@@ -1572,14 +2598,42 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
             "normalization": normalization_info,
             "label_map": {str(k): v for k, v in label_map.items()},
             "manifest": manifest_info,
-            "config": ctx.resolved,
+            # metadata.config 是完整配置快照，供实验复现与下游消费者（generate_inference 等）使用。
+            # 根因修复：ctx.resolved 仅含路由运行时字段（device/batch_size/precision/...），
+            # 缺失 14 个训练级字段（epochs/seed/deterministic/max_time/...）和场景级字段（data_root/...）。
+            # 方案 D：合并 experiment_config_to_dict(ctx.config)（声明式配置完整快照）
+            # 与 ctx.resolved（路由解析后实际生效值），重叠字段以 ctx.resolved 为准。
+            # 这样复现所需字段（epochs/seed/data_root/learning_mode/...）全部进入 metadata.config，
+            # 且未来 ExperimentConfig 新增字段自动进入，无需逐字段补录。
+            "config": {
+                **experiment_config_to_dict(ctx.config),
+                **ctx.resolved,
+            },
             "metrics": list(final_eval.keys()),
             "final_eval": final_eval,
+            # 对称性修复：显式提取 test_eval 字段，便于下游消费者直接访问 test 指标
+            "test_eval": {
+                k: v for k, v in final_eval.items()
+                if k.startswith("test_")
+            } if any(k.startswith("test_") for k in final_eval) else None,
             "env": build_env_snapshot(ctx.resolved, {"seed": ctx.config.trainer.seed}),
-            "resource": ctx.report.to_dict(),
+            "resource": {
+                **ctx.report.to_dict(),
+                # 方案 B：动态显存探测结果（stage_probe_vram 写入）
+                # None/跳过时记 skipped 原因；探测成功时含 measured_vram_mb/needed_vram_mb/free_vram_mb/ok
+                "vram_probe": ctx.vram_probe_result,
+            },
             "route_level": ctx.route_level,
             "task_spec": ctx.task_spec.to_dict(),
             "feature_spec": ctx.feature_spec.to_dict(),
+            # Part 2：best checkpoint 溯源 + epoch 利用率（风险推演 R1/R4）
+            # best_epoch/best_model_path/best_model_score 从 ctx 读取（stage_train 写入）
+            # epoch_utilization = best_epoch / epochs，供 Agent 判断预算是否合理
+            # （<0.3 预算过大，>0.9 预算不足）
+            "best_epoch": ctx.best_epoch,
+            "best_model_path": ctx.best_model_path,
+            "best_model_score": ctx.best_model_score,
+            "epoch_utilization": round(ctx.best_epoch / ctx.config.trainer.epochs, 3) if ctx.best_epoch and ctx.config.trainer.epochs else None,
             "created_at": datetime.now().isoformat(),
         }
         (ctx.output_dir / "metadata.json").write_text(
@@ -1650,6 +2704,15 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
     # RFC-002 阶段 L + P1.5：持久化探索历史 + 结构化反馈 + 自动推荐，闭合探索-反馈回路
     feedback = ctx.feedback
     if feedback:
+        # 对称性修复：在 feedback 中附加 test 指标摘要
+        # P2-3 修复后 val/test 分离，feedback 应同时包含 val 和 test 指标
+        if ctx.final_eval:
+            _test_metrics_summary = {
+                k: v for k, v in ctx.final_eval.items()
+                if k.startswith("test_") and not k.startswith("test_confusion")
+            }
+            if _test_metrics_summary:
+                feedback["test_metrics"] = _test_metrics_summary
         (ctx.output_dir / "feedback.json").write_text(
             json.dumps(feedback, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -1710,31 +2773,40 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
     except Exception as e:
         _logger.warning(f"Failed to save env_snapshot.json: {e}")
 
-    # 补齐 metrics.csv（从 training_log 派生，Grafana/Pandas 友好）
+    # 修复（任务4 / P1）：metrics.csv 双重写入修复。
+    # 旧逻辑：此处手动写顶层 metrics.csv，与 CSVLogger（build_logger 中
+    # CSVLogger(save_dir=output_dir, name="metrics", version="")）写入的
+    # metrics/metrics.csv 内容重复，导致运行目录同时存在两份相同 metrics.csv。
+    # 方案：删除手动顶层写入，仅注册 CSVLogger 产出的 metrics/metrics.csv 为产物。
+    # CSVLogger 在训练过程中按 epoch 增量写入，内容与 training_log 一致。
     if training_log:
-        try:
-            import csv as _csv
-            metrics_csv_path = ctx.output_dir / "metrics.csv"
-            # 收集所有可能的字段名（union of keys across entries）
-            fieldnames: list = []
-            for entry in training_log:
-                if isinstance(entry, dict):
-                    for k in entry.keys():
-                        if k not in fieldnames:
-                            fieldnames.append(k)
-            with open(metrics_csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = _csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                for entry in training_log:
-                    if isinstance(entry, dict):
-                        writer.writerow({k: entry.get(k, "") for k in fieldnames})
+        # 修复（任务3 / P2）：CSVLogger 的 finalize 在 Pipeline.run finally 块中调用，
+        # 晚于 stage_export，导致 metrics.csv 未 flush 时注册 artifact 失败
+        # （warning "CSVLogger metrics.csv not found"）。
+        # 方案：在注册 metrics artifact 前先 finalize csv_logger，确保文件已落盘。
+        if ctx.csv_logger is not None:
+            _finalize_lightning_logger(ctx.csv_logger)
+
+        csv_logger_metrics_path = ctx.output_dir / "metrics" / "metrics.csv"
+        if csv_logger_metrics_path.exists():
+            # 修复（任务4 / P2）：合并 metrics.csv 的 train+val 分行为 1 行/epoch，
+            # 与 training_log.jsonl 格式对齐。Lightning CSVLogger 在
+            # on_train_epoch_end 和 on_validation_epoch_end 分别写入一行，
+            # 导致每 epoch 有 2 行（train 行 + val 行），合并后每 epoch 1 行。
+            try:
+                _merge_metrics_csv(csv_logger_metrics_path)
+            except Exception as e:
+                _logger.warning("Failed to merge metrics.csv rows: %s", e)
             ctx.register_artifact(
-                "metrics", metrics_csv_path,
-                kind="metrics", producer_stage="stage_export",
+                "metrics", csv_logger_metrics_path,
+                kind="metrics", producer_stage="stage_build",
                 content_schema=_TRAINING_LOG_ENTRY_SCHEMA,
             )
-        except Exception as e:
-            _logger.warning(f"Failed to save metrics.csv: {e}")
+        else:
+            _logger.warning(
+                "CSVLogger metrics.csv not found at %s; metrics artifact not registered",
+                csv_logger_metrics_path,
+            )
 
     # 注册核心产物（model/metadata/config/training_log/feedback/exploration）
     if model_path is not None:
@@ -1748,7 +2820,9 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
         ctx.register_artifact(
             "model_metadata", metadata_path,
             kind="metadata", producer_stage="stage_export",
-            content_schema={"model_id": str, "dataset": str, "final_eval": dict},
+            # 对称性修复：final_eval 现在含 val_* 和 test_* 指标
+            content_schema={"model_id": str, "dataset": str, "final_eval": dict,
+                            "test_eval": dict},
         )
     config_yaml_path = ctx.output_dir / "config.yaml"
     if config_yaml_path.exists():
@@ -1769,7 +2843,9 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
         ctx.register_artifact(
             "feedback", feedback_path,
             kind="feedback", producer_stage="stage_eval",
-            content_schema={"status": str, "diagnosis": str, "suggestions": list},
+            # 对称性修复：content_schema 新增 test_metrics 字段
+            content_schema={"status": str, "diagnosis": str, "suggestions": list,
+                            "test_metrics": dict},
         )
     exploration_path = ctx.output_dir / "exploration.json"
     if exploration_path.exists():
@@ -1791,7 +2867,8 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
 
 # P0.2：不可序列化 stage — 产出对象引用（bundle/model/trainer）无法从 JSON checkpoint 恢复。
 # resume 时这些 stage 必须强制重跑，仅跳过纯计算 stage（validate/preflight/resolve）。
-_NON_SERIALIZABLE_STAGES = frozenset({"load", "build", "train"})
+# probe_vram 依赖 ctx.model/ctx.datamodule 对象引用，同样不可序列化恢复。
+_NON_SERIALIZABLE_STAGES = frozenset({"load", "build", "probe_vram", "train"})
 
 # P2：pipeline checkpoint 版本号，结构变更时递增
 _PIPELINE_VERSION = "2.0"
@@ -1814,6 +2891,36 @@ def _compute_config_hash(config: ExperimentConfig) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+def _compute_data_hash(data_root: str) -> str:
+    """计算数据集目录的元数据哈希（任务2）。
+
+    性能策略：不读取文件内容做全量 hash，只 hash 元数据
+    （排序后的文件相对路径 + 文件大小 + 文件 mtime 的拼接）。
+    大数据集（10k+ 文件）仍可在秒级完成。
+
+    Args:
+        data_root: 数据集根目录路径
+
+    Returns:
+        SHA256 十六进制字符串；目录不存在或为空时返回空字符串
+    """
+    root = Path(data_root)
+    if not root.exists():
+        return ""
+
+    entries = []
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            rel = path.relative_to(root).as_posix()
+            stat = path.stat()
+            entries.append(f"{rel}|{stat.st_size}|{stat.st_mtime}")
+
+    if not entries:
+        return ""
+
+    return sha256_str("\n".join(entries))
+
+
 # ============================================================
 # RFC-004 方案 G：manifest.json 生成
 # ============================================================
@@ -1832,15 +2939,23 @@ def _generate_manifest(ctx: PipelineContext) -> Optional[Path]:
     except Exception:
         sf_version = "unknown"
 
+    # 任务1：config_hash 覆盖声明式配置 + 路由解析后实际生效值。
+    # 旧逻辑仅 hash ExperimentConfig，不含 ctx.resolved（路由后的
+    # device/batch_size/precision/...），导致同名配置不同路由产生相同
+    # config_hash，溯源无法区分。合并后 config_hash 唯一标识运行时配置。
     try:
         config_hash = sha256_str(
-            json.dumps(experiment_config_to_dict(ctx.config), sort_keys=True, default=str)
+            json.dumps(
+                {**experiment_config_to_dict(ctx.config), **ctx.resolved},
+                sort_keys=True, default=str,
+            )
         )
     except Exception:
         config_hash = ""
 
-    # data_hash：可选，大数据集采样 hash（此处留空，未来 DVC 集成时填充）
-    data_hash = ""
+    # 任务2：data_hash 从 ctx.data_hash 读取（stage_load 计算的数据集元数据哈希）。
+    # 旧逻辑恒为空字符串，manifest.data_hash 无溯源价值。
+    data_hash = ctx.data_hash or ""
 
     manifest = ArtifactManifest(
         run_id=str(uuid.uuid4()),
@@ -1852,6 +2967,60 @@ def _generate_manifest(ctx: PipelineContext) -> Optional[Path]:
         artifacts=list(ctx.artifact_registry),  # copy
     )
     return manifest.save(ctx.output_dir)
+
+
+def _classify_runtime_error(e: Exception, stage_name: str) -> Exception:
+    """根据异常类型和 stage 上下文重新分类为具体 SenseFrame 异常类（任务4）。
+
+    Pipeline.run 的 except 块捕获 Exception 后，调用此函数将通用异常
+    包装为具体异常类（OOMError/ModelBuildError/TrainingError/
+    DataCorruptedError/CheckpointError/SaveError），使 Agent 可基于
+    异常类型做精确恢复决策（如 OOM → 降 batch_size，Checkpoint → 删旧 ckpt）。
+
+    分类优先级（从高到低）：
+    1. torch.cuda.OutOfMemoryError → OOMError
+    2. stage="build" + RuntimeError → ModelBuildError
+    3. stage="train" + RuntimeError → TrainingError
+    4. stage="load" + "corrupt" in msg → DataCorruptedError
+    5. "checkpoint" / ".ckpt" in msg → CheckpointError
+    6. "save" / "permission" in msg → SaveError
+    7. 其他 → 保持原异常
+
+    Args:
+        e: 原始异常
+        stage_name: 当前执行的 stage 名（如 "build" / "train" / "load"）
+
+    Returns:
+        重新分类后的异常（具体异常类实例或原异常）
+    """
+    msg = str(e).lower()
+
+    # 1. torch.cuda.OutOfMemoryError → OOMError（最高优先级，任何 stage 都需精确识别）
+    if isinstance(e, getattr(torch.cuda, "OutOfMemoryError", type(None))):
+        return OOMError(str(e))
+
+    # 2. stage="build" 且 RuntimeError → ModelBuildError
+    if stage_name == "build" and isinstance(e, RuntimeError):
+        return ModelBuildError(str(e))
+
+    # 3. stage="train" 且 RuntimeError → TrainingError
+    if stage_name == "train" and isinstance(e, RuntimeError):
+        return TrainingError(str(e))
+
+    # 4. stage="load" 且 "corrupt" in msg → DataCorruptedError
+    if stage_name == "load" and "corrupt" in msg:
+        return DataCorruptedError(str(e))
+
+    # 5. "checkpoint" / ".ckpt" in msg → CheckpointError
+    if "checkpoint" in msg or ".ckpt" in msg:
+        return CheckpointError(str(e))
+
+    # 6. "save" / "permission" in msg → SaveError
+    if "save" in msg or "permission" in msg:
+        return SaveError(str(e))
+
+    # 7. 其他 → 保持原异常
+    return e
 
 
 # ============================================================
@@ -1880,6 +3049,7 @@ class Pipeline:
             ("load", stage_load),
             ("resolve", stage_resolve),
             ("build", stage_build),
+            ("probe_vram", stage_probe_vram),
             ("train", stage_train),
             ("eval", stage_eval),
             ("export", stage_export),
@@ -1887,32 +3057,59 @@ class Pipeline:
 
     def replace_stage(self, name: str, fn: StageFn) -> "Pipeline":
         """替换指定 stage。"""
+        # 修复（5.5）：replace_stage 完全静默，加 INFO 日志记录替换操作
+        found = any(n == name for n, _ in self.stages)
         self.stages = [(n, fn if n == name else f) for n, f in self.stages]
+        _logger.info(
+            f"Pipeline.replace_stage: stage='{name}', found={found}, "
+            f"new_fn={getattr(fn, '__name__', repr(fn))}"
+        )
         return self
 
     def before(self, name: str, hook: StageFn) -> "Pipeline":
         """在指定 stage 前插入 hook。"""
+        # 修复（5.5）：before 完全静默，加 INFO 日志记录插入操作
         new_stages = []
+        inserted = False
         for n, f in self.stages:
             if n == name:
                 new_stages.append((f"before_{name}", hook))
+                inserted = True
             new_stages.append((n, f))
         self.stages = new_stages
+        _logger.info(
+            f"Pipeline.before: inserted hook before stage='{name}', "
+            f"inserted={inserted}, hook_fn={getattr(hook, '__name__', repr(hook))}"
+        )
         return self
 
     def after(self, name: str, hook: StageFn) -> "Pipeline":
         """在指定 stage 后插入 hook。"""
+        # 修复（5.5）：after 完全静默，加 INFO 日志记录插入操作
         new_stages = []
+        inserted = False
         for n, f in self.stages:
             new_stages.append((n, f))
             if n == name:
                 new_stages.append((f"after_{name}", hook))
+                inserted = True
         self.stages = new_stages
+        _logger.info(
+            f"Pipeline.after: inserted hook after stage='{name}', "
+            f"inserted={inserted}, hook_fn={getattr(hook, '__name__', repr(hook))}"
+        )
         return self
 
     def skip(self, name: str) -> "Pipeline":
         """跳过指定 stage。"""
+        # 修复（5.5）：skip 完全静默，加 INFO 日志记录跳过操作
+        before_count = len(self.stages)
         self.stages = [(n, f) for n, f in self.stages if n != name]
+        removed = before_count - len(self.stages)
+        _logger.info(
+            f"Pipeline.skip: removed stage='{name}', removed_entries={removed}, "
+            f"stages_before={before_count}, stages_after={len(self.stages)}"
+        )
         return self
 
     def stages_with_spec(self) -> List[StageSpec]:
@@ -2000,14 +3197,38 @@ class Pipeline:
                     ))
         return dangling
 
-    def run(self, ctx: PipelineContext) -> StageResult:
+    def run(self, ctx: PipelineContext, *, dry_run: bool = False) -> StageResult:
         """执行 pipeline（P1：支持断点续跑）。
 
         依次执行所有 stage，返回最终结果。
         任一 stage 抛异常则停止并返回错误。
         每个 stage 完成后写 checkpoint；失败时也写 checkpoint（标记 failed_stage）。
         若 ctx.stage_checkpoint_path 存在，加载后跳过已完成的 stage。
+
+        Args:
+            ctx: Pipeline 上下文
+            dry_run: dry-run 标志（任务3），True 时 stage_train 跳过 trainer.fit()，
+                     仅输出训练 plan。也可直接在调用 run 前设置 ctx.dry_run=True。
         """
+        # 修复（任务3 / P0）：从 kwargs 设置 dry-run 标志到 ctx，
+        # 供 stage_train 检查后跳过 trainer.fit()，避免 dry-run 仍执行
+        # 完整 fit/validation/checkpoint 产生副作用。
+        if dry_run:
+            ctx.dry_run = True
+        # 修复（OTel 全链路失效）：Pipeline.run 入口调用 init_otel，
+        # 否则 record_training_metric 全部 no-op，所有 OTel 埋点失效。
+        # 旧逻辑 init_otel 从未在训练流程被调用，用户以为指标在采集实际全丢。
+        try:
+            from ...observability_otel import init_otel
+            init_otel(
+                pipeline_run_id=str(ctx.output_dir) if ctx.output_dir else "",
+                trial_id=getattr(ctx, "trial_id", "") or "",
+                model_id=ctx.config.scene.model_id if hasattr(ctx, "config") else "",
+                dataset=ctx.config.scene.dataset if hasattr(ctx, "config") else "",
+            )
+        except Exception as e:
+            _logger.warning(f"OTel init failed (training metrics will be no-op): {e}")
+
         # P1：加载 checkpoint（若存在）
         if ctx.stage_checkpoint_path and ctx.stage_checkpoint_path.exists():
             ckpt = json.loads(ctx.stage_checkpoint_path.read_text(encoding="utf-8"))
@@ -2046,23 +3267,53 @@ class Pipeline:
                     _logger.info(f"Skipping completed stage: {name}")
                     continue
 
+                # P0-1: 在 stage 边界设置 callback active 状态
+                # 仅对要执行的 stage 设置（被跳过的 stage 不需要）
+                if ctx.trainer is not None and hasattr(ctx.trainer, "callbacks"):
+                    for cb in ctx.trainer.callbacks:
+                        if isinstance(cb, StageAwareCallback):
+                            cb.set_active(name)
+                            _logger.debug(
+                                "callback %s active=%s in stage=%s",
+                                type(cb).__name__, cb.is_active(), name,
+                            )
+
+                # 修复（stage 边界日志 + stage duration Timer）：
+                # 旧逻辑无 stage starting/completed 边界日志，Agent 无法追踪执行进度；
+                # 旧逻辑 record_training_metric value=0.0 硬编码，stage duration 恒为 0。
+                # 改为：用 Timer 包裹 fn(ctx)，回填实际耗时到 OTel 指标 + 加边界日志。
+                _logger.info(f"[Stage {name}] starting")
+                stage_timer = Timer()
+                stage_timer.__enter__()
                 try:
                     ctx = fn(ctx)
+                    stage_timer.__exit__()
+                    stage_duration = round(stage_timer.elapsed, 3)
                     # P1：记录完成 + 写 checkpoint
                     ctx.completed_stages.append(name)
                     self._write_checkpoint(ctx)
-                    # P0.2: OBP 训练指标埋点（stage 完成时记录，OTel 未初始化时 no-op）
+                    # P0.2: OBP 训练指标埋点（stage 完成时记录实际耗时）
                     record_training_metric(
                         f"senseframe.stage.{name}.duration_s",
-                        value=0.0,  # Timer 在 stage_train 内部管理
+                        value=stage_duration,
                         stage=name,
                         model_id=ctx.config.scene.model_id if hasattr(ctx, "config") else "",
                         dataset=ctx.config.scene.dataset if hasattr(ctx, "config") else "",
                     )
+                    _logger.info(f"[Stage {name}] completed (duration={stage_duration}s)")
                 except Exception as e:
+                    try:
+                        stage_timer.__exit__()
+                    except Exception:
+                        pass
+                    _logger.error(f"[Stage {name}] failed: {e}", exc_info=True)
+                    # 任务4：根据异常类型和 stage 上下文重新分类为具体异常类
+                    # （OOMError/ModelBuildError/TrainingError/DataCorruptedError/
+                    # CheckpointError/SaveError），使 Agent 可基于异常类型精确恢复。
+                    actual_error = _classify_runtime_error(e, name)
                     # P1：记录失败 stage + 写 checkpoint
                     ctx.failed_stage = name
-                    ctx.failed_error = str(e)
+                    ctx.failed_error = repr(actual_error)
                     self._write_checkpoint(ctx, failed_stage=name)
 
                     # 异常时 traceback 落盘
@@ -2078,6 +3329,25 @@ class Pipeline:
                             (ctx.output_dir / "FAILED").write_text(tb, encoding="utf-8")
                             for p in ctx.output_dir.glob("*.pth"):
                                 p.unlink()
+                            # P3-5：重命名为 FAILED_ 前缀，隔离失败目录，
+                            # 避免失败目录的 manifest/checkpoint 干扰新 run 的扫描。
+                            # 保留全部失败信息（checkpoint、metrics、logs、traceback）
+                            # 供 resume 和诊断；更新 ctx.output_dir 指向新位置，
+                            # 让 finally 分支的 _generate_manifest 写入隔离目录。
+                            failed_dir = ctx.output_dir.parent / f"FAILED_{ctx.output_dir.name}"
+                            if not failed_dir.exists():
+                                ctx.output_dir.rename(failed_dir)
+                                _logger.info(
+                                    "P3-5: failed output_dir moved to %s", failed_dir
+                                )
+                                ctx.output_dir = failed_dir
+                                if ctx.output is not None:
+                                    ctx.output.output_dir = str(failed_dir)
+                            else:
+                                _logger.warning(
+                                    "P3-5: FAILED_ dir already exists: %s, keeping original",
+                                    failed_dir,
+                                )
                         except Exception:
                             pass
                     # 关闭日志写入器（release_resources 也会关闭，此处保留双保险）
@@ -2136,6 +3406,13 @@ class Pipeline:
                 json.dumps(data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            # 修复（5.6）：checkpoint 写入成功路径无日志，加 INFO 留痕
+            # 旧逻辑只在失败时 warning，成功路径完全静默，无法追踪 checkpoint 落盘时机
+            _logger.info(
+                f"checkpoint written: {ckpt_path} "
+                f"(completed_stages={len(ctx.completed_stages)}, "
+                f"failed_stage={failed_stage})"
+            )
         except Exception as e:
             _logger.warning(f"Failed to write pipeline checkpoint: {e}")
 
@@ -2155,6 +3432,7 @@ class Pipeline:
             "model_id", "dataset", "learning_mode", "num_classes",
             "trial_id", "parent_trial_id",
             "training_duration_s", "best_model_path", "best_model_score",
+            "best_epoch",  # Part 2：持久化 best_epoch
             "early_stopped", "failed_stage", "failed_error",
             "route_level",
         ]
@@ -2223,12 +3501,46 @@ class Pipeline:
 
         # 向后兼容：从 JSON checkpoint 恢复
         output_dir = Path(output_dir)
+        # P3-5：自动检测 FAILED_ 前缀。Pipeline.run 失败时将 output_dir 重命名
+        # 为 FAILED_{原名}；resume 时若原路径不存在但 FAILED_ 候选存在，则从
+        # 失败目录恢复（保留 checkpoint/metrics/logs 供续跑与诊断）。
+        if not output_dir.exists():
+            failed_candidate = output_dir.parent / f"FAILED_{output_dir.name}"
+            if failed_candidate.exists():
+                _logger.info(
+                    "P3-5: detected FAILED_ prefix, resuming from %s", failed_candidate
+                )
+                output_dir = failed_candidate
         ckpt_path = output_dir / "pipeline_checkpoint.json"
         if not ckpt_path.exists():
             raise FileNotFoundError(f"No pipeline checkpoint found at {ckpt_path}")
 
         ckpt = json.loads(ckpt_path.read_text(encoding="utf-8"))
         completed = ckpt.get("completed_stages", [])
+
+        # 任务5：读取 failed_error 做诊断，输出恢复建议。
+        # 不改变续跑行为（仍从 completed_stages 推断），仅增加诊断日志，
+        # 帮助 Agent 理解上次失败原因并采取针对性措施。
+        # failed_error 可能存于顶层（旧格式）或 stage_outputs 内（_serialize_stage_outputs）
+        stage_outputs = ckpt.get("stage_outputs", {})
+        failed_error = ckpt.get("failed_error") or stage_outputs.get("failed_error") or ""
+        if failed_error:
+            failed_error_lower = failed_error.lower()
+            if "oom" in failed_error_lower or "outofmemory" in failed_error_lower:
+                _logger.warning(
+                    "Resume: 上次运行因 OOM 失败，建议降低 batch_size "
+                    "(ctx.resolved['batch_size']) 或减少 num_workers 后重试"
+                )
+            if "datacorrupted" in failed_error_lower or "corrupt" in failed_error_lower:
+                _logger.warning(
+                    "Resume: 上次运行因数据损坏失败，建议检查数据集完整性 "
+                    "(文件是否完整、未损坏) 后重试"
+                )
+            if "checkpoint" in failed_error_lower:
+                _logger.warning(
+                    "Resume: 上次运行因 checkpoint 问题失败，建议检查 checkpoint "
+                    "文件是否损坏（可能需要删除旧 checkpoint 重新训练）"
+                )
 
         return pipeline, completed
 
@@ -2312,6 +3624,7 @@ __all__ = [
     "ArtifactManifest",
     "load_manifest",
     "verify_artifacts",
+    "verify_artifacts_recursive",
 ]
 
 
@@ -2340,3 +3653,19 @@ def verify_artifacts(output_dir) -> Dict[str, bool]:
         {产物名: hash 是否匹配}
     """
     return _verify_artifacts(Path(output_dir))
+
+
+def verify_artifacts_recursive(output_dir, max_depth: int = 3) -> Dict[str, Dict[str, bool]]:
+    """递归校验 output_dir 及子目录中所有 manifest.json 的产物 hash（P3-4）。
+
+    用于 HPO 多 trial 场景：output_dir/ 下可能有 trial_0/、trial_1/ 等子目录，
+    每个子目录有自己的 manifest.json。单 run 场景请用 verify_artifacts。
+
+    Args:
+        output_dir: 根输出目录
+        max_depth: 最大递归深度
+
+    Returns:
+        {子目录相对路径: {产物名: hash 是否匹配}}，根目录用 "." 表示
+    """
+    return _verify_artifacts_recursive(Path(output_dir), max_depth=max_depth)

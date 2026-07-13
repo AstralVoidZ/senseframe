@@ -30,6 +30,7 @@ from ..base import (
     SearchSpace,
     TransformConfig,
 )
+from ...common.transforms import ChainedTransform
 
 
 # ============================================================
@@ -478,24 +479,24 @@ class GenericContainer(SceneContainer):
         pipeline = transform_cfg_params.get("pipeline")
         augment = transform_cfg_params.get("augment")
         pipeline_params = transform_cfg_params.get("pipeline_params", {})
+        # P3 上策：从配置读取 seed，传递给 compose_transforms 创建独立 Generator
+        transform_seed = transform_cfg_params.get("seed")
 
         train_transform = None
         eval_transform = None
 
         if pipeline:
             from .transforms import compose_transforms
-            pipeline_fn = compose_transforms(pipeline, **pipeline_params)
+            pipeline_fn = compose_transforms(pipeline, seed=transform_seed, **pipeline_params)
             train_transform = pipeline_fn
             eval_transform = pipeline_fn
 
         if augment:
             from .transforms import compose_transforms
-            augment_fn = compose_transforms(augment, **pipeline_params)
+            augment_seed = None if transform_seed is None else transform_seed + 1
+            augment_fn = compose_transforms(augment, seed=augment_seed, **pipeline_params)
             if train_transform is not None:
-                def _train_with_aug(x, y, _base=train_transform, _aug=augment_fn):
-                    x, y = _base(x, y)
-                    return _aug(x, y)
-                train_transform = _train_with_aug
+                train_transform = ChainedTransform([train_transform, augment_fn])
             else:
                 train_transform = augment_fn
 

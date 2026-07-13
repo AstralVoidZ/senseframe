@@ -14,6 +14,7 @@ Phase 2.1c：支持数据缓存（cache_dir）
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -24,6 +25,9 @@ try:
     import pytorch_lightning as pl
 except ImportError:
     import lightning as pl
+
+# 修复（5.10）：GenericDataModule 构造参数无日志，加模块级 logger
+_logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -94,6 +98,23 @@ class _TransformWrapper(Dataset):
         return x, y
 
 
+def _np_random_worker_init_fn(worker_id: int):
+    """DataLoader worker 初始化函数：为每个 worker 设置独立的 np.random 种子。
+
+    P3 上策的额外保障：PyTorch DataLoader 默认仅为 torch RNG 派生 per-worker 种子，
+    不为 np.random 派生。此函数从 torch 的 per-worker 种子派生 np.random 种子，
+    确保即使原语未使用注入的 rng（如第三方原语），worker 间 np.random 状态也不同。
+
+    注意：ComposedTransform 持有的独立 Generator 是主要的随机性隔离机制；
+    此函数是防御性兜底，处理未走注入路径的原语。
+    """
+    import numpy as np
+    # torch.initial_seed() 返回 DataLoader 为当前 worker 派生的种子
+    # （base_seed + worker_id，base_seed 由 torch.manual_seed 设置）
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+
+
 # ============================================================
 # Phase 2.1b：流式数据集
 # ============================================================
@@ -162,6 +183,7 @@ class GenericDataModule(pl.LightningDataModule):
         supervised_dataset: Optional[Dataset] = None,
         train_transform: Optional[Callable] = None,
         eval_transform: Optional[Callable] = None,
+        supervised_transform: Optional[Callable] = None,
         streaming: bool = False,
         cache_dir: Optional[str] = None,
         collate_fn: Optional[Callable] = None,
@@ -185,17 +207,33 @@ class GenericDataModule(pl.LightningDataModule):
                 # 否则 raw numpy（float64）进入 self_supervised encoder 时与 Float 权重 dtype 不匹配。
                 if unsupervised_dataset is not None:
                     unsupervised_dataset = _TransformWrapper(unsupervised_dataset, train_transform)
+            # P2-2 上策：supervised_dataset 使用独立的 supervised_transform（若提供），
+            # 否则回退到 train_transform。消除 supervised_dataset 与 train_transform 的
+            # 隐式耦合，允许微调阶段使用与预训练不同的增强强度。
+            # P2-1 修复：supervised_dataset 是 Phase 2 微调的训练数据，必须被包装；
+            # 旧代码错误地放在 eval_transform 分支内，若 eval_transform=None 但
+            # train_transform!=None（如 augment-without-pipeline 配置）会漏包装。
+            if supervised_dataset is not None:
+                sup_tf = supervised_transform if supervised_transform is not None else train_transform
+                if sup_tf is not None:
+                    supervised_dataset = _TransformWrapper(supervised_dataset, sup_tf)
             if eval_transform is not None:
                 test_dataset = _TransformWrapper(test_dataset, eval_transform)
                 if val_dataset is not None:
                     val_dataset = _TransformWrapper(val_dataset, eval_transform)
-                if supervised_dataset is not None:
-                    supervised_dataset = _TransformWrapper(supervised_dataset, train_transform)
 
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset
         # Phase 1.2d：支持独立验证集，None 时回退到 test_dataset（向后兼容）
-        self.val_dataset = val_dataset if val_dataset is not None else test_dataset
+        # P2 修复：回退时无日志，early_stopping 会监控 test 指标而非 val，静默回退使行为不可观测。
+        if val_dataset is not None:
+            self.val_dataset = val_dataset
+        else:
+            self.val_dataset = test_dataset
+            _logger.warning(
+                "val dataset not available, falling back to test set; "
+                "early_stopping will monitor test metrics"
+            )
         self.unsupervised_dataset = unsupervised_dataset
         self.supervised_dataset = supervised_dataset
 
@@ -208,6 +246,21 @@ class GenericDataModule(pl.LightningDataModule):
         self._cached = False
         if self.cache_dir is not None:
             self._maybe_load_cache()
+
+        # 修复（5.10）：GenericDataModule 构造参数无日志
+        # 旧逻辑：setup()/__init__ 无日志，无法追踪 batch_size / num_workers /
+        # persistent_workers 等关键参数（影响 DataLoader 行为 + 资源占用）。
+        # 由于 GenericDataModule 无 setup() 方法，在 __init__ 末尾记录关键参数。
+        _logger.info(
+            "GenericDataModule constructed: batch_size=%d, num_workers=%d, "
+            "pin_memory=%s, persistent_workers=%s, learning_mode=%s, "
+            "streaming=%s, cache_dir=%s, has_collate_fn=%s",
+            self.batch_size, self.num_workers,
+            self.pin_memory, self.persistent_workers,
+            self.learning_mode, self.streaming,
+            str(self.cache_dir) if self.cache_dir else "None",
+            self.collate_fn is not None,
+        )
 
     # ============================================================
     # Phase 2.1c：缓存机制
@@ -233,8 +286,9 @@ class GenericDataModule(pl.LightningDataModule):
                 self.test_dataset = cached["test"]
                 self.val_dataset = cached.get("val", self.test_dataset)
                 self._cached = True
-            except Exception:
-                pass  # 缓存损坏，忽略
+            except Exception as e:
+                # 缓存是优化手段，读失败不影响正确性，debug 级别即可
+                _logger.debug("Cache load failed (will reload data): %s", e)
 
     def save_cache(self) -> Optional[Path]:
         """Phase 2.1c：将当前数据集序列化到缓存目录。
@@ -253,13 +307,21 @@ class GenericDataModule(pl.LightningDataModule):
                 "val": self.val_dataset,
             }, cache_file)
             return cache_file
-        except Exception:
+        except Exception as e:
+            # 缓存写失败可能影响下次启动性能，warning 级别
+            _logger.warning("Cache save failed (next startup will reload data): %s", e)
             return None
 
     def train_dataloader(self):
         if "train" in self._dl_cache:
             return self._dl_cache["train"]
         if self.learning_mode == "self_supervised" and self.unsupervised_dataset:
+            # 自监督数据集（unsupervised）返回标准 2-tuple (x, y)，
+            # 增强在 SelfSupervisedModule._self_supervised_step 内部生成
+            # （gaussian_noise x1/x2），而非由数据集返回三元组，故默认
+            # collate 可正确批化，无需自定义 collate_fn。
+            # 但仍透传 self.collate_fn（默认 None=默认 collate）以保持与
+            # 监督分支一致，并允许用户注入 batch 级增强（如 mixup collate）。
             dl = DataLoader(
                 self.unsupervised_dataset,
                 batch_size=self.batch_size,
@@ -267,7 +329,10 @@ class GenericDataModule(pl.LightningDataModule):
                 num_workers=self.num_workers,
                 pin_memory=self.pin_memory,
                 persistent_workers=self.persistent_workers,
+                collate_fn=self.collate_fn,
+                worker_init_fn=_np_random_worker_init_fn,
             )
+            actual_dataset = self.unsupervised_dataset
         elif self.streaming:
             # 流式模式：IterableDataset 不支持 shuffle/drop_last
             dl = DataLoader(
@@ -276,7 +341,9 @@ class GenericDataModule(pl.LightningDataModule):
                 num_workers=self.num_workers,
                 pin_memory=self.pin_memory,
                 collate_fn=self.collate_fn,
+                worker_init_fn=_np_random_worker_init_fn,
             )
+            actual_dataset = self.train_dataset
         else:
             dl = DataLoader(
                 self.train_dataset,
@@ -287,7 +354,20 @@ class GenericDataModule(pl.LightningDataModule):
                 pin_memory=self.pin_memory,
                 persistent_workers=self.persistent_workers,
                 collate_fn=self.collate_fn,
+                worker_init_fn=_np_random_worker_init_fn,
             )
+            actual_dataset = self.train_dataset
+        # P1-3: 首次创建 dataloader 时打印摘要（缓存命中路径不重复打印）
+        try:
+            n_samples = len(actual_dataset) if actual_dataset is not None else 0
+        except TypeError:
+            n_samples = -1  # IterableDataset 无 len
+        _logger.info(
+            "DataLoader(train): dataset_samples=%d, batch_size=%d, "
+            "num_workers=%d, pin_memory=%s, persistent_workers=%s",
+            n_samples, self.batch_size, self.num_workers,
+            self.pin_memory, self.persistent_workers,
+        )
         self._dl_cache["train"] = dl
         return dl
 
@@ -302,6 +382,7 @@ class GenericDataModule(pl.LightningDataModule):
                 num_workers=self.num_workers,
                 pin_memory=self.pin_memory,
                 collate_fn=self.collate_fn,
+                worker_init_fn=_np_random_worker_init_fn,
             )
         else:
             dl = DataLoader(
@@ -312,7 +393,19 @@ class GenericDataModule(pl.LightningDataModule):
                 pin_memory=self.pin_memory,
                 persistent_workers=self.persistent_workers,
                 collate_fn=self.collate_fn,
+                worker_init_fn=_np_random_worker_init_fn,
             )
+        # P1-3: 首次创建 dataloader 时打印摘要
+        try:
+            n_samples = len(self.val_dataset) if self.val_dataset is not None else 0
+        except TypeError:
+            n_samples = -1
+        _logger.info(
+            "DataLoader(val): dataset_samples=%d, batch_size=%d, "
+            "num_workers=%d, pin_memory=%s, persistent_workers=%s",
+            n_samples, self.batch_size * 2, self.num_workers,
+            self.pin_memory, self.persistent_workers,
+        )
         self._dl_cache["val"] = dl
         return dl
 
@@ -326,6 +419,7 @@ class GenericDataModule(pl.LightningDataModule):
                 num_workers=self.num_workers,
                 pin_memory=self.pin_memory,
                 collate_fn=self.collate_fn,
+                worker_init_fn=_np_random_worker_init_fn,
             )
         else:
             dl = DataLoader(
@@ -336,7 +430,19 @@ class GenericDataModule(pl.LightningDataModule):
                 pin_memory=self.pin_memory,
                 persistent_workers=self.persistent_workers,
                 collate_fn=self.collate_fn,
+                worker_init_fn=_np_random_worker_init_fn,
             )
+        # P1-3: 首次创建 dataloader 时打印摘要
+        try:
+            n_samples = len(self.test_dataset) if self.test_dataset is not None else 0
+        except TypeError:
+            n_samples = -1
+        _logger.info(
+            "DataLoader(test): dataset_samples=%d, batch_size=%d, "
+            "num_workers=%d, pin_memory=%s, persistent_workers=%s",
+            n_samples, self.batch_size * 2, self.num_workers,
+            self.pin_memory, self.persistent_workers,
+        )
         self._dl_cache["test"] = dl
         return dl
 
@@ -354,6 +460,17 @@ class GenericDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             collate_fn=self.collate_fn,
+        )
+        # P1-3: 首次创建 dataloader 时打印摘要
+        try:
+            n_samples = len(self.supervised_dataset) if self.supervised_dataset is not None else 0
+        except TypeError:
+            n_samples = -1
+        _logger.info(
+            "DataLoader(supervised): dataset_samples=%d, batch_size=%d, "
+            "num_workers=%d, pin_memory=%s, persistent_workers=%s",
+            n_samples, self.batch_size, self.num_workers,
+            self.pin_memory, self.persistent_workers,
         )
         self._dl_cache["supervised"] = dl
         return dl

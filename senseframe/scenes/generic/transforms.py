@@ -223,12 +223,13 @@ def seasonal_decompose(x: np.ndarray, period: int = 12) -> np.ndarray:
 # ============================================================
 # 数据增强原语
 # ============================================================
-def jitter(x: np.ndarray, sigma: float = 0.01) -> np.ndarray:
+def jitter(x: np.ndarray, sigma: float = 0.01, rng: Optional[np.random.Generator] = None) -> np.ndarray:
     """时域抖动增强：添加高斯噪声。
 
     Args:
         x: 输入数据
         sigma: 噪声标准差
+        rng: 可选的独立随机数生成器（P3 上策，详见 wifi_csi.transforms.time_jitter）
 
     Returns:
         增强后的数据
@@ -236,11 +237,12 @@ def jitter(x: np.ndarray, sigma: float = 0.01) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
     if x.size == 0:
         return x.copy()
-    noise = np.random.normal(0, sigma, x.shape)
+    r = rng if rng is not None else np.random
+    noise = r.normal(0, sigma, x.shape)
     return x + noise
 
 
-def scaling(x: np.ndarray, sigma: float = 0.1) -> np.ndarray:
+def scaling(x: np.ndarray, sigma: float = 0.1, rng: Optional[np.random.Generator] = None) -> np.ndarray:
     """幅度缩放增强：乘以 (1 + 高斯噪声)。
 
     对整个序列乘以一个随机标量因子，改变整体幅度。
@@ -248,6 +250,7 @@ def scaling(x: np.ndarray, sigma: float = 0.1) -> np.ndarray:
     Args:
         x: 输入数据
         sigma: 缩放因子的噪声标准差
+        rng: 可选的独立随机数生成器（P3 上策）
 
     Returns:
         增强后的数据
@@ -255,11 +258,12 @@ def scaling(x: np.ndarray, sigma: float = 0.1) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
     if x.size == 0:
         return x.copy()
-    factor = 1.0 + np.random.normal(0, sigma)
+    r = rng if rng is not None else np.random
+    factor = 1.0 + r.normal(0, sigma)
     return x * factor
 
 
-def window_warp(x: np.ndarray, ratio: float = 0.1) -> np.ndarray:
+def window_warp(x: np.ndarray, ratio: float = 0.1, rng: Optional[np.random.Generator] = None) -> np.ndarray:
     """窗口切片增强：随机裁剪一段，用插值放缩回原长度。
 
     随机选取序列中一段子窗口，通过线性插值将其拉伸/压缩回原序列长度。
@@ -267,6 +271,7 @@ def window_warp(x: np.ndarray, ratio: float = 0.1) -> np.ndarray:
     Args:
         x: 输入数据，shape (..., T)
         ratio: 裁剪比例（0 < ratio <= 1），裁剪长度 = int(T * ratio)
+        rng: 可选的独立随机数生成器（P3 上策）
 
     Returns:
         增强后的数据，shape 与输入一致
@@ -274,6 +279,7 @@ def window_warp(x: np.ndarray, ratio: float = 0.1) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
     if x.size == 0:
         return x.copy()
+    r = rng if rng is not None else np.random
 
     def _warp_1d(sig: np.ndarray) -> np.ndarray:
         n = len(sig)
@@ -281,7 +287,7 @@ def window_warp(x: np.ndarray, ratio: float = 0.1) -> np.ndarray:
             return sig.copy()
         crop_len = max(2, int(n * ratio))
         crop_len = min(crop_len, n)
-        start = np.random.randint(0, max(1, n - crop_len + 1))
+        start = r.integers(0, max(1, n - crop_len + 1))
         window = sig[start:start + crop_len]
         # 线性插值放缩回原长度
         if len(window) < 2:
@@ -301,7 +307,7 @@ def window_warp(x: np.ndarray, ratio: float = 0.1) -> np.ndarray:
     return result.reshape(orig_shape)
 
 
-def magnitude_warp(x: np.ndarray, sigma: float = 0.1, knot: int = 4) -> np.ndarray:
+def magnitude_warp(x: np.ndarray, sigma: float = 0.1, knot: int = 4, rng: Optional[np.random.Generator] = None) -> np.ndarray:
     """幅度扭曲增强：用样条插值生成非线性扭曲曲线。
 
     生成一条由 knot 个控制点构成的平滑随机曲线，乘到原序列上，
@@ -311,6 +317,7 @@ def magnitude_warp(x: np.ndarray, sigma: float = 0.1, knot: int = 4) -> np.ndarr
         x: 输入数据，shape (..., T)
         sigma: 控制点噪声标准差
         knot: 样条控制点数量（必须 >= 2）
+        rng: 可选的独立随机数生成器（P3 上策）
 
     Returns:
         增强后的数据，shape 与输入一致
@@ -324,6 +331,7 @@ def magnitude_warp(x: np.ndarray, sigma: float = 0.1, knot: int = 4) -> np.ndarr
     x = np.asarray(x, dtype=np.float64)
     if x.size == 0:
         return x.copy()
+    r = rng if rng is not None else np.random
 
     def _warp_1d(sig: np.ndarray) -> np.ndarray:
         n = len(sig)
@@ -331,7 +339,7 @@ def magnitude_warp(x: np.ndarray, sigma: float = 0.1, knot: int = 4) -> np.ndarr
             return sig.copy()
         # 生成 knot 个控制点（1 + 高斯噪声），用线性插值扩展到 n
         ctrl_x = np.linspace(0, 1, knot)
-        ctrl_y = 1.0 + np.random.normal(0, sigma, size=knot)
+        ctrl_y = 1.0 + r.normal(0, sigma, size=knot)
         warp_curve = np.interp(np.linspace(0, 1, n), ctrl_x, ctrl_y)
         return sig * warp_curve
 
@@ -371,15 +379,16 @@ def list_transforms() -> list:
     return sorted(TRANSFORM_REGISTRY.keys())
 
 
-def compose_transforms(names: list, **kwargs) -> callable:
+def compose_transforms(names: list, seed: Optional[int] = None, **kwargs) -> callable:
     """组合多个 transform 原语为单一函数。
 
     Args:
         names: 原语名列表，如 ["rolling_stats", "jitter"]
+        seed: 可选的随机种子（P3 上策，详见 wifi_csi.transforms.compose_transforms）
         **kwargs: 传递给每个原语的参数（按原语名分组）
 
     Returns:
-        组合后的函数 fn(x, y) -> (x, y)
+        ComposedTransform 实例（callable，可 pickle 供 DataLoader multi-worker 使用）
     """
     transforms = []
     for name in names:
@@ -388,16 +397,37 @@ def compose_transforms(names: list, **kwargs) -> callable:
             raise ValueError(f"Unknown transform: {name}. Available: {list_transforms()}")
         transforms.append((name, fn))
 
-    def composed(x, y=None):
+    return ComposedTransform(transforms, kwargs, seed=seed)
+
+
+class ComposedTransform:
+    """组合多个 transform 原语的 callable 类（可 pickle）。
+
+    替代旧 composed 闭包，确保 DataLoader num_workers>0 时序列化不失败。
+    P3 上策：持有独立 np.random.Generator，在 __call__ 中注入到原语，
+    消除对全局 np.random 状态的依赖。
+    """
+
+    def __init__(self, transforms, kwargs, seed: Optional[int] = None):
+        import inspect
+        self.transforms = list(transforms)
+        self.kwargs = dict(kwargs)
+        self.rng = np.random.default_rng(seed) if seed is not None else None
+        self._accepts_rng = [
+            'rng' in inspect.signature(fn).parameters for _, fn in self.transforms
+        ]
+
+    def __call__(self, x, y=None):
         import torch
         x_np = x.numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
-        for name, fn in transforms:
-            params = kwargs.get(name, {})
-            x_np = fn(x_np, **params)
+        for (name, fn), accepts_rng in zip(self.transforms, self._accepts_rng):
+            params = self.kwargs.get(name, {})
+            if accepts_rng:
+                x_np = fn(x_np, rng=self.rng, **params)
+            else:
+                x_np = fn(x_np, **params)
         x_out = torch.from_numpy(x_np).float() if isinstance(x, torch.Tensor) else x_np
         return x_out, y
-
-    return composed
 
 
 __all__ = [

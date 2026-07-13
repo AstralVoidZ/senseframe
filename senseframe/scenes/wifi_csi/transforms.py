@@ -321,27 +321,31 @@ def bvp_estimate(
 # ============================================================
 # 数据增强原语
 # ============================================================
-def time_jitter(x: np.ndarray, sigma: float = 0.01) -> np.ndarray:
+def time_jitter(x: np.ndarray, sigma: float = 0.01, rng: Optional[np.random.Generator] = None) -> np.ndarray:
     """时域抖动增强：添加高斯噪声。
 
     Args:
         x: 输入数据
         sigma: 噪声标准差
+        rng: 可选的独立随机数生成器。P3 上策：消除对全局 np.random 状态的依赖，
+            确保多 worker 间随机性独立且可复现。None 时回退到全局 np.random（向后兼容）。
 
     Returns:
         增强后的数据
     """
     x = np.asarray(x, dtype=np.float64)
-    noise = np.random.normal(0, sigma, x.shape)
+    r = rng if rng is not None else np.random
+    noise = r.normal(0, sigma, x.shape)
     return x + noise
 
 
-def freq_masking(x: np.ndarray, mask_ratio: float = 0.1) -> np.ndarray:
+def freq_masking(x: np.ndarray, mask_ratio: float = 0.1, rng: Optional[np.random.Generator] = None) -> np.ndarray:
     """频域掩码增强：随机屏蔽部分频率分量。
 
     Args:
         x: 输入数据
         mask_ratio: 屏蔽比例
+        rng: 可选的独立随机数生成器（P3 上策，详见 time_jitter）
 
     Returns:
         增强后的数据
@@ -350,28 +354,32 @@ def freq_masking(x: np.ndarray, mask_ratio: float = 0.1) -> np.ndarray:
     result = x.copy()
     if mask_ratio <= 0 or x.size == 0:
         return result
+    r = rng if rng is not None else np.random
     if x.ndim >= 1:
         n = x.shape[-1]
         n_mask = max(1, int(n * mask_ratio))
         if n_mask >= n:
             n_mask = max(1, n - 1)
-        mask_start = np.random.randint(0, max(1, n - n_mask + 1))
+        # r.integers 上界 exclusive，np.random.randint 也是 exclusive，语义一致
+        mask_start = r.integers(0, max(1, n - n_mask + 1))
         result[..., mask_start:mask_start + n_mask] = 0
     return result
 
 
-def amplitude_rotation(x: np.ndarray, angle_range: float = 5.0) -> np.ndarray:
+def amplitude_rotation(x: np.ndarray, angle_range: float = 5.0, rng: Optional[np.random.Generator] = None) -> np.ndarray:
     """幅度旋转增强：对 CSI 幅值做随机旋转。
 
     Args:
         x: 输入数据
         angle_range: 旋转角度范围（度）
+        rng: 可选的独立随机数生成器（P3 上策，详见 time_jitter）
 
     Returns:
         增强后的数据
     """
     x = np.asarray(x, dtype=np.float64)
-    angle = np.random.uniform(-angle_range, angle_range)
+    r = rng if rng is not None else np.random
+    angle = r.uniform(-angle_range, angle_range)
     rad = np.deg2rad(angle)
     cos_a, sin_a = np.cos(rad), np.sin(rad)
     # 对最后一维做旋转：按最后一维长度判断
@@ -414,15 +422,17 @@ def list_transforms() -> list:
     return sorted(TRANSFORM_REGISTRY.keys())
 
 
-def compose_transforms(names: list, **kwargs) -> callable:
+def compose_transforms(names: list, seed: Optional[int] = None, **kwargs) -> callable:
     """组合多个 transform 原语为单一函数。
 
     Args:
         names: 原语名列表，如 ["hampel", "phase_unwrap", "stft"]
+        seed: 可选的随机种子。P3 上策：为 ComposedTransform 创建独立 np.random.Generator，
+            消除对全局 np.random 状态的依赖。None 时不创建 Generator（原语回退到全局 np.random）。
         **kwargs: 传递给每个原语的参数（按原语名分组）
 
     Returns:
-        组合后的函数 fn(x, y) -> (x, y)
+        ComposedTransform 实例（callable，可 pickle 供 DataLoader multi-worker 使用）
     """
     transforms = []
     for name in names:
@@ -431,16 +441,42 @@ def compose_transforms(names: list, **kwargs) -> callable:
             raise ValueError(f"Unknown transform: {name}. Available: {list_transforms()}")
         transforms.append((name, fn))
 
-    def composed(x, y=None):
+    return ComposedTransform(transforms, kwargs, seed=seed)
+
+
+class ComposedTransform:
+    """组合多个 transform 原语的 callable 类（可 pickle）。
+
+    替代旧 composed 闭包，确保 DataLoader num_workers>0 时序列化不失败。
+    依次对输入应用 (name, fn) 列表中的原语，处理 torch.Tensor ↔ numpy 转换。
+
+    P3 上策：持有独立 np.random.Generator，在 __call__ 中注入到原语，
+    消除对全局 np.random 状态的依赖。Generator 可 pickle，随对象传递到 worker。
+    """
+
+    def __init__(self, transforms, kwargs, seed: Optional[int] = None):
+        # transforms: List[Tuple[str, Callable]]；kwargs: Dict[str, dict]
+        import inspect
+        self.transforms = list(transforms)
+        self.kwargs = dict(kwargs)
+        # 独立 Generator：相同 seed 产生相同序列，不同 ComposedTransform 实例独立
+        self.rng = np.random.default_rng(seed) if seed is not None else None
+        # 预计算每个原语是否接受 rng 参数，避免 try/except 误吞原语内部 TypeError
+        self._accepts_rng = [
+            'rng' in inspect.signature(fn).parameters for _, fn in self.transforms
+        ]
+
+    def __call__(self, x, y=None):
         import torch
         x_np = x.numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
-        for name, fn in transforms:
-            params = kwargs.get(name, {})
-            x_np = fn(x_np, **params)
+        for (name, fn), accepts_rng in zip(self.transforms, self._accepts_rng):
+            params = self.kwargs.get(name, {})
+            if accepts_rng:
+                x_np = fn(x_np, rng=self.rng, **params)
+            else:
+                x_np = fn(x_np, **params)
         x_out = torch.from_numpy(x_np).float() if isinstance(x, torch.Tensor) else x_np
         return x_out, y
-
-    return composed
 
 
 __all__ = [

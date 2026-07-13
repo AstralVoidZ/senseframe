@@ -26,6 +26,8 @@ class SceneMeta:
     学习模式（supervised/self_supervised），供 Agent 程序化查询。
     Phase R-fix：新增 is_dynamic_dataset 标志，标记数据集在运行时动态决定
     （如 custom/generic 场景），引擎跳过静态 dataset 校验。
+    P0 修复：新增 modality 字段，场景显式声明数据模态（csi/image/text/tabular/sequence/audio），
+    覆盖 profiler 的 shape 启发式（CSI (1,250,90) 与 image (1,H,W) 在 shape 上不可区分）。
     """
     name: str                              # 场景标识，如 "wifi_csi"
     supported_tasks: List[str]             # ["classification", "self_supervised"]
@@ -39,6 +41,9 @@ class SceneMeta:
     supported_learning_modes: List[str] = field(default_factory=lambda: ["supervised"])
     # R-fix：动态数据集场景标志（custom/generic），引擎据此跳过静态 dataset 校验
     is_dynamic_dataset: bool = False
+    # P0 修复：场景显式声明数据模态，覆盖 profiler shape 启发式
+    # 默认 "unknown" 保持向后兼容（未声明的场景继续用 shape 启发式）
+    modality: str = "unknown"
 
 
 @dataclass
@@ -67,19 +72,26 @@ class SearchSpace:
 
 @dataclass
 class TransformConfig:
-    """Phase 2.1a：数据变换配置（RFC Phase C：支持 batch 级变换）。
+    """Phase 2.1a：数据变换配置。
 
     场景容器通过 get_transforms 返回此配置，DataModule 在 __getitem__ 后应用。
+    仅支持 sample-level（样本级）变换，在 Dataset.__getitem__ 返回 (x, y) 后、
+    collate 前应用。batch 级变换（如 mixup / batch 归一化）不在本配置支持范围内
+    ——P1 清理：原 batch_transform 字段全代码库无消费者（DataModule / collate 均未读取），
+    属未实现的预留能力，已删除以避免误导调用方。如需 batch 级增强，应通过
+    GenericDataModule.collate_fn 注入。
+
     - train_transform: 训练阶段变换（含数据增强），签名 fn(x, y) -> (x, y)
     - eval_transform:  验证/测试阶段变换（无增强，仅预处理），签名 fn(x, y) -> (x, y)
-    - batch_transform: RFC Phase C 新增，batch 级变换（如 mixup/batch 归一化），
-      签名 fn(batch) -> batch，在 collate 后应用
+    - supervised_transform: Phase 2 微调专用变换（自监督模式下 supervised_dataset 使用）。
+      None 时 DataModule 回退到 train_transform（向后兼容）；显式设置时，允许微调阶段
+      使用与预训练不同的增强强度（例如更弱的增强或无增强）。P2-2 上策：消除
+      supervised_dataset 与 train_transform 的隐式耦合，让 transform 归属由数据用途决定。
     None 表示该阶段无变换（使用 Dataset 原始返回）。
     """
     train_transform: Optional[Callable] = None
     eval_transform: Optional[Callable] = None
-    # RFC Phase C：batch 级变换（在 collate 后应用，支持 mixup/batch 归一化等）
-    batch_transform: Optional[Callable] = None
+    supervised_transform: Optional[Callable] = None
 
 
 @dataclass
@@ -90,6 +102,12 @@ class DatasetBundle:
     所有场景的 load_dataset 统一返回此数据类，调用方按属性访问。
 
     向后兼容：提供 to_tuple() 方法，按学习模式返回对应元组。
+
+    根因修复（数据结构契约对齐）：保留 `supervised_finetune`（自监督专用）的同时
+    显式声明 `train`（监督专用）字段。stage_build 在监督路径访问 `bundle.train`，
+    自监督路径访问 `bundle.supervised_finetune`；两个字段通过 filling_rule 互斥
+    （supervised 模式 train=required/supervised_finetune=forbidden，反之亦然），
+    既满足 stage_build 的字段期望，又通过 validate_filling 强制契约一致性。
     """
     train: Optional[Dataset] = None
     test: Optional[Dataset] = None

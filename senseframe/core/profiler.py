@@ -45,6 +45,10 @@ class DataProfile:
     n_features: int = 0
     n_classes: Optional[int] = None
     class_distribution: Dict[str, int] = field(default_factory=dict)
+    # 根因修复（P2）：类别不平衡比率 = max(counts)/max(min(counts),1)。
+    # 自监督模式下无标签 → class_distribution 为空 → 此字段为 None。
+    # 消费者（stage_load OTel 埋点）必须做 None 守卫，避免对 None 求值。
+    imbalance_ratio: Optional[float] = None
 
     # 分布特征
     missing_rate: float = 0.0
@@ -62,6 +66,10 @@ class DataProfile:
     recommended_loss: str = "cross_entropy"
     recommended_metrics: List[str] = field(default_factory=lambda: ["accuracy", "macro_f1"])
     recommended_normalization: str = "zscore"  # none/zscore/minmax
+    # P3-6：类别权重推荐（imbalance_ratio > 5 时自动计算 inverse frequency 权重）。
+    # resolver 自动注入到 cross_entropy_weighted 的 loss_kwargs["weights"]。
+    # None 表示数据平衡或非分类任务，不注入权重。
+    recommended_class_weights: Optional[List[float]] = None
 
     # 元信息
     dataset_name: str = ""
@@ -148,6 +156,7 @@ class DataProfiler:
         dataset,
         dataset_name: str = "",
         profile_source: str = "train",
+        modality_hint: Optional[str] = None,
     ) -> DataProfile:
         """探查 torch Dataset，输出数据画像。
 
@@ -155,6 +164,9 @@ class DataProfiler:
             dataset: torch Dataset（支持 __getitem__ 返回 (x, y) 或 (x,)）
             dataset_name: 数据集名称（用于元信息）
             profile_source: 数据来源标记
+            modality_hint: 场景显式声明的数据模态（如 "csi"），非 None 时覆盖 shape 启发式。
+                           P0 修复：CSI (1,250,90) 与 image (1,H,W) 在 shape 上不可区分，
+                           需场景通过 SceneMeta.modality 显式声明。
 
         Returns:
             DataProfile 数据画像
@@ -194,12 +206,17 @@ class DataProfiler:
         # 类别统计
         n_classes = None
         class_dist: Dict[str, int] = {}
+        # 根因修复（P2）：imbalance_ratio 从 class_distribution 派生；
+        # 自监督模式无标签 → class_dist 为空 → imbalance_ratio 保持 None。
+        imbalance_ratio: Optional[float] = None
         if samples_y:
             try:
                 y_arr = np.array(samples_y)
                 unique, counts = np.unique(y_arr, return_counts=True)
                 n_classes = len(unique)
                 class_dist = {str(int(u)): int(c) for u, c in zip(unique, counts)}
+                if counts is not None and len(counts) > 0:
+                    imbalance_ratio = float(max(counts)) / max(float(min(counts)), 1.0)
             except Exception:
                 pass
 
@@ -216,10 +233,18 @@ class DataProfiler:
         # 结构特征推断
         is_spatial = len(input_shape) >= 3  # (C, H, W) 或更高
         is_temporal = len(input_shape) >= 2 and not is_spatial  # (C, T) 或 (T, F)
-        modality = self._infer_modality(input_shape, is_spatial, is_temporal)
+        # P0 修复：modality_hint 非 None 时覆盖 shape 启发式
+        # 场景通过 SceneMeta.modality 显式声明，优先级高于 shape 启发式
+        modality = self._infer_modality(
+            input_shape, is_spatial, is_temporal, modality_hint=modality_hint,
+        )
+        # CSI 模态修正：CSI 数据是时序的（time × subcarrier），非空间
+        if modality == "csi":
+            is_spatial = False
+            is_temporal = True
 
         # 推荐策略
-        rec_task, rec_loss, rec_metrics, rec_norm = self._recommend(
+        rec_task, rec_loss, rec_metrics, rec_norm, rec_weights = self._recommend(
             n_classes=n_classes,
             input_shape=input_shape,
             is_spatial=is_spatial,
@@ -249,6 +274,7 @@ class DataProfiler:
             n_features=n_features,
             n_classes=n_classes,
             class_distribution=class_dist,
+            imbalance_ratio=imbalance_ratio,
             missing_rate=missing_rate,
             value_range=(value_min, value_max),
             mean=mean,
@@ -260,6 +286,7 @@ class DataProfiler:
             recommended_loss=rec_loss,
             recommended_metrics=rec_metrics,
             recommended_normalization=rec_norm,
+            recommended_class_weights=rec_weights,
             dataset_name=dataset_name,
             dtypes=dtypes_dict,
             feature_names=feature_names_list,
@@ -272,20 +299,42 @@ class DataProfiler:
         self,
         bundle,
         dataset_name: str = "",
+        modality_hint: Optional[str] = None,
+        learning_mode: str = "supervised",
     ) -> DataProfile:
-        """探查 DatasetBundle，优先用 train 集。
+        """探查 DatasetBundle，按学习模式选择采样源。
+
+        P1 修复：旧实现恒用 bundle.train（fallback test），但自监督模式下
+        bundle.train 为 None（按 filling_rule 为 forbidden），回退到 test 集
+        做画像采样——normalization 统计量来自测试集造成数据泄露，且分布
+        与实际训练集（unsupervised）不一致。改为按 learning_mode 选择：
+        - supervised → train 集（无 train 时回退 test）
+        - self_supervised → unsupervised 集（无 unsupervised 时回退 test）
+        确保画像统计量来自训练集，避免数据泄露。
 
         Args:
-            bundle: DatasetBundle（含 train/test/val 等属性）
+            bundle: DatasetBundle（含 train/test/val/unsupervised/supervised_finetune）
             dataset_name: 数据集名称
+            modality_hint: 场景显式声明的数据模态（如 "csi"），覆盖 shape 启发式
+            learning_mode: "supervised" 或 "self_supervised"，决定采样源
 
         Returns:
             DataProfile 数据画像
         """
-        ds = getattr(bundle, "train", None) or getattr(bundle, "test", None)
+        if learning_mode == "self_supervised":
+            # 自监督模式：训练用 unsupervised 集，从其采样画像
+            ds = getattr(bundle, "unsupervised", None) or getattr(bundle, "test", None)
+            profile_source = "unsupervised"
+        else:
+            # 监督模式：训练用 train 集
+            ds = getattr(bundle, "train", None) or getattr(bundle, "test", None)
+            profile_source = "train"
         if ds is None:
             return DataProfile(dataset_name=dataset_name)
-        return self.profile_dataset(ds, dataset_name=dataset_name, profile_source="train")
+        return self.profile_dataset(
+            ds, dataset_name=dataset_name, profile_source=profile_source,
+            modality_hint=modality_hint,
+        )
 
     def _to_numpy(self, x) -> np.ndarray:
         """转换为 numpy array。"""
@@ -300,8 +349,16 @@ class DataProfiler:
         input_shape: Tuple[int, ...],
         is_spatial: bool,
         is_temporal: bool,
+        modality_hint: Optional[str] = None,
     ) -> str:
-        """推断数据模态。"""
+        """推断数据模态。
+
+        P0 修复：modality_hint 非 None 时优先使用场景显式声明，
+        覆盖 shape 启发式（CSI 与 image 在 shape 上不可区分）。
+        """
+        # P0 修复：场景显式声明优先于 shape 启发式
+        if modality_hint is not None and modality_hint != "unknown":
+            return modality_hint
         if is_spatial:
             return "image"
         if is_temporal:
@@ -319,13 +376,13 @@ class DataProfiler:
         missing_rate: float,
         class_dist: Dict[str, int],
         value_range: Tuple[float, float],
-    ) -> Tuple[str, str, List[str], str]:
+    ) -> Tuple[str, str, List[str], str, Optional[List[float]]]:
         """基于数据画像推荐策略（非强制，Agent 可覆盖）。
 
         推荐优先从注册表查询可用策略，回退到内置默认。
 
         Returns:
-            (task_type, loss, metrics, normalization)
+            (task_type, loss, metrics, normalization, class_weights)
         """
         from .task import has_task_type, get_task_type_default_loss, get_task_type_default_metrics
         from .losses import has_loss
@@ -355,11 +412,20 @@ class DataProfiler:
             norm = "none"
 
         # 类别不平衡 → 推荐 focal loss（Agent 可覆盖）
+        # P3-6：同时自动计算 class_weights（inverse frequency weighting）
+        class_weights = None
         if n_classes is not None and n_classes > 1 and class_dist:
             counts = list(class_dist.values())
             if counts:
                 ratio = max(counts) / max(min(counts), 1)
                 if ratio > 5 and has_loss("focal"):
                     loss = "focal"
+                # P3-6：计算 inverse frequency 权重 w_i = N / (n_classes * count_i)
+                # 与 recommended_loss 协同：ratio>5 时同时推荐 focal_loss + class_weights。
+                # resolver 优先注入 class_weights 到 cross_entropy_weighted（当 loss 仍为
+                # cross_entropy 时），focal_loss 自身不需 weights（内置 alpha 参数）。
+                if ratio > 5:
+                    total = sum(counts)
+                    class_weights = [total / (len(counts) * c) for c in counts]
 
-        return task_type, loss, metrics, norm
+        return task_type, loss, metrics, norm, class_weights

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -26,6 +27,19 @@ from .exploration import ExplorationTracker
 if TYPE_CHECKING:
     # P3.2.4：避免循环导入，HistoryStore 类型注解用 TYPE_CHECKING
     from .exploration import HistoryStore  # noqa: F401
+
+# 修复（5.12 / 5.4）：模块级 logger + OTel 埋点常量导入
+# 旧逻辑：StudyManager ask/tell/create_study/best_trial 全部零日志；
+# ML_SEARCH_COVERAGE_RATIO 定义但从未被 record_training_metric 调用。
+logger = logging.getLogger(__name__)
+try:
+    from .observability_otel import record_training_metric, ML_SEARCH_COVERAGE_RATIO
+except ImportError:
+    # OTel 未安装时降级为 no-op
+    def record_training_metric(*args, **kwargs):
+        pass
+
+    ML_SEARCH_COVERAGE_RATIO = "ml.search.coverage_ratio"
 
 
 @dataclass
@@ -72,6 +86,10 @@ class StudySpec:
     status: str = "running"  # running / completed / stopped
     created_at: str = ""
     completed_at: str = ""
+    # P3-1：study 级种子，None 时使用全局随机。
+    # 每个 trial 的实际种子 = seed + trial_index，既可复现又不重复。
+    # 彻底消除 sampler 对全局 random 模块的依赖（避免被 set_seed 重置）。
+    seed: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -80,6 +98,7 @@ class StudySpec:
             "search_space": self.search_space.to_dict(),
             "sampler": self.sampler, "status": self.status,
             "created_at": self.created_at, "completed_at": self.completed_at,
+            "seed": self.seed,
         }
 
 
@@ -176,23 +195,42 @@ def list_samplers() -> List[str]:
 
 
 class RandomSampler:
-    """随机采样器（SP-3 内置）。"""
+    """随机采样器（SP-3 内置）— 持有独立 RNG，不受全局 set_seed 影响。
+
+    P3-1 修复：旧代码使用全局 random 模块，被 stage_preflight 的 set_seed(42)
+    周期性重置，导致 HPO 多 trial 产出相同参数。现在 __init__ 创建独立
+    np.random.Generator，与训练 pipeline 的 RNG 完全隔离。
+
+    P3-2 修复：旧代码忽略 ParameterSpec.step 字段（random.randint 不考虑 step），
+    导致 batch_size=9 在 step=8 约束下被错误产出。现在统一消费 step。
+    """
+
     name = "random"
 
+    def __init__(self, seed: Optional[int] = None):
+        import numpy as np
+        self._rng = np.random.default_rng(seed)
+
     def sample(self, search_space: SearchSpace, history: List[Dict[str, Any]]) -> Dict[str, Any]:
-        import random
         params = {}
         for p in search_space.parameters:
             if p.type == "float":
                 if p.log and p.low and p.high:
-                    import math
-                    params[p.name] = math.exp(random.uniform(math.log(p.low), math.log(p.high)))
+                    # log-uniform 采样
+                    params[p.name] = float(self._rng.loguniform(p.low, p.high))
                 else:
-                    params[p.name] = random.uniform(p.low or 0, p.high or 1)
+                    params[p.name] = float(self._rng.uniform(p.low or 0, p.high or 1))
             elif p.type == "int":
-                params[p.name] = random.randint(int(p.low or 0), int(p.high or 100))
+                low, high = int(p.low or 0), int(p.high or 100)
+                if p.step:
+                    # P3-2：消费 step 字段——采样值必须是 low + k*step 的形式
+                    step_int = int(p.step)
+                    n_steps = (high - low) // step_int + 1
+                    params[p.name] = low + int(self._rng.integers(0, n_steps)) * step_int
+                else:
+                    params[p.name] = int(self._rng.integers(low, high + 1))
             elif p.type == "categorical" and p.choices:
-                params[p.name] = random.choice(p.choices)
+                params[p.name] = str(self._rng.choice(p.choices))
         return params
 
     def warm_start(self, source_history: List[Dict[str, Any]]) -> None:
@@ -206,10 +244,12 @@ class RandomSampler:
 
 
 class GridSampler:
-    """网格采样器（SP-3 内置）。"""
+    """网格采样器（SP-3 内置）— 确定性采样，seed 参数被接受但忽略。"""
     name = "grid"
 
-    def __init__(self):
+    def __init__(self, seed: Optional[int] = None):
+        # GridSampler 按网格顺序采样，不需要 RNG。接受 seed 仅为满足
+        # StudyManager.ask() 的统一调用接口（sampler_cls(seed=...)）。
         self._grid_index: Dict[str, int] = {}  # study_id -> index
 
     def sample(self, search_space: SearchSpace, history: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -221,7 +261,12 @@ class GridSampler:
                 step = p.step or (p.high - p.low) / 5 if p.low and p.high else 0.1
                 grids.append([p.low + i * step for i in range(int((p.high - p.low) / step) + 1)] if p.low and p.high else [0])
             elif p.type == "int":
-                grids.append(list(range(int(p.low or 0), int(p.high or 10) + 1)))
+                low, high = int(p.low or 0), int(p.high or 10)
+                if p.step:
+                    # P3-2：消费 step 字段
+                    grids.append(list(range(low, high + 1, int(p.step))))
+                else:
+                    grids.append(list(range(low, high + 1)))
             elif p.type == "categorical" and p.choices:
                 grids.append(p.choices)
             else:
@@ -379,8 +424,8 @@ class ASHASampler:
 
         Args:
             trial_id: Trial 标识
-            intermediate_values: {epoch: value} 已收集的中间值
-            rung: 当前 rung 序号（0-based）
+            intermediate_values: {epoch: value} 已收集的中间值（1-indexed epoch）
+            rung: 当前 rung 序号（1-indexed epoch，由 max(intermediate_values.keys()) 得来）
 
         Returns:
             True 表示应剪枝该 trial，False 表示继续训练
@@ -549,8 +594,9 @@ class StudyManager:
         sampler: str = "random",
         warm_start_from: Optional[str] = None,
         history_store: Optional["HistoryStore"] = None,
+        seed: Optional[int] = None,
     ) -> str:
-        """创建 Study（SP-1；P3.2.4 扩展 warm-start）。
+        """创建 Study（SP-1；P3.2.4 扩展 warm-start；P3-1 扩展 seed）。
 
         Args:
             name: Study 名称
@@ -561,15 +607,26 @@ class StudyManager:
                 用于从该数据集历史 warm-start 当前 study。None 表示不 warm-start。
             history_store: P3.2.4 新增——HistoryStore 实例，用于加载源数据集历史。
                 与 warm_start_from 配合使用；若 warm_start_from 为 None 则忽略。
+            seed: P3-1 新增——study 级种子。None 时使用全局随机（不推荐，可能被
+                set_seed 重置）；指定时每个 trial 的种子 = seed + trial_index，
+                确保可复现且 trial 间参数有多样性。
 
         Returns:
             study_id
         """
+        # 修复（5.12）：create_study 入口 INFO 日志
+        n_params = len(search_space.parameters) if search_space else 0
+        logger.info(
+            "SP create_study: name=%s, direction=%s, sampler=%s, n_params=%d, "
+            "warm_start_from=%s, seed=%s",
+            name, direction, sampler, n_params, warm_start_from, seed,
+        )
         study_id = f"study_{uuid.uuid4().hex[:8]}"
         study = StudySpec(
             study_id=study_id, name=name, direction=direction,
             search_space=search_space or SearchSpace(),
             sampler=sampler, created_at=datetime.now().isoformat(),
+            seed=seed,
         )
         with self._lock:
             self._studies[study_id] = study
@@ -581,6 +638,11 @@ class StudyManager:
             meta_learner = MetaLearner(self, history_store)
             meta_learner.warm_start(study_id, warm_start_from)
 
+        # 修复（5.12）：create_study 出口 INFO 日志
+        logger.info(
+            "SP create_study done: study_id=%s, name=%s",
+            study_id, name,
+        )
         return study_id
 
     def get_study(self, study_id: str) -> Optional[StudySpec]:
@@ -598,6 +660,8 @@ class StudyManager:
 
     def ask(self, study_id: str) -> TrialSpec:
         """请求下一组参数（SP-2 Ask）。"""
+        # 修复（5.12）：ask 入口 INFO 日志
+        logger.info("SP ask: study_id=%s", study_id)
         study = self._studies.get(study_id)
         if study is None:
             raise KeyError(f"Study '{study_id}' not found")
@@ -606,9 +670,16 @@ class StudyManager:
 
         tracker = self._trackers[study_id]
         sampler_cls = get_sampler(study.sampler) or RandomSampler
-        sampler = sampler_cls()
         # P0.4：改用 ExplorationTracker.get_history 公共 API，不直接访问 tracker.history
-        params = sampler.sample(study.search_space, tracker.get_history())
+        history = tracker.get_history()
+        # P3-1：每个 trial 使用 study_seed + trial_index 作为独立种子，
+        # 彻底消除 sampler 对全局 random 模块的依赖。
+        # 相同 study_seed → 相同参数序列（可复现）；不同 study_seed → 不同参数。
+        trial_index = len(history)
+        study_seed = study.seed
+        sampler_seed = (study_seed + trial_index) if study_seed is not None else None
+        sampler = sampler_cls(seed=sampler_seed)
+        params = sampler.sample(study.search_space, history)
 
         trial_id = f"trial_{uuid.uuid4().hex[:8]}"
         trial = TrialSpec(
@@ -619,6 +690,30 @@ class StudyManager:
             self._pending_trials[trial_id] = trial
             # 也记录到 tracker（status=pending）
             tracker.add_trial(strategy=params, result=None, trial_id=trial_id)
+
+        # 修复（5.4）：ML_SEARCH_COVERAGE_RATIO OTel 埋点（搜索空间覆盖率）
+        # 计算方式：已采样 trial 数 / (n_params * 10) 的归一化比率（启发式）
+        # OTel 未初始化时 no-op，可无脑调
+        try:
+            n_params = len(study.search_space.parameters)
+            n_trials = len(history)
+            # 覆盖率：粗略估计——已采样 trial 数占预期采样预算的比例
+            # 预期采样预算 = max(n_params * 10, 20)
+            expected_budget = max(n_params * 10, 20) if n_params > 0 else 20
+            coverage_ratio = min(1.0, n_trials / expected_budget)
+            record_training_metric(
+                ML_SEARCH_COVERAGE_RATIO,
+                value=float(coverage_ratio),
+                stage="hpo",
+            )
+        except Exception:
+            pass
+
+        # 修复（5.12）：ask 出口 INFO 日志
+        logger.info(
+            "SP ask done: study_id=%s, trial_id=%s, params=%s",
+            study_id, trial_id, params,
+        )
         return trial
 
     def tell(
@@ -630,6 +725,11 @@ class StudyManager:
         feedback: Optional[Dict[str, Any]] = None,
     ) -> None:
         """报告试验结果（SP-2 Tell）。"""
+        # 修复（5.12）：tell 入口 INFO 日志
+        logger.info(
+            "SP tell: trial_id=%s, value=%s, state=%s",
+            trial_id, value, state,
+        )
         trial = self._pending_trials.get(trial_id)
         if trial is None:
             raise KeyError(f"Trial '{trial_id}' not found (not asked or already told)")
@@ -651,6 +751,12 @@ class StudyManager:
         # 从 pending 移除
         with self._lock:
             del self._pending_trials[trial_id]
+
+        # 修复（5.12）：tell 出口 INFO 日志
+        logger.info(
+            "SP tell done: trial_id=%s, study_id=%s, state=%s, value=%s",
+            trial_id, trial.study_id, state, value,
+        )
 
     def get_trial(self, trial_id: str) -> Optional[TrialResult]:
         """查询 Trial 结果（SP-2）。"""
@@ -698,16 +804,31 @@ class StudyManager:
 
     def best_trial(self, study_id: str) -> Optional[TrialResult]:
         """获取最优 Trial（SP-2）。"""
+        # 修复（5.12）：best_trial 入口 INFO 日志
+        logger.info("SP best_trial: study_id=%s", study_id)
         study = self._studies.get(study_id)
         if study is None:
+            logger.info("SP best_trial done: study_id=%s not found", study_id)
             return None
         tracker = self._trackers[study_id]
         mode = "max" if study.direction == "maximize" else "min"
         metric = "value"
         best = tracker.best_trial(metric=metric, mode=mode)
         if best is None:
+            logger.info(
+                "SP best_trial done: study_id=%s, no completed trials yet",
+                study_id,
+            )
             return None
-        return self.get_trial(best["trial_id"])
+        result = self.get_trial(best["trial_id"])
+        # 修复（5.12）：best_trial 出口 INFO 日志
+        logger.info(
+            "SP best_trial done: study_id=%s, best_trial_id=%s, value=%s",
+            study_id,
+            best["trial_id"],
+            result.value if result else "N/A",
+        )
+        return result
 
 
 # ============================================================

@@ -36,7 +36,7 @@ Agent 驱动的 AutoML 训练框架。提供可编程原语库 + 执行底座 + 
 ## 前置条件
 
 - Python 3.x + PyTorch + PyTorch Lightning 已安装
-- 数据集放置于 `CSI_DATASETS/`（WiFi CSI 场景）或通过 `data_root` 指定路径
+- 数据集放置于 `resource/CSI_DATASETS/`（WiFi CSI 场景）或通过 `data_root` 指定路径
 - 自监督模式仅支持 NTU-Fi_HAR 数据集，`num_classes` 声明 14
 - 可复现场景：固定 `trainer.seed`，严格复现时启用 `trainer.deterministic: true`
 - **查询注册表前必须显式激活**：调用 `sf.activate_lazy_scenes()` 后再查询模型/数据集（CQS 合规，查询不触发注册副作用）
@@ -89,7 +89,7 @@ profile.save("data_profile.json")
 loaded = sf.DataProfile.load("data_profile.json")
 ```
 
-画像字段：`n_samples`, `input_shape`, `n_classes`, `class_distribution`, `missing_rate`, `value_range`, `mean`, `std`, `is_spatial`, `is_temporal`, `modality`, `recommended_*`
+画像字段：`n_samples`, `input_shape`, `n_features`, `n_classes`, `class_distribution`, `missing_rate`, `value_range`, `mean`, `std`, `is_spatial`, `is_temporal`, `modality`, `recommended_task_type`, `recommended_loss`, `recommended_metrics`, `recommended_normalization`, `dataset_name`, `dtypes`, `feature_names`, `nullable`, `shapes`, `profile_source`
 
 ### 步骤 3：注册自定义策略
 
@@ -209,7 +209,7 @@ python -m senseframe.cli recommend --dataset UT_HAR_data --priority balanced
 python -m senseframe.cli experiment --config configs/exp.yaml --dry-run
 ```
 
-检查项：配置校验、场景注册、数据集/模型/学习模式支持、资源探测、数据存在性、显存、磁盘。
+检查项：配置校验、场景注册、数据集/模型/学习模式支持、资源探测、数据存在性、**文件扩展名声明一致性**（基于 DatasetSpec.file_format + layout 递归 glob，扩展名不匹配时 dry-run 阶段即报错）、显存、磁盘。
 
 ### 步骤 7：执行训练
 
@@ -260,9 +260,8 @@ ctx.release_resources()  # 主动清理 Trainer/DataLoader/Logger/GPU 显存
 ### 步骤 10：后处理与导出
 
 ```bash
-# 后处理：拷贝模型 + 生成推理脚本
-python scripts/postprocess.py --output-dir runs/<实验目录> \
-  --models-dir models --result-dir result
+# 后处理：拷贝模型 + 生成推理脚本（所有产物均在 output_dir 内）
+python scripts/postprocess.py --output-dir runs/<实验目录>
 
 # 模型导出
 python -m senseframe.cli export \
@@ -271,6 +270,8 @@ python -m senseframe.cli export \
     --formats onnx,torchscript,state_dict \
     --output-dir exports/
 ```
+
+注：`postprocess.py` 仅接受 `--output-dir` 参数（P0-1.5 路径安全修复后，所有后处理产物均在 output_dir 内，manifest 存相对路径）。`metadata.config` 自动包含 `data_root`（stage_export 显式补录），推理脚本生成不依赖外部路径输入。
 
 格式：`state_dict` / `torchscript` / `onnx` / `quantized_onnx`
 
@@ -299,11 +300,14 @@ python -m senseframe.cli export \
 | `DATASET_NOT_SUPPORTED` | `DatasetNotSupportedError` | 检查 dataset 名 |
 | `MODEL_NOT_SUPPORTED` | `ModelNotSupportedError` | 检查 model_id |
 | `DATA_NOT_FOUND` | `DataNotFoundError` | 检查 data_root，不重试 |
+| `DATA_LOAD_ERROR` | `DataCorruptedError` | 检查数据完整性/格式/权限（JSON/pickle 损坏、PermissionError） |
 | `OOM_ERROR` | `OOMError` | 降 batch_size 重试 |
+| `CHECKPOINT_ERROR` | `CheckpointError` | 检查 checkpoint 路径/版本兼容/完整性 |
 | `PREFLIGHT_ERROR` | `PreflightError` | 升级硬件或换小模型 |
 | `TRAINING_ERROR` | `TrainingError` | 查看 traceback |
 | `MODEL_BUILD_ERROR` | `ModelBuildError` | 检查 model_id |
 | `SAVE_ERROR` | `SaveError` | 检查磁盘空间/权限 |
+| `UNKNOWN_ERROR` | `SenseFrameError`（基类） | 兜底分类，查看 traceback |
 
 ```python
 from senseframe.engine.runner.errors import SenseFrameError, OOMError
@@ -345,7 +349,7 @@ pipeline.stages_with_spec()  # List[StageSpec]，每项含 name / reads / writes
 
 # 顶层自省 API
 sf.context_schema()       # PipelineContext.schema() 的便捷入口
-sf.stage_io("stage_train") # 查询单个 stage 的 reads / writes
+sf.stage_io("train") # 查询单个 stage 的 reads / writes（stage 名无 stage_ 前缀）
 sf.list_stages()          # 列出全部 stage 名
 sf.pipeline_graph()       # 返回 DAG 描述
 sf.data_bundle_schema()   # DatasetBundle.schema()
@@ -377,7 +381,7 @@ tracker.save(output_dir / "exploration.json")
 
 # 技能库：将成功策略保存为可复用 Skill
 sf.save_skill(name="wifi_csi_focal", description="WiFi CSI + Focal Loss",
-              code="register_loss('focal')(...)", version="1.0.0")
+              code="register_loss('focal')(...)", tags=["wifi_csi", "focal"])
 skill = sf.load_skill("wifi_csi_focal")
 matches = sf.search_skills(query="WiFi CSI")
 all_skills = sf.list_skills()
@@ -389,10 +393,10 @@ all_skills = sf.list_skills()
 | `PipelineContext.exploration_history` | 探索历史列表 |
 | `PipelineContext.feedback` | 结构化反馈（first-class 字段，RFC-004） |
 | `ExplorationTracker(history)` | 探索状态管理器，支持 save / recommend_next |
-| `save_skill(name, description, code, version)` | 保存技能 |
+| `save_skill(name, description, code, tags, source_path)` | 保存技能 |
 | `load_skill(name, version=None)` | 加载技能（None = 最新版） |
 | `search_skills(query)` | 全文检索技能 |
-| `list_skills()` | 列出全部技能 |
+| `list_skills()` | 列出全部技能名（返回 `List[str]`） |
 
 ## 断点续跑
 
@@ -548,11 +552,19 @@ from senseframe.nas.search_space import NASSearchSpace
 sf.register_sampler("darts", DARTSSampler)  # 已内置注册
 
 # 方式 B：直接运行 DARTSPipelineRun（含 supernet 训练 + arch 搜索）
+# 修复（文档契约）：DARTSPipelineRun 构造参数是
+#   sampler: DARTSSampler, builder: ArchitectureBuilder, search_space: SearchSpace,
+#   input_shape: Tuple[int, ...], num_classes: int, n_epochs: int,
+#   lr_w: float, lr_arch: float
+# 旧文档用 supernet/train_loader/val_loader（不存在）+ lr_arch=3e-4（代码默认 1e-3）。
 from senseframe.nas.darts import DARTSPipelineRun
 run = DARTSPipelineRun(
-    supernet=supernet, search_space=nas_space,
-    train_loader=train_loader, val_loader=val_loader,
-    n_epochs=50, lr_arch=3e-4, lr_w=1e-3,
+    sampler=darts_sampler,         # DARTSSampler 实例（上面 register_sampler 的对象）
+    builder=arch_builder,          # ArchitectureBuilder 实例
+    search_space=nas_space,        # SP SearchSpace
+    input_shape=(1, 250, 90),      # 模型输入形状（不含 batch 维）
+    num_classes=7,
+    n_epochs=50, lr_w=0.025, lr_arch=0.001,  # 代码默认值；可按需覆盖
 )
 result = run.run(train_loader, val_loader)
 # result = {"best_arch": ..., "final_alpha": ..., "history": [...]}
@@ -592,7 +604,12 @@ policy = AutoAugmentPolicyBuilder().from_params(trial.params).build()
 ```python
 from senseframe.automl.meta_learner import MetaLearner
 
-learner = MetaLearner()
+# 修复（文档契约）：MetaLearner 构造需要 study_manager + history_store 两个必填参数。
+# 旧文档用 MetaLearner() 无参构造，与代码契约不符，会抛 TypeError。
+learner = MetaLearner(
+    study_manager=sm,         # StudyManager 实例（前面创建的）
+    history_store=store,      # HistoryStore 实例（前面创建的）
+)
 # 从源数据集历史中提取成功策略
 learner.warm_start(study_id=target_study_id,
                    source_dataset="UT_HAR_data",

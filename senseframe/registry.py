@@ -26,6 +26,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
+# P2-1 修复：list_models/list_datasets 在未激活场景时 warning 提示
+import logging
+_logger = logging.getLogger(__name__)
+
 
 # ============================================================
 # 数据类
@@ -76,9 +80,23 @@ class DatasetSpec:
     dir_names: Tuple[str, ...] = ()        # 可能的目录名（如 ("Widardata", "Widar")）
     file_format: str = "auto"              # auto / csv / npy / mat / image
     loader_type: str = "auto"              # auto / tensor / csi_mat / csv_folder / image_folder / numpy / streaming_csv
+    # P0-1.7: 目录结构声明，loader 按 spec 声明 glob，禁止探测 fallback
+    # nested = 类别子目录（<root>/<class_dir>/<sample>.<ext>）
+    # flat   = 扁平结构（<root>/<sample>.<ext>）
+    layout: str = "nested"
     # 自监督模式
     unsupervised_source: str = ""          # 自监督预训练数据集名
     supervised_source: str = ""            # 监督微调数据集名
+    # 修复根因（P2）：训练集样本数，供 get_default_epochs 动态计算推荐 epochs。
+    # None 表示未知 → get_default_epochs 回退到纯静态表查询（向后兼容）。
+    # 实测 UT_HAR_data+ResNet18 静态表 200 epoch 但 19 epoch 就早停，
+    # 硬编码上限不合理，需基于数据集规模动态收敛。
+    n_samples: Optional[int] = None
+    # P2-3 修复：验证集策略声明
+    # has_native_val=True 表示原始数据含独立 val split（如 UT_HAR_data 的 X_val/y_val）
+    # val_split_ratio 非 None 表示从 train 自动划分 val 的比例（如 0.1 = 10%）
+    has_native_val: bool = False
+    val_split_ratio: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -89,6 +107,10 @@ class DatasetSpec:
             "dir_names": list(self.dir_names),
             "file_format": self.file_format,
             "loader_type": self.loader_type,
+            "layout": self.layout,
+            "n_samples": self.n_samples,
+            "has_native_val": self.has_native_val,
+            "val_split_ratio": self.val_split_ratio,
         }
 
 
@@ -248,12 +270,11 @@ def bind_model_factory(
         dataset: 数据集名（"*" 表示匹配任意数据集，需用户自行保证）
         factory: 无参（或仅位置/关键字参数）可调用对象，返回 nn.Module
         learning_mode: "supervised" / "self_supervised" / "*"
-        default_epochs: 该 (model, dataset) 组合的默认训练轮数
+        default_epochs: 已废弃（方案 B 去静态化），保留参数向后兼容，不再写入 _EPOCHS_TABLE
     """
     key = (model_id, dataset, learning_mode)
     _FACTORY_BINDINGS[key] = factory
-    if default_epochs is not None:
-        _EPOCHS_TABLE[(model_id, dataset)] = default_epochs
+    # 方案 B：不再写入 _EPOCHS_TABLE，epochs 完全由 _compute_epochs_budget 动态计算
 
 
 def bind_scene_factory(
@@ -276,33 +297,56 @@ def bind_scene_factory(
         dataset: 数据集名
         factory: 可调用对象，返回 nn.Module
         learning_mode: "supervised" / "self_supervised" / "*"
-        default_epochs: 该 (model, dataset) 组合的默认训练轮数
+        default_epochs: 已废弃（方案 B 去静态化），保留参数向后兼容，不再写入 _SCENE_EPOCHS
     """
     if scene_name not in _SCENE_FACTORIES:
         _SCENE_FACTORIES[scene_name] = {}
     key = (model_id, dataset, learning_mode)
     _SCENE_FACTORIES[scene_name][key] = factory
-    if default_epochs is not None:
-        set_scene_epochs(scene_name, model_id, dataset, default_epochs)
+    # 方案 B：不再调用 set_scene_epochs，epochs 完全由 _compute_epochs_budget 动态计算
 
 
 def set_default_epochs(model_id: str, dataset: str, epochs: int) -> None:
-    """单独设置默认 epoch（全局级，不绑定工厂）。"""
-    _EPOCHS_TABLE[(model_id, dataset)] = epochs
+    """设置默认 epoch（方案 B 后已废弃：框架不再维护静态 epochs 表）。
+
+    方案 B 去静态化：epochs 完全由 _compute_epochs_budget(n_samples) 动态计算。
+    本函数保留签名（公共 API 向后兼容），但不再写入 _EPOCHS_TABLE。
+    调用方应改用 get_default_epochs(n_samples=...) 获取动态预算。
+
+    Args:
+        model_id: 模型 ID
+        dataset: 数据集名
+        epochs: 已忽略（保留参数向后兼容）
+    """
+    import logging
+    logging.getLogger(__name__).debug(
+        "set_default_epochs is deprecated (方案 B 去静态化): "
+        "model_id=%s, dataset=%s, epochs=%s ignored. "
+        "Use get_default_epochs(n_samples=...) instead.",
+        model_id, dataset, epochs,
+    )
 
 
 def set_scene_epochs(scene_name: str, model_id: str, dataset: str, epochs: int) -> None:
-    """设置场景级默认 epoch。
+    """设置场景级默认 epoch（方案 B 后已废弃：框架不再维护静态 epochs 表）。
+
+    方案 B 去静态化：epochs 完全由 _compute_epochs_budget(n_samples) 动态计算。
+    本函数保留签名（__init__.py 导出 + 场景注册调用），但不再写入 _SCENE_EPOCHS。
+    调用方应改用 get_default_epochs(n_samples=...) 获取动态预算。
 
     Args:
         scene_name: 场景名
         model_id: 模型 ID
         dataset: 数据集名
-        epochs: 默认训练轮数
+        epochs: 已忽略（保留参数向后兼容）
     """
-    if scene_name not in _SCENE_EPOCHS:
-        _SCENE_EPOCHS[scene_name] = {}
-    _SCENE_EPOCHS[scene_name][(model_id, dataset)] = epochs
+    import logging
+    logging.getLogger(__name__).debug(
+        "set_scene_epochs is deprecated (方案 B 去静态化): "
+        "scene=%s, model_id=%s, dataset=%s, epochs=%s ignored. "
+        "Use get_default_epochs(n_samples=...) instead.",
+        scene_name, model_id, dataset, epochs,
+    )
 
 
 def get_model_spec(model_id: str, version: Optional[str] = None) -> Optional[ModelSpec]:
@@ -384,8 +428,12 @@ def register_dataset(
     dir_names: Tuple[str, ...] = (),
     file_format: str = "auto",
     loader_type: str = "auto",
+    layout: str = "nested",
     unsupervised_source: str = "",
     supervised_source: str = "",
+    n_samples: Optional[int] = None,
+    has_native_val: bool = False,
+    val_split_ratio: Optional[float] = None,
     overwrite: bool = False,
 ) -> DatasetSpec:
     if not overwrite and name in _DATASET_REGISTRY:
@@ -397,8 +445,12 @@ def register_dataset(
         dir_names=tuple(dir_names),
         file_format=file_format,
         loader_type=loader_type,
+        layout=layout,
         unsupervised_source=unsupervised_source,
         supervised_source=supervised_source,
+        n_samples=n_samples,
+        has_native_val=has_native_val,
+        val_split_ratio=val_split_ratio,
     )
     _DATASET_REGISTRY[name] = spec
     return spec
@@ -740,38 +792,104 @@ def get_model(
     return factory(num_classes=num_classes)
 
 
-def get_default_epochs(model_id: str, dataset: str, *, scene_name: Optional[str] = None) -> int:
-    """获取模型在指定数据集上的默认 epoch 数。
+def _compute_epochs_budget(n_samples: int) -> int:
+    """估算 epoch 预算上限（非最优值）。
 
-    查找顺序：场景级（如果 scene_name 提供）→ 全局级 → 其他场景级。
+    语义：max_epochs 是计算预算，实际停止由 Early Stopping 决定。
+    样本越多每 epoch 信息越密，所需预算越少。
+    公式：base = clamp(150000 / n_samples, 30, 300)
+
+    实测验证：
+    - UT_HAR_data(3977 samples) → 37（实测 best epoch 3-14，预算充足）
+    - Widar(5000 samples) → 30
+    - NTU-Fi_HAR(700 samples) → 214（小数据集需充分训练）
+
+    设计决策（风险推演 R4 + 方案 B 去静态化）：
+    - 消除模型范式系数：模型差异由 Early Stopping 实时吸收，无需预测
+    - 消除分段：单公式连续函数，减少调优面
+    - 不自动调整 patience：业界共识 patience 是用户决策，框架只提供
+      epoch_utilization（best_epoch/epochs）供 Agent 分析
+    - 彻底删除 _EPOCHS 静态表：epochs 完全由本函数动态计算，无静态 fallback
     """
-    key = (model_id, dataset)
-    # 1) 场景级
-    if scene_name and scene_name in _SCENE_EPOCHS:
-        if key in _SCENE_EPOCHS[scene_name]:
-            return _SCENE_EPOCHS[scene_name][key]
-    # 2) 全局级
-    if key in _EPOCHS_TABLE:
-        return _EPOCHS_TABLE[key]
-    # 3) 其他场景级（scene_name=None 时回退）
-    if scene_name is None:
-        for sn, epochs_map in _SCENE_EPOCHS.items():
-            if key in epochs_map:
-                return epochs_map[key]
-    raise ValueError(f"No default epochs for ({model_id}, {dataset})")
+    if n_samples is None or n_samples <= 0:
+        raise ValueError(
+            f"n_samples required for epochs budget (got {n_samples}). "
+            "框架不再提供静态 epochs 表，必须传入训练集样本数。"
+        )
+    return max(30, min(300, 150000 // n_samples))
+
+
+def get_default_epochs(
+    model_id: str,
+    dataset: str,
+    *,
+    scene_name: Optional[str] = None,
+    n_samples: Optional[int] = None,
+) -> int:
+    """获取模型在指定数据集上的默认 epoch 数（方案 B：完全动态）。
+
+    方案 B 去静态化后，epochs 完全由 _compute_epochs_budget(n_samples) 动态计算。
+    不再查 _EPOCHS_TABLE / _SCENE_EPOCHS 静态表（已清空，不再写入）。
+    scene_name 参数保留但不再影响结果（向后兼容签名）。
+
+    Args:
+        model_id: 模型 ID（保留参数，未来可按模型范式调整预算，当前未使用）
+        dataset: 数据集名（保留参数，当前未使用）
+        scene_name: 场景名（保留参数，向后兼容，当前不影响结果）
+        n_samples: 训练集样本数（必填，>0）。无此信息时 raise ValueError，
+            框架不猜测、不回退默认值。
+
+    Raises:
+        ValueError: n_samples 未提供或 <=0 时
+    """
+    if n_samples is None or n_samples <= 0:
+        raise ValueError(
+            f"get_default_epochs requires n_samples (got {n_samples}). "
+            f"框架已删除静态 epochs 表，必须传入训练集样本数。"
+            f"model_id={model_id}, dataset={dataset}, scene_name={scene_name}"
+        )
+    return _compute_epochs_budget(n_samples)
 
 
 def list_models(
     dataset: Optional[str] = None,
     paradigm: Optional[str] = None,
     enabled_only: bool = True,
+    route_level: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """列出模型，可按数据集/范式过滤。"""
+    """列出模型，可按数据集/范式/路由级别过滤。
+
+    Args:
+        dataset: 数据集名，提供时仅返回支持该数据集的模型
+        paradigm: 范式名（如 supervised/self_supervised），提供时仅返回该范式的模型
+        enabled_only: True 时仅返回 enabled=True 的模型
+        route_level: P3-3 新增——资源路由级别（如 gpu_standard/cpu_only）。
+            提供时仅返回该路由下可用的模型（委托 ResourceRouter.filter_models），
+            与 recommend 命令的过滤能力对称。
+    """
+    # P2-1 修复：未激活场景时 registry 为空，warning 提示用户先 activate_lazy_scenes
+    if len(_MODEL_REGISTRY) == 0:
+        _logger.warning(
+            "list_models: registry 为空，可能未调用 activate_lazy_scenes()。"
+            "请先 import senseframe as sf; sf.activate_lazy_scenes() 再查询。"
+        )
+    # P3-3：route_level 过滤委托 ResourceRouter
+    if route_level is not None:
+        from .routing import ResourceRouter
+        try:
+            allowed_ids = set(ResourceRouter.filter_models(route_level))
+        except Exception:
+            _logger.warning("list_models: route_level='%s' 过滤失败，忽略过滤", route_level)
+            allowed_ids = None
+    else:
+        allowed_ids = None
     results: List[Dict[str, Any]] = []
     for model_id, spec in iter_model_specs():
         if enabled_only and not spec.enabled:
             continue
         if paradigm and spec.paradigm != paradigm:
+            continue
+        if allowed_ids is not None and model_id not in allowed_ids:
             continue
         if dataset and dataset not in DATASET_INFO:
             continue
@@ -790,18 +908,37 @@ def list_models(
     return results
 
 
-def get_model_info(model_id: str, dataset: Optional[str] = None) -> Dict[str, Any]:
-    """查询单个模型详情。"""
+def get_model_info(
+    model_id: str,
+    dataset: Optional[str] = None,
+    *,
+    scene_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """查询单个模型详情。
+
+    Args:
+        model_id: 模型 ID
+        dataset: 数据集名，提供时附加 default_epochs
+        scene_name: 场景名。提供时优先从场景级 epoch 表查找 default_epochs，
+            缩小查找范围到该 scene（不回退搜索其他场景）。
+            None（默认）保持旧行为：全局级 → 其他场景级回退搜索。
+    """
     if not is_model_registered(model_id):
         raise ValueError(f"Unknown model_id: {model_id}")
     info = {"model_id": model_id, **get_model_spec(model_id).to_dict()}
     if dataset:
-        info["default_epochs"] = get_default_epochs(model_id, dataset)
+        info["default_epochs"] = get_default_epochs(model_id, dataset, scene_name=scene_name)
     return info
 
 
 def list_datasets() -> List[Dict[str, Any]]:
     """列出所有可用数据集。"""
+    # P2-1 修复：未激活场景时 registry 为空，warning 提示用户先 activate_lazy_scenes
+    if len(_DATASET_REGISTRY) == 0:
+        _logger.warning(
+            "list_datasets: registry 为空，可能未调用 activate_lazy_scenes()。"
+            "请先 import senseframe as sf; sf.activate_lazy_scenes() 再查询。"
+        )
     return [{"name": k, **v} for k, v in DATASET_INFO.items()]
 
 

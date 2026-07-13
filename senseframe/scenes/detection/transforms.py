@@ -50,6 +50,7 @@ def hsv_jitter(
     hue: float = 0.1,
     saturation: float = 0.1,
     brightness: float = 0.1,
+    rng: Optional[np.random.Generator] = None,
 ) -> np.ndarray:
     """HSV 空间抖动增强。
 
@@ -60,6 +61,7 @@ def hsv_jitter(
         hue: H 通道抖动幅度（0~1）
         saturation: S 通道抖动幅度（0~1）
         brightness: V 通道抖动幅度（0~1）
+        rng: 可选的独立随机数生成器（P3 上策）
 
     Returns:
         增强后的图像，shape 与输入一致
@@ -73,12 +75,14 @@ def hsv_jitter(
         # 非 RGB 三通道图像，直接返回（不做 HSV 变换）
         return x.copy()
 
+    r = rng if rng is not None else np.random
+
     # 归一化到 [0, 1] 用于 HSV 转换
     h, w = x_chw.shape[1], x_chw.shape[2]
     rgb = np.clip(x_chw, 0, 255) / 255.0 if x_chw.max() > 1.0 else x_chw.copy()
 
     # RGB -> HSV（向量化）
-    r, g, b = rgb[0], rgb[1], rgb[2]
+    r_chan, g_chan, b_chan = rgb[0], rgb[1], rgb[2]
     mx = np.max(rgb, axis=0)
     mn = np.min(rgb, axis=0)
     diff = mx - mn
@@ -89,19 +93,19 @@ def hsv_jitter(
     # 计算 H
     h_chan = np.zeros((h, w), dtype=np.float64)
     # R 最大
-    mask_r = (mx == r) & (diff > 0)
-    h_chan[mask_r] = (60.0 * ((g - b) / np.maximum(diff, 1e-10)))[mask_r] % 360.0
+    mask_r = (mx == r_chan) & (diff > 0)
+    h_chan[mask_r] = (60.0 * ((g_chan - b_chan) / np.maximum(diff, 1e-10)))[mask_r] % 360.0
     # G 最大
-    mask_g = (mx == g) & (diff > 0)
-    h_chan[mask_g] = (60.0 * (2.0 + (b - r) / np.maximum(diff, 1e-10)))[mask_g] % 360.0
+    mask_g = (mx == g_chan) & (diff > 0)
+    h_chan[mask_g] = (60.0 * (2.0 + (b_chan - r_chan) / np.maximum(diff, 1e-10)))[mask_g] % 360.0
     # B 最大
-    mask_b = (mx == b) & (diff > 0)
-    h_chan[mask_b] = (60.0 * (4.0 + (r - g) / np.maximum(diff, 1e-10)))[mask_b] % 360.0
+    mask_b = (mx == b_chan) & (diff > 0)
+    h_chan[mask_b] = (60.0 * (4.0 + (r_chan - g_chan) / np.maximum(diff, 1e-10)))[mask_b] % 360.0
 
     # 加噪声
-    h_chan = (h_chan + np.random.uniform(-hue, hue, (h, w)) * 360.0) % 360.0
-    s = np.clip(s + np.random.uniform(-saturation, saturation, (h, w)), 0.0, 1.0)
-    v = np.clip(v + np.random.uniform(-brightness, brightness, (h, w)), 0.0, 1.0)
+    h_chan = (h_chan + r.uniform(-hue, hue, (h, w)) * 360.0) % 360.0
+    s = np.clip(s + r.uniform(-saturation, saturation, (h, w)), 0.0, 1.0)
+    v = np.clip(v + r.uniform(-brightness, brightness, (h, w)), 0.0, 1.0)
 
     # HSV -> RGB
     c = v * s
@@ -135,13 +139,14 @@ def hsv_jitter(
     return _from_chw(rgb_out, was_hwc)
 
 
-def cutout(x: np.ndarray, n_holes: int = 1, length: int = 16) -> np.ndarray:
+def cutout(x: np.ndarray, n_holes: int = 1, length: int = 16, rng: Optional[np.random.Generator] = None) -> np.ndarray:
     """随机遮挡增强：在图像上随机选 n_holes 个矩形区域置零。
 
     Args:
         x: 输入图像，shape (C,H,W) 或 (H,W,C)
         n_holes: 遮挡区域数量（必须 >= 1）
         length: 遮挡区域边长（像素，必须 >= 1）
+        rng: 可选的独立随机数生成器（P3 上策）
 
     Returns:
         遮挡后的图像
@@ -162,11 +167,12 @@ def cutout(x: np.ndarray, n_holes: int = 1, length: int = 16) -> np.ndarray:
     if x_chw.ndim != 3:
         return x.copy()
 
+    r = rng if rng is not None else np.random
     c, h, w = x_chw.shape
     result = x_chw.copy()
     for _ in range(n_holes):
-        cy = np.random.randint(0, h)
-        cx = np.random.randint(0, w)
+        cy = r.integers(0, h)
+        cx = r.integers(0, w)
         y1 = np.clip(cy - length // 2, 0, h)
         y2 = np.clip(cy + length // 2, 0, h)
         x1 = np.clip(cx - length // 2, 0, w)
@@ -180,6 +186,7 @@ def mixup(
     x: np.ndarray,
     y: np.ndarray,
     alpha: float = 0.2,
+    rng: Optional[np.random.Generator] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """MixUp 增强：对样本及其标签做线性插值混合。
 
@@ -190,6 +197,7 @@ def mixup(
         x: 输入样本，shape (N, ...) 或单样本 (...)
         y: one-hot 标签，shape (N, num_classes) 或 (num_classes,)
         alpha: Beta 分布参数（0 时无混合）
+        rng: 可选的独立随机数生成器（P3 上策）
 
     Returns:
         (x_out, y_out)：混合后的样本与标签
@@ -211,10 +219,11 @@ def mixup(
     if alpha <= 0:
         return x.copy(), y.copy()
 
+    r = rng if rng is not None else np.random
     # 从 Beta(alpha, alpha) 采样混合系数
-    lam = np.random.beta(alpha, alpha)
+    lam = r.beta(alpha, alpha)
     # 随机打乱索引
-    perm = np.random.permutation(n)
+    perm = r.permutation(n)
     x_mix = lam * x + (1.0 - lam) * x[perm]
     # y 需要是 one-hot 才能线性插值
     if y.ndim == 1:
@@ -231,6 +240,7 @@ def random_erasing(
     x: np.ndarray,
     area_ratio: Tuple[float, float] = (0.02, 0.2),
     min_aspect: float = 0.3,
+    rng: Optional[np.random.Generator] = None,
 ) -> np.ndarray:
     """随机擦除增强：随机选择一块区域置零（区域面积和长宽比随机）。
 
@@ -240,6 +250,7 @@ def random_erasing(
         x: 输入图像，shape (C,H,W) 或 (H,W,C)
         area_ratio: 擦除区域面积占图像面积的比例范围 (min, max)
         min_aspect: 擦除区域最小长宽比
+        rng: 可选的独立随机数生成器（P3 上策）
 
     Returns:
         擦除后的图像
@@ -263,18 +274,19 @@ def random_erasing(
     if x_chw.ndim != 3:
         return x.copy()
 
+    r = rng if rng is not None else np.random
     c, h, w = x_chw.shape
     img_area = float(h * w)
     # 最多尝试 10 次找到合法的擦除区域
     for _ in range(10):
-        erase_area = img_area * np.random.uniform(lo, hi)
-        aspect = np.random.uniform(min_aspect, 1.0 / min_aspect)
+        erase_area = img_area * r.uniform(lo, hi)
+        aspect = r.uniform(min_aspect, 1.0 / min_aspect)
         eh = int(round(np.sqrt(erase_area * aspect)))
         ew = int(round(np.sqrt(erase_area / aspect)))
         if eh < 1 or ew < 1 or eh >= h or ew >= w:
             continue
-        cy = np.random.randint(0, h - eh)
-        cx = np.random.randint(0, w - ew)
+        cy = r.integers(0, h - eh)
+        cx = r.integers(0, w - ew)
         result = x_chw.copy()
         result[:, cy:cy + eh, cx:cx + ew] = 0.0
         return _from_chw(result, was_hwc)
@@ -375,15 +387,16 @@ def list_transforms() -> list:
     return sorted(TRANSFORM_REGISTRY.keys())
 
 
-def compose_transforms(names: list, **kwargs) -> callable:
+def compose_transforms(names: list, seed: Optional[int] = None, **kwargs) -> callable:
     """组合多个 transform 原语为单一函数。
 
     Args:
         names: 原语名列表，如 ["hsv_jitter", "cutout"]
+        seed: 可选的随机种子（P3 上策，详见 wifi_csi.transforms.compose_transforms）
         **kwargs: 传递给每个原语的参数（按原语名分组）
 
     Returns:
-        组合后的函数 fn(x, y) -> (x, y)
+        ComposedTransform 实例（callable，可 pickle 供 DataLoader multi-worker 使用）
     """
     transforms = []
     for name in names:
@@ -392,29 +405,49 @@ def compose_transforms(names: list, **kwargs) -> callable:
             raise ValueError(f"Unknown transform: {name}. Available: {list_transforms()}")
         transforms.append((name, fn))
 
-    def composed(x, y=None):
+    return ComposedTransform(transforms, kwargs, seed=seed)
+
+
+class ComposedTransform:
+    """组合多个 transform 原语的 callable 类（可 pickle）。
+
+    替代旧 composed 闭包，确保 DataLoader num_workers>0 时序列化不失败。
+    处理 mixup 原语需要同时变换 x 和 y 的特殊情况。
+    P3 上策：持有独立 np.random.Generator，在 __call__ 中注入到原语，
+    消除对全局 np.random 状态的依赖。
+    """
+
+    def __init__(self, transforms, kwargs, seed: Optional[int] = None):
+        import inspect
+        self.transforms = list(transforms)
+        self.kwargs = dict(kwargs)
+        self.rng = np.random.default_rng(seed) if seed is not None else None
+        self._accepts_rng = [
+            'rng' in inspect.signature(fn).parameters for _, fn in self.transforms
+        ]
+
+    def __call__(self, x, y=None):
         import torch
         x_np = x.numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
         y_np = y.numpy() if isinstance(y, torch.Tensor) else (
             np.asarray(y) if y is not None else None
         )
-        for name, fn in transforms:
-            params = kwargs.get(name, {})
+        for (name, fn), accepts_rng in zip(self.transforms, self._accepts_rng):
+            params = self.kwargs.get(name, {})
+            rng_kw = {'rng': self.rng} if accepts_rng else {}
             # mixup 需要同时处理 x 和 y
             if name == "mixup":
                 if y_np is not None:
-                    x_np, y_np = fn(x_np, y_np, **params)
+                    x_np, y_np = fn(x_np, y_np, **rng_kw, **params)
                 else:
-                    x_np = fn(x_np, **params)
+                    x_np = fn(x_np, **rng_kw, **params)
             else:
-                x_np = fn(x_np, **params)
+                x_np = fn(x_np, **rng_kw, **params)
         x_out = torch.from_numpy(x_np).float() if isinstance(x, torch.Tensor) else x_np
         y_out = None
         if y_np is not None:
             y_out = torch.from_numpy(y_np).float() if isinstance(y, torch.Tensor) else y_np
         return x_out, y_out
-
-    return composed
 
 
 __all__ = [

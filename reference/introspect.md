@@ -33,14 +33,18 @@ sf.context_schema()  # 顶层便捷入口
 
 | Stage | 填充字段 |
 |-------|----------|
-| `init`（构造注入） | `config` |
+| `init`（构造注入） | `config`, `dry_run` |
 | `stage_validate` | `scene`, `meta`, `model_id`, `dataset`, `learning_mode` |
 | `stage_preflight` | `report`, `route_level`, `route_config`, `output` |
-| `stage_resolve` | `scene_kwargs`, `scene_info`, `num_classes`, `task_spec`, `feature_spec`, `resolved`, `lightning_params`, `distributed_kwargs` |
-| `stage_load` | `bundle`, `data_profile`, `output_dir`, `log_writer` |
+| `stage_resolve` | `scene_info`, `num_classes`, `task_spec`, `feature_spec`, `resolved`, `lightning_params`, `distributed_kwargs` |
+| `stage_load` | `scene_kwargs`, `bundle`, `data_profile`, `output_dir`, `log_writer`, `data_hash` |
 | `stage_build` | `model`, `datamodule`, `module`, `callbacks`, `pl_logger`, `csv_logger`, `monitor` |
-| `stage_train` | `trainer` |
-| `agent`（运行时） | `trial_id`, `parent_trial_id`, `exploration_history`, `extra`, `completed_stages`, `stage_checkpoint_path` |
+| `stage_probe_vram` | `vram_probe_result`（方案 B：动态显存探测结果，写入 metadata.resource.vram_probe） |
+| `stage_train` | `trainer`, `training_duration_s`, `best_model_path`, `best_model_score`, `best_epoch`, `intermediate_values` |
+| `stage_export`（metadata） | `best_epoch`, `best_model_path`, `best_model_score`, `epoch_utilization` 持久化到 metadata.json + pipeline_checkpoint.json |
+| `stage_eval` | `final_eval`, `training_log`, `early_stopped`, `feedback` |
+| `stage_export` | `artifact_registry` |
+| `agent`（运行时） | `trial_id`, `parent_trial_id`, `exploration_history`, `extra`, `completed_stages`, `stage_checkpoint_path`, `failed_stage`, `failed_error` |
 
 ### 运行时状态查询
 
@@ -57,7 +61,7 @@ ctx.describe()                 # 运行时状态摘要
 ```python
 {
     "completed_fields": ["config", "scene", "meta", ...],
-    "extra_keys": ["feedback", "failed_stage"],     # extra 字典的键
+    "extra_keys": [],     # extra 字典的键（用户自定义扩展，框架不写入；feedback/failed_stage 是 first-class 字段，不在 extra 中）
     "trial_id": "trial_0001",
     "completed_stages": ["validate", "preflight", "resolve", "load"],
 }
@@ -156,8 +160,8 @@ import senseframe as sf
 sf.list_stages()
 # ["validate", "preflight", "resolve", "load", "build", "train", "eval", "export"]
 
-# 查询单个 stage 的 reads / writes
-sf.stage_io("stage_train")
+# 查询单个 stage 的 reads / writes（stage 名无 stage_ 前缀）
+sf.stage_io("train")
 # {"name": "train", "reads": [...], "writes": [...], "description": "..."}
 
 # 查询全部 stage 的 IO 声明
@@ -200,7 +204,7 @@ pipeline.stages_with_spec()  # 含 my_eval 的 StageSpec
 | `trial_id` | `Optional[str]` | 当前试验 ID |
 | `parent_trial_id` | `Optional[str]` | 父试验 ID（支持回溯） |
 | `exploration_history` | `List[Dict]` | 探索历史列表 |
-| `extra["feedback"]` | `Dict` | stage_eval 产出的结构化反馈 |
+| `feedback` | `Optional[Dict]` | stage_eval 产出的结构化反馈（first-class 字段） |
 
 ### record_trial()
 
@@ -231,7 +235,7 @@ ctx.record_trial(
 
 ### stage_eval 结构化反馈
 
-`stage_eval` 自动调用 `analyze_training_result` 产出 feedback，写入 `ctx.extra["feedback"]` 和 `exploration_history[-1]`：
+`stage_eval` 自动调用 `analyze_training_result` 产出 feedback，写入 `ctx.feedback`（first-class 字段）和 `exploration_history[-1]`：
 
 | status | 触发条件 | suggestions 示例 |
 |--------|----------|------------------|
@@ -461,4 +465,4 @@ sf.data_profile_schema()
 }
 ```
 
-`DataProfile` 实例字段：`n_samples`, `input_shape`, `n_classes`, `class_distribution`, `missing_rate`, `value_range`, `mean`, `std`, `is_spatial`, `is_temporal`, `modality`, `recommended_task_type`, `recommended_loss`, `recommended_metrics`, `recommended_normalization`。
+`DataProfile` 实例字段：`n_samples`, `input_shape`, `n_features`, `n_classes`, `class_distribution`, `missing_rate`, `value_range`, `mean`, `std`, `is_spatial`, `is_temporal`, `modality`, `recommended_task_type`, `recommended_loss`, `recommended_metrics`, `recommended_normalization`, `dataset_name`, `dtypes`, `feature_names`, `nullable`, `shapes`, `profile_source`, `imbalance_ratio`, `recommended_class_weights`。

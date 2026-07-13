@@ -33,6 +33,10 @@ from .registry import (
     is_dataset_registered,
     has_normalization,
     resolve_factory,
+    # P2-1 修复：与 list_losses/list_metrics/list_task_types 对称暴露
+    list_models,
+    list_datasets,
+    get_model_info,
 )
 from .data import normalize, Normalize
 
@@ -93,6 +97,7 @@ from .engine.runner import (
     ArtifactManifest,
     load_manifest,
     verify_artifacts,
+    verify_artifacts_recursive,
 )
 
 # RFC Phase F：代码注入 — load_extension API

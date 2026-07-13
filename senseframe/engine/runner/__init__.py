@@ -58,6 +58,7 @@ from .pipeline import (
     ArtifactManifest,
     load_manifest,
     verify_artifacts,
+    verify_artifacts_recursive,
 )
 # RFC-003 DSP-3：stage 装饰器对外暴露为同名 `stage`
 stage = stage_decorator
@@ -113,4 +114,5 @@ __all__ = [
     "ArtifactManifest",
     "load_manifest",
     "verify_artifacts",
+    "verify_artifacts_recursive",
 ]

@@ -22,6 +22,7 @@ from ..base import (
     SearchSpace,
     TransformConfig,
 )
+from ...common.transforms import ChainedTransform
 from ...data import CSIDataModule, NORMALIZATION_CONSTANTS  # Phase 3.1：从 data.py 导入
 from ...data.normalization import Normalize  # R-fix：统一归一化接口
 from ...registry import (
@@ -46,30 +47,71 @@ __all__ = ["WiFiCSIContainer", "NORMALIZATION_CONSTANTS"]
 # R-fix：归一化统一走 registry 策略注册表（Normalize 类委托 get_normalization），
 # 消除直接读 NORMALIZATION_CONSTANTS 的重复实现。
 # RFC Phase C：变换参数可配置，通过工厂函数生成。
-def _make_ntu_fi_transform(stride: int = 4, reshape=(3, 114, 500), norm_name: str = "NTU-Fi_HAR"):
-    """构造 NTU-Fi 变换函数（RFC Phase C：参数可配置）。
 
-    Agent 可通过 scene.params.transform 注入 stride/reshape/norm_name，
-    消除硬编码封装死点。
+# 修复：将 transform 从闭包改为 callable 类（模块顶层定义，可 pickle）
+# 旧闭包函数无法 pickle，num_workers>0 时 DataLoader 序列化失败：
+# _pickle.PicklingError: Can't pickle local object <function _make_ntu_fi_transform.<locals>.transform>
+class NTUFiTransform:
+    """NTU-Fi 数据变换（callable，可 pickle 供 DataLoader multi-worker 使用）。
+
+    RFC Phase C：参数可配置，Agent 可通过 scene.params.transform 注入 stride/reshape/norm_name。
+
+    修复（forkserver 注册表丢失）：DataLoader worker 在 forkserver 模式下从独立的
+    forkserver 进程 fork，该进程在主进程启动早期创建，此时场景尚未激活，
+    _NORMALIZATION_REGISTRY 为空。因此在 __init__ 中获取并缓存 strategy 对象，
+    __call__ 中直接使用缓存的 strategy，不依赖全局注册表。
+    ZScoreStrategy/IdentityStrategy 仅持有 numpy 标量/数组，可安全 pickle。
     """
-    def transform(x, y):
-        x = Normalize(norm_name)(x, None)[0]
-        x = x[:, ::stride]
-        x = x.reshape(*reshape)
-        return torch.FloatTensor(x), y
-    return transform
+    def __init__(self, stride: int = 4, reshape=(3, 114, 500), norm_name: str = "NTU-Fi_HAR"):
+        self.stride = stride
+        self.reshape = reshape
+        self.norm_name = norm_name
+        # 在主进程构造时获取 strategy 并缓存（可 pickle，随对象传递到 worker）
+        from ...registry import get_normalization
+        self._strategy = get_normalization(norm_name)
+
+    def __call__(self, x, y):
+        x = self._strategy.apply(x)
+        x = x[:, ::self.stride]
+        x = x.reshape(*self.reshape)
+        # float() 显式转 float32（CSIDataset 从 .mat 加载的是 float64）
+        return x.float(), y
+
+
+class WidarTransform:
+    """Widar 数据变换（callable，可 pickle 供 DataLoader multi-worker 使用）。
+
+    同 NTUFiTransform：缓存 strategy 避免 forkserver 模式下注册表丢失。
+    """
+    def __init__(self, reshape=(22, 20, 20), norm_name: str = "Widar"):
+        self.reshape = reshape
+        self.norm_name = norm_name
+        from ...registry import get_normalization
+        self._strategy = get_normalization(norm_name)
+
+    def __call__(self, x, y):
+        x = self._strategy.apply(x)
+        x = x.reshape(*self.reshape)
+        return x.float(), y
+
+
+def _make_ntu_fi_transform(stride: int = 4, reshape=(3, 114, 500), norm_name: str = "NTU-Fi_HAR"):
+    """构造 NTU-Fi 变换（RFC Phase C：参数可配置）。
+
+    返回 NTUFiTransform callable 类实例（可 pickle），替代旧闭包函数。
+    """
+    return NTUFiTransform(stride=stride, reshape=reshape, norm_name=norm_name)
 
 
 def _make_widar_transform(reshape=(22, 20, 20), norm_name: str = "Widar"):
-    """构造 Widar 变换函数（RFC Phase C：参数可配置）。"""
-    def transform(x, y):
-        x = Normalize(norm_name)(x, None)[0]
-        x = x.reshape(*reshape)
-        return torch.FloatTensor(x), y
-    return transform
+    """构造 Widar 变换（RFC Phase C：参数可配置）。
+
+    返回 WidarTransform callable 类实例（可 pickle），替代旧闭包函数。
+    """
+    return WidarTransform(reshape=reshape, norm_name=norm_name)
 
 
-# 向后兼容：保留原硬编码函数（默认参数）
+# 向后兼容：保留原硬编码变量（默认参数）
 _ntu_fi_transform = _make_ntu_fi_transform()
 _widar_transform = _make_widar_transform()
 
@@ -95,6 +137,9 @@ class WiFiCSIContainer(SceneContainer):
             requires_custom_dataloader=True,
             # Phase 6.2：显式声明支持的学习模式
             supported_learning_modes=["supervised", "self_supervised"],
+            # P0 修复：显式声明数据模态为 CSI，覆盖 profiler 的 shape 启发式
+            # （CSI (1,250,90) 与 image (1,H,W) 在 shape 上不可区分）
+            modality="csi",
         )
 
     def load_dataset(self, dataset_name: str, root: str,
@@ -128,10 +173,13 @@ class WiFiCSIContainer(SceneContainer):
             return DatasetBundle(
                 unsupervised=dm.unsupervised_dataset,
                 supervised_finetune=dm.supervised_dataset,
+                val=dm.val_dataset,
                 test=dm.test_dataset,
             )
+        # P2-3 修复：填充 bundle.val，打通 val 传播链路
         return DatasetBundle(
             train=dm.train_dataset,
+            val=dm.val_dataset,
             test=dm.test_dataset,
         )
 
@@ -191,8 +239,14 @@ class WiFiCSIContainer(SceneContainer):
         """返回 (model_id, dataset) 的默认训练配置。
 
         Phase 9.2：通过 **kwargs 接收上下文，符合 LSP。
+        方案 B：epochs 完全动态，需 n_samples。从 dataset spec 获取，无则 raise。
         """
-        epochs = get_default_epochs(model_id, dataset_name, scene_name="wifi_csi")
+        from ...registry import get_dataset_spec, is_dataset_registered
+        n_samples = None
+        if is_dataset_registered(dataset_name):
+            n_samples = get_dataset_spec(dataset_name).n_samples
+        epochs = get_default_epochs(
+            model_id, dataset_name, scene_name="wifi_csi", n_samples=n_samples)
         model_info = MODEL_TABLE.get(model_id, {})
         return DefaultConfig(
             epochs=epochs,
@@ -228,7 +282,7 @@ class WiFiCSIContainer(SceneContainer):
 
         Phase 9.2：通过 **kwargs 接收上下文，符合 LSP。
         """
-        return get_model_info(model_id)
+        return get_model_info(model_id, scene_name=kwargs.get("scene_name"))
 
     def get_transforms(self, dataset_name: str, **kwargs) -> TransformConfig:
         """
@@ -271,20 +325,19 @@ class WiFiCSIContainer(SceneContainer):
         pipeline = transform_cfg_params.get("pipeline")
         augment = transform_cfg_params.get("augment")
         pipeline_params = transform_cfg_params.get("pipeline_params", {})
+        # P3 上策：从配置读取 seed，传递给 compose_transforms 创建独立 Generator
+        transform_seed = transform_cfg_params.get("seed")
 
         train_transform = base_transform
         eval_transform = base_transform
 
         if pipeline:
             from .transforms import compose_transforms
-            pipeline_fn = compose_transforms(pipeline, **pipeline_params)
+            pipeline_fn = compose_transforms(pipeline, seed=transform_seed, **pipeline_params)
 
             if base_transform is not None:
-                def _combined(x, y, _base=base_transform, _pipe=pipeline_fn):
-                    x, y = _base(x, y)
-                    return _pipe(x, y)
-                train_transform = _combined
-                eval_transform = _combined
+                train_transform = ChainedTransform([base_transform, pipeline_fn])
+                eval_transform = train_transform
             else:
                 train_transform = pipeline_fn
                 eval_transform = pipeline_fn
@@ -292,13 +345,12 @@ class WiFiCSIContainer(SceneContainer):
         # RFC-002 阶段 N：数据增强（仅 train，eval 不增强）
         if augment:
             from .transforms import compose_transforms
-            augment_fn = compose_transforms(augment, **pipeline_params)
+            # 增强原语使用与 pipeline 不同的 seed 偏移，避免随机序列重叠
+            augment_seed = None if transform_seed is None else transform_seed + 1
+            augment_fn = compose_transforms(augment, seed=augment_seed, **pipeline_params)
 
             if train_transform is not None:
-                def _train_with_aug(x, y, _base=train_transform, _aug=augment_fn):
-                    x, y = _base(x, y)
-                    return _aug(x, y)
-                train_transform = _train_with_aug
+                train_transform = ChainedTransform([train_transform, augment_fn])
             else:
                 train_transform = augment_fn
 
