@@ -16,7 +16,7 @@ WiFi CSI 场景依赖外部 SenseFi 代码库，框架不猜测路径，调用�
 | 数据集名 | 目录名 | 类别数 | 输入形状 | loader | layout | 用途 |
 |----------|--------|--------|----------|--------|--------|------|
 | `UT_HAR_data` | UT_HAR | 7 | (1, 250, 90) | npy (tensor) | flat | 监督训练 |
-| `NTU-Fi-HumanID` | NTU-Fi-HumanID | 14 | (3, 114, 500) | mat (csi_mat) | flat | 监督训练 / 自监督微调 |
+| `NTU-Fi-HumanID` | NTU-Fi-HumanID | 14 | (3, 114, 500) | mat (csi_mat) | nested | 监督训练 / 自监督微调 |
 | `NTU-Fi_HAR` | NTU-Fi_HAR | 6 | (3, 114, 500) | mat (csi_mat) | nested | 自监督预训练（无监督数据） |
 | `Widar` | Widardata / Widar | 22 | (22, 20, 20) | csv (csv_folder) | nested | 监督训练 |
 

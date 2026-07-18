@@ -49,10 +49,20 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # TrainerConfig 字段集合（用于判断采样参数去向）
 # Phase 14.1.3：从 TrainerConfig dataclass 自动派生，不再硬编码
+# P1 演进（2026-07-18）：TrainerConfig 已迁移到 pydantic v2 BaseModel，
+# 用 model_fields 替代 dataclasses.fields。dataclass 版本回退保留以备
+# 未来其他 dataclass 类型使用。
 # ============================================================
-from dataclasses import fields as _dc_fields
 from .config import TrainerConfig as _TrainerConfig
-_TRAINER_FIELDS = frozenset(f.name for f in _dc_fields(_TrainerConfig))
+
+def _get_field_names(cls) -> frozenset:
+    """统一获取 dataclass / pydantic BaseModel 的字段名集合。"""
+    if hasattr(cls, "model_fields"):  # pydantic v2
+        return frozenset(cls.model_fields.keys())
+    from dataclasses import fields as _dc_fields
+    return frozenset(f.name for f in _dc_fields(cls))
+
+_TRAINER_FIELDS = _get_field_names(_TrainerConfig)
 
 # Phase 12.1：TaskSpec 相关字段（写入 scene.params 由场景容器透传到 TaskSpec）
 _TASK_FIELDS = frozenset({

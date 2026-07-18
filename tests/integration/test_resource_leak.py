@@ -87,10 +87,25 @@ class TestResourceLeak:
             f"线程泄露: before={before['py_threads']}, after={after['py_threads']}, delta=+{delta}"
 
     def _classify_fds(self):
-        """分类当前进程的 fd（pipe/file/socket/other）。"""
+        """分类当前进程的 fd（pipe/file/socket/other）。
+
+        Linux: 通过 /proc/self/fd 分类。
+        Windows: 无 /proc，用 psutil.Process().open_files() 统计打开的文件句柄。
+        """
         import os
+        import sys
         counts = {"pipe": 0, "file": 0, "socket": 0, "anon_inode": 0, "other": 0}
         details = {"pipe": [], "file": [], "other": []}
+        if sys.platform == "win32":
+            # Windows: 无 /proc/self/fd，用 psutil 统计打开的文件句柄
+            try:
+                open_files = psutil.Process().open_files()
+                counts["file"] = len(open_files)
+                for f in open_files[:10]:
+                    details["file"].append((0, f.path))
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
+            return counts, details
         try:
             for fd in os.listdir('/proc/self/fd'):
                 try:
@@ -115,18 +130,27 @@ class TestResourceLeak:
                     if len(details["other"]) < 5:
                         details["other"].append((fd, link))
         except OSError:
-            pass  # Windows
+            pass
         return counts, details
 
     def test_no_handle_leak_across_runs(self, experiment_config):
-        """跑 3 次 run_pipeline，句柄数增长不超过 20。
+        """跑 3 次 run_pipeline，句柄数增长不超过阈值。
 
         修复前实测：每次 +24~48 个 pipe（num_workers × 2 × num_dataloaders），
         根因是 PyTorch _MultiProcessingDataLoaderIter._shutdown_workers() 不 close
         worker 进程的 stdin/stdout/stderr/sentinel pipe。
         修复后：datamodule.py 模块级 patch 在 _shutdown_workers 后调 w.close()。
+
+        平台差异：
+        - Linux: num_fds 仅统计 fd，阈值 20（pipe 泄露的特征值是 num_workers×2×2×N）
+        - Windows: num_handles 统计所有 OS 级句柄（含 GDI/User 对象、事件、线程句柄等），
+          非 fd 资源的正常波动大于 Linux，阈值放宽至 60
         """
+        import sys
         from senseframe.engine.runner.orchestrator import run_experiment
+
+        # 句柄泄露阈值：Linux 严格（20），Windows 宽松（60，因 num_handles 语义更宽）
+        _HANDLE_LEAK_THRESHOLD = 60 if sys.platform == "win32" else 20
 
         run_experiment(experiment_config)
         before = _resource_snapshot()
@@ -140,7 +164,7 @@ class TestResourceLeak:
         delta = _delta(before, after, "handles")
 
         # 失败时打印 fd 分类，便于定位泄露源
-        if delta > 20:
+        if delta > _HANDLE_LEAK_THRESHOLD:
             msg = [f"句柄泄露: before={before['handles']}, after={after['handles']}, delta=+{delta}"]
             msg.append("FD 分类 before: %s" % before_counts)
             msg.append("FD 分类 after:  %s" % after_counts)
@@ -160,7 +184,7 @@ class TestResourceLeak:
                     msg.append("  fd=%s -> %s" % (fd, link))
             pytest.fail("\n".join(msg))
 
-        assert delta <= 20
+        assert delta <= _HANDLE_LEAK_THRESHOLD
 
     def test_no_child_process_leak(self, experiment_config):
         """跑 3 次 run_pipeline，子进程数不增长。

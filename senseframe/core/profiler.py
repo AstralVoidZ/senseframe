@@ -312,6 +312,16 @@ class DataProfiler:
         - self_supervised → unsupervised 集（无 unsupervised 时回退 test）
         确保画像统计量来自训练集，避免数据泄露。
 
+        P0-A 修复（2026-07-18）：自监督模式下分两路采样：
+        - distribution 统计（mean/std/value_range/input_shape/modality/n_samples/missing_rate）
+          ← bundle.unsupervised（encoder 预训练数据分布，避免 test 泄露）
+        - task 统计（n_classes/class_distribution/imbalance_ratio/recommended_class_weights
+          /recommended_task_type/recommended_loss/recommended_metrics）
+          ← bundle.supervised_finetune（Stage 2 微调任务的真实分类空间）
+        旧实现把两类统计合并到 unsupervised 集采样，导致 n_classes=6（NTU-Fi_HAR 6 类
+        动作标签）而非 14（NTU-Fi-HumanID 14 类身份标签），class_weights 维度不匹配
+        14 类 CrossEntropy，且 Agent 基于 data_profile.n_classes=6 错误决策。
+
         Args:
             bundle: DatasetBundle（含 train/test/val/unsupervised/supervised_finetune）
             dataset_name: 数据集名称
@@ -332,6 +342,32 @@ class DataProfiler:
                     f"dataset={dataset_name}"
                 )
             profile_source = "unsupervised"
+            # 先用 unsupervised 集做 distribution 统计
+            profile = self.profile_dataset(
+                ds, dataset_name=dataset_name, profile_source=profile_source,
+                modality_hint=modality_hint,
+            )
+            # P0-A：再用 supervised_finetune 集覆盖 task 统计
+            # n_classes/class_distribution/imbalance_ratio/recommended_class_weights
+            # 必须来自 Stage 2 微调任务数据，而非 unsupervised 预训练数据。
+            # unsupervised 集的 label 是预训练数据集的原生标签（如 NTU-Fi_HAR 6 类动作），
+            # 与下游 finetune 任务的真实分类空间（如 NTU-Fi-HumanID 14 类身份）无关。
+            task_ds = getattr(bundle, "supervised_finetune", None)
+            if task_ds is not None:
+                task_profile = self.profile_dataset(
+                    task_ds, dataset_name=dataset_name,
+                    profile_source="supervised_finetune",
+                    modality_hint=modality_hint,
+                )
+                # 仅覆盖 task 级字段，保留 distribution 级字段来自 unsupervised
+                profile.n_classes = task_profile.n_classes
+                profile.class_distribution = task_profile.class_distribution
+                profile.imbalance_ratio = task_profile.imbalance_ratio
+                profile.recommended_class_weights = task_profile.recommended_class_weights
+                profile.recommended_task_type = task_profile.recommended_task_type
+                profile.recommended_loss = task_profile.recommended_loss
+                profile.recommended_metrics = task_profile.recommended_metrics
+            return profile
         else:
             ds = getattr(bundle, "train", None)
             if ds is None:
@@ -375,7 +411,9 @@ class DataProfiler:
             f"Scene must declare modality via SceneMeta.modality "
             f"(e.g., 'csi', 'image', 'sequence', 'tabular'). "
             f"Shape-based inference is unreliable: CSI (1,250,90) and "
-            f"image (1,H,W) are indistinguishable by shape alone."
+            f"image (1,H,W) are indistinguishable by shape alone. "
+            f"If calling profile_bundle directly, pass modality_hint explicitly; "
+            f"if using Pipeline, ensure SceneMeta.modality is set in the scene container."
         )
 
     def _recommend(

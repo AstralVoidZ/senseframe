@@ -325,6 +325,7 @@ def save_skill(
     description: str = "",
     tags: Optional[List[str]] = None,
     source_path: str = "",
+    version: Optional[str] = None,
 ) -> bool:
     """保存代码为技能。
 
@@ -336,18 +337,22 @@ def save_skill(
         description: 技能描述
         tags: 标签列表
         source_path: 来源扩展文件路径（s2：便于追溯）
+        version: 技能版本号（None 时由 Skill 默认值 "1.0.0" 决定）
 
     Returns:
         True 入库成功，False 验证失败
     """
     lib = get_skill_library()
-    skill = Skill(
+    kwargs = dict(
         name=name,
         description=description,
         code=code,
         tags=tags or [],
         source_path=source_path,
     )
+    if version is not None:
+        kwargs["version"] = version
+    skill = Skill(**kwargs)
     return lib.register(skill)
 
 

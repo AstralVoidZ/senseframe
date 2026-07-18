@@ -48,11 +48,12 @@ def main():
     # 加载 YAML 配置
     config_path = Path(args.config)
     if not config_path.exists():
+        # P2 演进（2026-07-18）：错误输出到 stderr，与 cli.py 对齐
         print(json.dumps({
             "valid": False,
             "error": f"Config file not found: {args.config}",
             "code": "CONFIG_NOT_FOUND",
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
     with open(config_path, "r", encoding="utf-8") as f:
@@ -63,18 +64,20 @@ def main():
             "valid": False,
             "error": "Config file must contain a YAML mapping at top level",
             "code": "INVALID_CONFIG_FORMAT",
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
     # 解析为 ExperimentConfig
     try:
         config = ExperimentConfig.from_dict(config_dict)
     except ValueError as e:
+        # P2 演进：from_dict 失败统一用 CONFIG_PARSE_ERROR（YAML 解析/结构阶段），
+        # 与 config.validate() 阶段的 CONFIG_VALIDATION_ERROR 区分。
         print(json.dumps({
             "valid": False,
             "error": str(e),
             "code": "CONFIG_PARSE_ERROR",
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
     # 执行完整校验
@@ -85,7 +88,7 @@ def main():
             "valid": False,
             "error": str(e),
             "code": "CONFIG_VALIDATION_ERROR",
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
     # 校验通过，输出配置摘要

@@ -1,6 +1,12 @@
 # ExperimentConfig Schema 字段参考
 
-声明式实验配置的完整字段定义与校验规则。所有字段经 `ExperimentConfig.validate()` 校验，配置错误快速失败抛 `ValueError`。
+声明式实验配置的完整字段定义与校验规则。
+
+P1 演进（2026-07-18）：6 个配置类已从 stdlib `dataclass` 迁移到 `pydantic v2 BaseModel`。
+- 构造时（`__init__` / `from_dict` / `model_validate`）自动校验字段类型与约束，错误快速失败抛 `ValidationError`
+- `ExperimentConfig.validate()` 保留为兼容方法，仅校验 pydantic 无法在构造时覆盖的延迟约束（如 `data_root` 由 CLI/env 后填充）
+- `from_dict()` / `to_dict()` 保留为薄封装，委托 `model_validate()` / `model_dump()`
+- JSON Schema 由 `ExperimentConfig.model_json_schema()` 自动生成（替代手写 schema）
 
 ## 顶层结构
 
@@ -14,7 +20,7 @@ output_dir: str = "runs"      # 可选
 save_model: bool = true         # 可选
 ```
 
-**命令式注入字段**（仅 Python 代码可设，不参与 `from_dict/to_dict` 序列化）：
+**命令式注入字段**（仅 Python 代码可设，不参与 `from_dict/to_dict` 序列化，也不出现在 `model_json_schema()` 生成的 JSON Schema 中）：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -24,6 +30,25 @@ save_model: bool = true         # 可选
 | `extra_callbacks` | `List[Any]` | `List[pl.Callback]` |
 
 `trainer_factory` 为 None 时使用框架默认 `pl.Trainer` 构造逻辑。
+
+P2 演进（2026-07-18）：这 4 个工厂字段已从 `ExperimentConfig` 拆分到独立的 `RuntimeInjections` dataclass（非 pydantic BaseModel）。
+- `ExperimentConfig` 通过 `runtime: RuntimeInjections = Field(exclude=True)` 持有运行时注入对象
+- 通过 `@property` 代理访问，`cfg.module_factory` 等价于 `cfg.runtime.module_factory`
+- 构造时传入工厂字段会被 `model_validator(mode='before')` 提取并转发到 `runtime`：
+  `ExperimentConfig(..., module_factory=...)` → `runtime=RuntimeInjections(module_factory=...)`
+- `runtime` 字段用 `Field(exclude=True)` 排除 `model_dump()`，`model_json_schema()` 覆盖移除
+- YAML 中不允许声明 `runtime` 或工厂字段（运行时对象不可序列化），`from_dict` 显式拒绝
+
+访问方式（两种等价）：
+```python
+# 方式 1：兼容代理（推荐，旧代码无需修改）
+cfg.module_factory = my_factory
+cfg.extra_callbacks.append(my_callback)
+
+# 方式 2：直接访问 runtime
+cfg.runtime.module_factory = my_factory
+cfg.runtime.extra_callbacks.append(my_callback)
+```
 
 ## SceneConfig
 
@@ -111,9 +136,10 @@ save_model: bool = true         # 可选
 | `metrics` | list[str] | 否 | `["accuracy", "macro_f1"]` | 评估指标列表 |
 | `gpu` | int | 否 | null | 指定 GPU ID，null=自动 |
 | `resume` | str | 否 | null | resume checkpoint 路径，null=不恢复 |
-| `mixed_precision` | any | 否 | null | 混合精度：True=16-mixed, False=32, 字符串直接透传, null=自动 |
-| `limit_train_batches` | any | 否 | null | 限制训练 batch 数（dry-run 用），null=不限制 |
-| `limit_val_batches` | any | 否 | null | 限制验证 batch 数（dry-run 用），null=不限制 |
+| `mixed_precision` | bool/str | 否 | null | 混合精度：True=16-mixed, False=32, 字符串直接透传（如 "bf16-mixed"）, null=自动 |
+| `limit_train_batches` | int/float | 否 | null | 限制训练 batch 数（dry-run 用），null=不限制；1 或 1.0=只跑 1 batch |
+| `limit_val_batches` | int/float | 否 | null | 限制验证 batch 数（dry-run 用），null=不限制 |
+| `num_workers` | int | 否 | null | DataLoader 并行加载进程数，null=由 routing 按资源自动派生；Windows + Python 3.14 spawn 模式下 num_workers>0 需 `if __name__=='__main__'` 保护，可显式设为 0 规避 multiprocessing 错误 |
 | `auto_lr_find` | bool | 否 | false | 自动 LR 标定（Lightning LR Range Test），true 时 stage_train 调 trainer.tune() |
 
 **支持的 optimizer**：`adam` / `adamw` / `sgd` / `rmsprop`
@@ -148,12 +174,16 @@ save_model: bool = true         # 可选
 **支持的 pruner**：`median` / `none` / `hyperband`
 **支持的 direction**：`minimize` / `maximize`
 
-**校验规则**（仅 `enabled: true` 时校验）：
+**校验规则**（P1 演进：pydantic 构造时即校验，不再依赖 `enabled` 短路）：
 - `n_trials` > 0
 - `sampler` / `pruner` / `direction` 必须在支持列表中
 - `metric` 不能为空
 - `load_if_exists: true` 时必须指定 `study_name`
 - `timeout` 若非 null 必须 > 0
+
+> 旧实现仅在 `enabled: true` 时校验，pydantic 版本在构造时即校验所有字段。
+> 默认值均合法（`n_trials=20` / `sampler="tpe"` / ...），因此 `HPOConfig()` 默认构造不受影响。
+> 若显式传入非法值（如 `sampler="garbage"`），即使 `enabled=false` 也会在构造时报错——这是更严格的契约，符合 fail-fast 原则。
 
 ### HPO 持久化与断点续搜
 
@@ -182,8 +212,8 @@ hpo:
 
 ## 配置解析流程
 
-1. `ExperimentConfig.from_dict(yaml_dict)` 解析嵌套 dict 为 dataclass 实例
-2. `config.validate()` 递归校验所有子配置
+1. `ExperimentConfig.from_dict(yaml_dict)` 解析嵌套 dict 为 pydantic BaseModel 实例（构造时自动校验字段类型与约束）
+2. `config.validate()` 递归校验延迟约束（如 `data_root` 由 CLI/env 后填充，构造时为空字符串不报错）
 3. 校验通过后传给 `run_experiment(config)`
 
 ```python
@@ -285,12 +315,17 @@ num_nodes: 4                  # 节点数
 sync_batchnorm: true
 ```
 
-支持字段（YAML 顶层，非 trainer 下）：
+支持字段（YAML 顶层，ExperimentConfig 声明字段）：
 - `devices`：GPU 数量，默认 1（单卡，向后兼容）；支持 int 或 `"auto"`（自动检测）
 - `strategy`：分布式策略，默认 null（单设备）；支持 `"ddp"` / `"ddp_spawn"` / `"fsdp"` 等 Lightning 支持的策略
 - `num_nodes`：多节点训练节点数，默认 1
 - `sync_batchnorm`：是否启用同步 BatchNorm，默认 false
 - `num_processes`：CPU 模式并行进程数，默认 1（仅 `device: cpu` 时生效）
+
+> P2 修复（2026-07-18）：这 5 个字段原在文档中声明为"YAML 顶层字段"，但未在
+> ExperimentConfig 中声明，被 `extra="ignore"` 静默丢弃，routing.py 永远读到默认值
+> ——分布式训练 YAML 配置实际不生效。现已提升为声明字段，并通过
+> `experiment_config_to_dict` 透传到 routing 层。
 
 **混合精度**：通过 `mixed_precision` 字段配置，支持 `"16-mixed"` / `"bf16-mixed"` / `"32"`。
 

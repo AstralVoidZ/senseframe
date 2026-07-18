@@ -39,10 +39,10 @@ class TestClosedLoop:
             f"pipeline 状态: {ctx.output.status}"
         )
 
-        # 2. 读取 feedback（stage_eval 写入 ctx.extra）
+        # 2. 读取 feedback（stage_eval 写入 ctx.feedback）
         # P5 P2-7 阶段2：feedback 现在是 FeedbackResult dataclass，用属性访问
-        feedback = ctx.extra.get("feedback")
-        assert feedback is not None, "ctx.extra 未生成 feedback（stage_eval 未执行或异常）"
+        feedback = ctx.feedback
+        assert feedback is not None, "ctx.feedback 未生成（stage_eval 未执行或异常）"
         # 兼容 FeedbackResult dataclass 和 dict 两种形态
         if hasattr(feedback, "status"):
             assert feedback.status is not None, "feedback 缺少 status 字段"

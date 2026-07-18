@@ -39,7 +39,7 @@ class TestContextSchema:
     def test_has_schema_version(self):
         schema = context_schema()
         assert "schema_version" in schema
-        assert schema["schema_version"] == "1.0.0"
+        assert schema["schema_version"] == "1.1.0"
 
     def test_has_fields(self):
         schema = context_schema()
@@ -65,6 +65,38 @@ class TestContextSchema:
             if f["name"] == "config":
                 assert f["fill_stage"] == "init"
                 break
+
+    def test_fields_have_stage_name_and_is_pseudo_stage(self):
+        """schema v1.1: 每个字段含 stage_name + is_pseudo_stage。
+
+        - 伪 stage (init/agent): is_pseudo_stage=True, stage_name=None
+        - 真实 stage (stage_validate 等): is_pseudo_stage=False, stage_name=去掉 stage_ 前缀
+        """
+        schema = context_schema()
+        for f in schema["fields"]:
+            assert "stage_name" in f, f"字段 {f['name']} 缺少 stage_name"
+            assert "is_pseudo_stage" in f, f"字段 {f['name']} 缺少 is_pseudo_stage"
+            assert isinstance(f["is_pseudo_stage"], bool)
+
+    def test_pseudo_stage_fields_have_none_stage_name(self):
+        """伪 stage 字段的 stage_name 应为 None。"""
+        schema = context_schema()
+        for f in schema["fields"]:
+            if f["fill_stage"] in ("init", "agent"):
+                assert f["is_pseudo_stage"] is True, \
+                    f"字段 {f['name']} fill_stage={f['fill_stage']} 应为伪 stage"
+                assert f["stage_name"] is None, \
+                    f"字段 {f['name']} fill_stage={f['fill_stage']} stage_name 应为 None"
+
+    def test_real_stage_fields_stage_name_matches_list_stages(self):
+        """真实 stage 字段的 stage_name 应与 list_stages() 输出对齐。"""
+        from senseframe.introspect import list_stages
+        real_stages = set(list_stages())
+        schema = context_schema()
+        for f in schema["fields"]:
+            if not f["is_pseudo_stage"] and f["fill_stage"] != "unknown":
+                assert f["stage_name"] in real_stages, \
+                    f"字段 {f['name']} stage_name={f['stage_name']} 不在 list_stages()={real_stages} 中"
 
 
 class TestContextDescribe:

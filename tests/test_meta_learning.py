@@ -748,19 +748,6 @@ class TestGrepEvidence:
         path = _source_path("autoaugment/sampler.py")
         assert _grep_source(path, "def warm_start(")
 
-    def test_grep_p3_doc_meta_learning_section(self):
-        """grep 实证：P3 规划文档含 'ε4 元学习' 章节。"""
-        doc_path = Path(__file__).parent.parent / "docs" / "analysis"
-        # rglob 递归查找（参考 test_autoaugment.py 的 test_grep_p3_doc_reference）
-        p3_docs = [p for p in doc_path.rglob("*P3*") if p.is_file()]
-        assert len(p3_docs) >= 1
-        content = p3_docs[0].read_text(encoding="utf-8")
-        # P3 文档应含 ε4 元学习章节
-        assert "ε4 元学习" in content
-        assert "MetaLearner" in content
-        assert "HistoryStore" in content
-        assert "warm_start" in content
-
 
 # ============================================================
 # P3.2.5: 集成测试

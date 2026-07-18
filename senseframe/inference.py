@@ -18,6 +18,7 @@
 """
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -25,6 +26,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+
+from .common import load_checkpoint_flexible
+from .engine.metadata import load_metadata
+
+_logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -371,15 +377,27 @@ def load_model_for_inference(
     if not metadata_path.exists():
         raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
 
-    # 加载 metadata
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    # 加载 metadata（P3：通过 load_metadata 自动协商 schema_version 迁移）
+    metadata = load_metadata(metadata_path)
 
     # 重建模型架构
     model = _build_model_from_metadata(metadata)
 
     # 加载权重
-    state_dict = torch.load(model_path, map_location=device, weights_only=False)
-    model.load_state_dict(state_dict)
+    # 修复：使用 load_checkpoint_flexible 兼容 Lightning checkpoint 与裸 state_dict。
+    # 旧代码直接 torch.load + model.load_state_dict(state_dict) 与 export.py 同源 bug：
+    # Lightning ckpt 顶层含 epoch/global_step/optimizer_states 等非权重字段触发
+    # `Unexpected key(s) in state_dict`，且未剥离 "model." 前缀导致 key 不匹配。
+    load_info = load_checkpoint_flexible(
+        model_path, model, map_location=device, weights_only=False,
+    )
+    _logger.info(
+        "load_model_for_inference: loaded checkpoint %s (format=%s, keys=%d, prefix=%r)",
+        model_path,
+        load_info["source_format"],
+        load_info["num_keys_loaded"],
+        load_info["stripped_prefix"],
+    )
 
     return InferenceModel(model=model, metadata=metadata, device=device)
 

@@ -27,6 +27,17 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DOCS_ROOT = PROJECT_ROOT  # 文档分布在项目根（SKILL.md）和 commands/、reference/ 子目录
 
+
+def _field_names(cls):
+    """统一获取 dataclass / pydantic v2 BaseModel 的字段名集合。
+
+    P1 演进（2026-07-18）：TrainerConfig/InputFeature/OutputFeature 已迁移到
+    pydantic v2 BaseModel，用 model_fields 替代 dataclasses.fields。
+    """
+    if hasattr(cls, "model_fields"):  # pydantic v2
+        return list(cls.model_fields.keys())
+    return [f.name for f in dataclass_fields(cls)]
+
 # 受检文档清单
 DOC_FILES = [
     PROJECT_ROOT / "SKILL.md",
@@ -56,7 +67,7 @@ def _doc_lines(path: Path) -> list:
 def test_trainer_config_no_max_epochs_in_docs():
     """文档不应出现 max_epochs（TrainerConfig 字段是 epochs）。"""
     from senseframe.engine.config import TrainerConfig
-    actual_fields = {f.name for f in dataclass_fields(TrainerConfig)}
+    actual_fields = set(_field_names(TrainerConfig))
     assert "max_epochs" not in actual_fields, "TrainerConfig 不应有 max_epochs 字段"
     assert "epochs" in actual_fields, "TrainerConfig 应有 epochs 字段"
 
@@ -619,7 +630,7 @@ def test_epochs_budget_formula():
 def test_auto_lr_find_in_trainer_config():
     """TrainerConfig 应含 auto_lr_find 字段（Part 4: 自动 LR 标定）。"""
     from senseframe.engine.config import TrainerConfig
-    actual_fields = {f.name for f in dataclass_fields(TrainerConfig)}
+    actual_fields = set(_field_names(TrainerConfig))
     assert "auto_lr_find" in actual_fields, (
         "TrainerConfig 应含 auto_lr_find 字段。"
         "Part 4 新增自动 LR 标定能力（Lightning LR Range Test），默认 False。"
@@ -805,7 +816,7 @@ def test_trainer_config_defaults_match_doc():
     from senseframe.engine.config import TrainerConfig
 
     tc = TrainerConfig()
-    code_fields = {f.name: getattr(tc, f.name) for f in dataclass_fields(tc)}
+    code_fields = {name: getattr(tc, name) for name in _field_names(TrainerConfig)}
 
     doc_path = PROJECT_ROOT / "reference" / "config_schema.md"
     content = _read_doc(doc_path)

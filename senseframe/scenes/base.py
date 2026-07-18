@@ -45,7 +45,7 @@ class SceneMeta:
     # R-fix：动态数据集场景标志（custom/generic），引擎据此跳过静态 dataset 校验
     is_dynamic_dataset: bool = False
     # P0 修复：场景显式声明数据模态，覆盖 profiler shape 启发式
-    # 默认 "unknown" 保持向后兼容（未声明的场景继续用 shape 启发式）
+    # profiler 遇到 "unknown" 会 raise ValueError；所有场景容器必须在 meta() 中显式声明
     modality: str = "unknown"
 
 
@@ -111,6 +111,13 @@ class DatasetBundle:
     自监督路径访问 `bundle.supervised_finetune`；两个字段通过 filling_rule 互斥
     （supervised 模式 train=required/supervised_finetune=forbidden，反之亦然），
     既满足 stage_build 的字段期望，又通过 validate_filling 强制契约一致性。
+
+    P0-B 修复（2026-07-18）：新增 `learning_mode` 字段，由 scene container 在
+    `load_dataset` 时显式传入。旧实现 `describe(learning_mode="supervised")` 默认
+    参数导致自监督模式下 `bundle.describe()` 误报 `learning_mode='supervised'`。
+    现在学习模式作为一等字段随 bundle 携带，describe() 在未传参时优先读
+    `self.learning_mode`，再退化为从 filled_fields 推断，确保调用方不传参也能
+    得到正确结果。
     """
     train: Optional[Dataset] = None
     test: Optional[Dataset] = None
@@ -118,15 +125,22 @@ class DatasetBundle:
     # 自监督模式专用
     unsupervised: Optional[Dataset] = None
     supervised_finetune: Optional[Dataset] = None
+    # P0-B：学习模式作为一等字段随 bundle 携带，由 scene container 显式传入。
+    # 默认 "supervised" 保持向后兼容（旧调用方不传时仍为监督模式）。
+    learning_mode: str = "supervised"
 
-    def to_tuple(self, learning_mode: str = "supervised") -> Tuple:
+    def to_tuple(self, learning_mode: Optional[str] = None) -> Tuple:
         """
         向后兼容：按学习模式返回元组。
 
         - supervised: (train, test)
         - self_supervised: (unsupervised, supervised_finetune, test)
+
+        Args:
+            learning_mode: 显式覆盖；None 时读 self.learning_mode（P0-B 修复）
         """
-        if learning_mode == "self_supervised":
+        mode = learning_mode if learning_mode is not None else self.learning_mode
+        if mode == "self_supervised":
             return (self.unsupervised, self.supervised_finetune, self.test)
         return (self.train, self.test)
 
@@ -174,17 +188,28 @@ class DatasetBundle:
                 errors.append(f"Field '{field_name}' is forbidden for learning_mode='{learning_mode}' but is not None")
         return errors
 
+    def _infer_learning_mode(self) -> str:
+        """从 filled_fields 推断 learning_mode（describe 兜底）。
+
+        - unsupervised 或 supervised_finetune 非 None → "self_supervised"
+        - 否则 → "supervised"
+        """
+        if self.unsupervised is not None or self.supervised_finetune is not None:
+            return "self_supervised"
+        return "supervised"
+
     @staticmethod
     def schema() -> Dict[str, Any]:
         """返回字段结构 + 填充规则表（RFC-003 DSP-2）。"""
         return {
-            "schema_version": "1.0.0",
+            "schema_version": "1.1.0",  # P0-B: 新增 learning_mode 字段
             "fields": [
                 {"name": "train", "type": "Optional[Dataset]"},
                 {"name": "test", "type": "Optional[Dataset]"},
                 {"name": "val", "type": "Optional[Dataset]"},
                 {"name": "unsupervised", "type": "Optional[Dataset]"},
                 {"name": "supervised_finetune", "type": "Optional[Dataset]"},
+                {"name": "learning_mode", "type": "str", "default": "supervised"},
             ],
             "filling_rules": {
                 "supervised": DatasetBundle.filling_rule("supervised"),
@@ -192,12 +217,38 @@ class DatasetBundle:
             },
         }
 
-    def describe(self, learning_mode: str = "supervised") -> Dict[str, Any]:
-        """返回运行时状态（RFC-003 DSP-2）。"""
+    def describe(self, learning_mode: Optional[str] = None) -> Dict[str, Any]:
+        """返回运行时状态（RFC-003 DSP-2）。
+
+        P0-B 修复：learning_mode 形参默认改为 None，触发兜底逻辑：
+        1. 显式传参 → 用传入值
+        2. None + self.learning_mode 已由 container 设置 → 用 self.learning_mode
+        3. None + self.learning_mode 是默认值 "supervised" 但 filled_fields
+           显示自监督填充 → 从 filled_fields 推断（防御性兜底）
+
+        这样调用方不传参也能得到正确结果，消除旧实现"默认 supervised 导致
+        自监督模式误报"的 bug。
+        """
+        if learning_mode is None:
+            # 优先读 self.learning_mode（container 显式传入的值）
+            # 若 self.learning_mode 仍是默认 "supervised" 但 filled_fields
+            # 显示自监督填充，则从 filled_fields 推断（防御性兜底）
+            if self.learning_mode == "supervised":
+                inferred = self._infer_learning_mode()
+                if inferred != self.learning_mode:
+                    # filled_fields 显示自监督但 learning_mode 字段未设置，
+                    # 用推断值覆盖（兼容未显式传 learning_mode 的旧 container）
+                    effective_mode = inferred
+                else:
+                    effective_mode = self.learning_mode
+            else:
+                effective_mode = self.learning_mode
+        else:
+            effective_mode = learning_mode
         return {
             "filled_fields": self.filled_fields(),
-            "learning_mode": learning_mode,
-            "validation_errors": self.validate_filling(learning_mode),
+            "learning_mode": effective_mode,
+            "validation_errors": self.validate_filling(effective_mode),
         }
 
 
@@ -363,7 +414,7 @@ class SceneContainer(ABC):
         """
         from ..core.features import FeatureSpec
         info = self.get_dataset_info(dataset_name, **kwargs)
-        return FeatureSpec.from_dataset_info(info, modality=self.meta().name)
+        return FeatureSpec.from_dataset_info(info, modality=self.meta().modality)
 
     def get_task_spec(
         self,

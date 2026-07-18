@@ -386,6 +386,113 @@ class TestExceptionHierarchy:
 
 
 # ============================================================
+# D.2 get_error_code 公共函数（遗留问题 1 修复 2026-07-19）
+# ============================================================
+class TestGetErrorCode:
+    """get_error_code 公共函数契约。
+
+    遗留问题 1 修复（2026-07-19）：替代 cli.py / probe_worker.py 中的 type(e).__name__，
+    让 JSON 输出的 "code" 字段与 SKILL.md 错误码表对齐，Agent 可程序化解析。
+
+    优先级：
+    1. SenseFrameError 子类 → exc.error_code（isinstance 检查）
+    2. 非 SenseFrame 异常 → classify_error(exc, stage) heuristic 兜底
+    """
+
+    def test_get_error_code_for_senseframe_errors(self):
+        """SenseFrameError 子类 → exc.error_code（优先级 1，直接返回）。"""
+        from senseframe.engine.runner.errors import (
+            get_error_code, SceneNotRegisteredError, DatasetNotSupportedError,
+            ModelNotSupportedError, DataNotFoundError, DataCorruptedError,
+            OOMError, CheckpointError, PreflightError, TrainingError,
+            ModelBuildError, SaveError, ConfigValidationError, MetadataVersionError,
+        )
+        assert get_error_code(SceneNotRegisteredError("test")) == "SCENE_NOT_FOUND"
+        assert get_error_code(DatasetNotSupportedError("test")) == "DATASET_NOT_SUPPORTED"
+        assert get_error_code(ModelNotSupportedError("test")) == "MODEL_NOT_SUPPORTED"
+        assert get_error_code(DataNotFoundError("test")) == "DATA_NOT_FOUND"
+        assert get_error_code(DataCorruptedError("test")) == "DATA_LOAD_ERROR"
+        assert get_error_code(OOMError("test")) == "OOM_ERROR"
+        assert get_error_code(CheckpointError("test")) == "CHECKPOINT_ERROR"
+        assert get_error_code(PreflightError("test")) == "PREFLIGHT_ERROR"
+        assert get_error_code(TrainingError("test")) == "TRAINING_ERROR"
+        assert get_error_code(ModelBuildError("test")) == "MODEL_BUILD_ERROR"
+        assert get_error_code(SaveError("test")) == "SAVE_ERROR"
+        assert get_error_code(ConfigValidationError("test")) == "CONFIG_VALIDATION_ERROR"
+        assert get_error_code(MetadataVersionError("test")) == "METADATA_VERSION_ERROR"
+
+    def test_get_error_code_for_non_senseframe_falls_back(self):
+        """非 SenseFrame 异常 → classify_error heuristic 兜底。"""
+        from senseframe.engine.runner.errors import get_error_code
+        # FileNotFoundError → DATA_NOT_FOUND（heuristic）
+        assert get_error_code(FileNotFoundError("test")) == "DATA_NOT_FOUND"
+        # KeyError + stage="build" → MODEL_BUILD_ERROR（heuristic）
+        assert get_error_code(KeyError("test"), stage="build") == "MODEL_BUILD_ERROR"
+        # ValueError → CONFIG_VALIDATION_ERROR（heuristic 兜底）
+        assert get_error_code(ValueError("test")) == "CONFIG_VALIDATION_ERROR"
+
+    def test_get_error_code_stage_propagated_to_classify_error(self):
+        """stage 参数传递给 classify_error（heuristic 兜底时生效）。"""
+        from senseframe.engine.runner.errors import get_error_code
+        # KeyError + stage="build" → MODEL_BUILD_ERROR
+        assert get_error_code(KeyError("test"), stage="build") == "MODEL_BUILD_ERROR"
+        # KeyError 无 stage → 兜底 MODEL_BUILD_ERROR（heuristic 末尾分支）
+        assert get_error_code(KeyError("test")) == "MODEL_BUILD_ERROR"
+
+    def test_get_error_code_senseframe_ignores_stage(self):
+        """SenseFrameError 子类的 error_code 不受 stage 影响（优先级 1，跳过 heuristic）。"""
+        from senseframe.engine.runner.errors import (
+            get_error_code, SceneNotRegisteredError, MetadataVersionError,
+        )
+        exc = SceneNotRegisteredError("test")
+        assert get_error_code(exc, stage="validate") == "SCENE_NOT_FOUND"
+        assert get_error_code(exc, stage="train") == "SCENE_NOT_FOUND"
+        assert get_error_code(exc, stage=None) == "SCENE_NOT_FOUND"
+
+        exc2 = MetadataVersionError("test")
+        assert get_error_code(exc2, stage="load") == "METADATA_VERSION_ERROR"
+        assert get_error_code(exc2, stage=None) == "METADATA_VERSION_ERROR"
+
+    def test_get_error_code_returns_string_not_class_name(self):
+        """get_error_code 始终返回结构化错误码字符串（不再是 type(e).__name__ 类名）。"""
+        from senseframe.engine.runner.errors import (
+            get_error_code, MetadataVersionError, ConfigValidationError,
+        )
+        # MetadataVersionError → "METADATA_VERSION_ERROR"（不是 "MetadataVersionError"）
+        result = get_error_code(MetadataVersionError("test"))
+        assert isinstance(result, str)
+        assert result == "METADATA_VERSION_ERROR"
+        assert result != "MetadataVersionError"
+
+        # ConfigValidationError → "CONFIG_VALIDATION_ERROR"（不是 "ConfigValidationError"）
+        result = get_error_code(ConfigValidationError("test"))
+        assert result == "CONFIG_VALIDATION_ERROR"
+        assert result != "ConfigValidationError"
+
+    def test_get_error_code_aligns_with_skill_md_table(self):
+        """get_error_code 返回值与 schemas.ERROR_CODES 对齐（SKILL.md 错误码表闭环）。"""
+        from senseframe.engine.runner.errors import (
+            get_error_code, MetadataVersionError, ConfigValidationError,
+            SceneNotRegisteredError, OOMError,
+        )
+        from senseframe.schemas import ERROR_CODES
+
+        # 所有 SenseFrameError 子类的 error_code 都应在 ERROR_CODES 中注册
+        test_cases = [
+            MetadataVersionError("test"),
+            ConfigValidationError("test"),
+            SceneNotRegisteredError("test"),
+            OOMError("test"),
+        ]
+        for exc in test_cases:
+            code = get_error_code(exc)
+            assert code in ERROR_CODES, (
+                f"错误码 {code} 未在 schemas.ERROR_CODES 中注册，"
+                f"SKILL.md 错误码表存在缺口"
+            )
+
+
+# ============================================================
 # E. DSP-3 就绪度：advisory 契约可查询且不阻断（方案 5）
 # ============================================================
 
@@ -395,12 +502,12 @@ class TestDSP3Readiness:
     def _make_minimal_ctx(self):
         """构造最小 PipelineContext（仅 config，其余字段为默认值）。"""
         from senseframe.engine.runner.pipeline import PipelineContext
-        from senseframe.engine.config import ExperimentConfig, SceneConfig, TrainerConfig
+        from senseframe.engine.config import ExperimentConfig, SceneConfig, TrainerConfig, InputFeature, OutputFeature
         cfg = ExperimentConfig(
             scene=SceneConfig(name="generic", model_id="MLP", dataset="UT_HAR_data"),
             trainer=TrainerConfig(epochs=1),
-            input_features=1,
-            output_features=7,
+            input_features=[InputFeature(name="x", type="csi")],
+            output_features=[OutputFeature(name="y", type="category", num_classes=7)],
         )
         return PipelineContext(config=cfg)
 

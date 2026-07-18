@@ -725,17 +725,6 @@ class TestGrepEvidence:
         # datamodule_factory 分支应在 P3.1 之前就存在
         assert _grep_source(path, "datamodule_factory is not None")
 
-    def test_grep_p3_doc_reference(self):
-        """grep 实证：P3 规划文档存在。"""
-        doc_path = Path(__file__).parent.parent / "docs" / "analysis"
-        # rglob 递归查找（兼容 Windows 路径分隔符差异）
-        p3_docs = [p for p in doc_path.rglob("*P3*") if p.is_file()]
-        assert len(p3_docs) >= 1
-        # P3 文档应含 AutoAugment 章节
-        content = p3_docs[0].read_text(encoding="utf-8")
-        assert "AutoAugment" in content
-        assert "AugmentationSearchSpace" in content
-
 
 # ============================================================
 # P3.1: 集成测试

@@ -335,7 +335,7 @@ class TestIntermediateMetricLogger:
     """IntermediateMetricLogger 回调验证。"""
 
     def test_writes_to_intermediate_values(self):
-        """回调应将指标写入 intermediate_values dict。"""
+        """回调应将指标写入 intermediate_values dict（1-indexed epoch key）。"""
         iv: Dict[int, float] = {}
         cb = IntermediateMetricLogger(metric="val_accuracy", intermediate_values=iv)
         # 模拟 trainer（P0-3: sanity_checking=False 才会写入）
@@ -344,10 +344,11 @@ class TestIntermediateMetricLogger:
         trainer.sanity_checking = False
         trainer.callback_metrics = {"val_accuracy": 0.85}
         cb.on_validation_epoch_end(trainer, None)
-        assert iv == {0: 0.85}
+        # P1 修复：1-indexed（current_epoch + 1），与 training_log/CSV epoch 对齐
+        assert iv == {1: 0.85}
 
     def test_writes_multiple_epochs(self):
-        """多个 epoch 应写入多个 entry。"""
+        """多个 epoch 应写入多个 entry（1-indexed epoch key）。"""
         iv: Dict[int, float] = {}
         cb = IntermediateMetricLogger(metric="val_accuracy", intermediate_values=iv)
         for epoch, val in [(0, 0.5), (1, 0.6), (2, 0.7)]:
@@ -356,7 +357,8 @@ class TestIntermediateMetricLogger:
             trainer.sanity_checking = False
             trainer.callback_metrics = {"val_accuracy": val}
             cb.on_validation_epoch_end(trainer, None)
-        assert iv == {0: 0.5, 1: 0.6, 2: 0.7}
+        # P1 修复：1-indexed（current_epoch + 1），与 training_log/CSV epoch 对齐
+        assert iv == {1: 0.5, 2: 0.6, 3: 0.7}
 
     def test_none_intermediate_values_noop(self):
         """intermediate_values=None 时应 no-op。"""
@@ -380,7 +382,7 @@ class TestIntermediateMetricLogger:
         assert iv == {}
 
     def test_handles_tensor_values(self):
-        """应处理 Tensor 类型值（Lightning callback_metrics 返回 Tensor）。"""
+        """应处理 Tensor 类型值（Lightning callback_metrics 返回 Tensor）。1-indexed key。"""
         try:
             import torch
         except ImportError:
@@ -392,13 +394,14 @@ class TestIntermediateMetricLogger:
         trainer.sanity_checking = False
         trainer.callback_metrics = {"val_accuracy": torch.tensor(0.85)}
         cb.on_validation_epoch_end(trainer, None)
+        # P1 修复：1-indexed（current_epoch + 1）
         # float32 精度容差（torch.tensor(0.85).item() = 0.8500000238418579）
-        assert 0 in iv
-        assert iv[0] == pytest.approx(0.85, abs=1e-6)
-        assert isinstance(iv[0], float)
+        assert 1 in iv
+        assert iv[1] == pytest.approx(0.85, abs=1e-6)
+        assert isinstance(iv[1], float)
 
     def test_handles_float_values(self):
-        """应处理 float 类型值。"""
+        """应处理 float 类型值。1-indexed key。"""
         iv: Dict[int, float] = {}
         cb = IntermediateMetricLogger(metric="val_accuracy", intermediate_values=iv)
         trainer = MagicMock()
@@ -406,8 +409,9 @@ class TestIntermediateMetricLogger:
         trainer.sanity_checking = False
         trainer.callback_metrics = {"val_accuracy": 0.85}
         cb.on_validation_epoch_end(trainer, None)
-        assert iv == {0: 0.85}
-        assert isinstance(iv[0], float)
+        # P1 修复：1-indexed（current_epoch + 1）
+        assert iv == {1: 0.85}
+        assert isinstance(iv[1], float)
 
     def test_skips_sanity_check(self):
         """P0-3: sanity_check 阶段不应写入 intermediate_values。"""

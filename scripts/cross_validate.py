@@ -23,6 +23,7 @@ if str(_BOOTSTRAP_ROOT) not in sys.path:
 
 from senseframe.common.paths import PROJECT_ROOT, resolve_data_root  # noqa: E402
 from senseframe.engine.config import ExperimentConfig  # noqa: E402
+from senseframe.engine.metadata import load_metadata  # noqa: E402
 from senseframe.engine.runner import run_experiment  # noqa: E402
 
 
@@ -102,9 +103,8 @@ def _record_output(test_id, config, out):
         out_dir = Path(out.output_dir)
         metadata_path = out_dir / "metadata.json"
         if metadata_path.exists():
-            record["metadata"] = json.loads(
-                metadata_path.read_text(encoding="utf-8")
-            )
+            # P3：通过 load_metadata 自动协商 schema_version 迁移
+            record["metadata"] = load_metadata(metadata_path)
 
         record["files"] = sorted(
             str(p.relative_to(out_dir))

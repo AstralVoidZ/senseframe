@@ -20,6 +20,12 @@ import json
 import sys
 from pathlib import Path
 
+# bootstrap：senseframe 可导入前的必要本地推导
+_BOOTSTRAP_ROOT = Path(__file__).resolve().parents[1]
+if str(_BOOTSTRAP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BOOTSTRAP_ROOT))
+from senseframe.engine.metadata import load_metadata  # noqa: E402
+
 # 推理脚本模板
 # 使用 $VAR 占位符避免 f-string 冲突，运行时用 str.replace 注入
 _INFERENCE_TEMPLATE = '''#!/usr/bin/env python
@@ -67,6 +73,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from senseframe.scenes import get_scene  # noqa: E402
+from senseframe.common import load_checkpoint_flexible  # noqa: E402
 
 
 # 训练时记录的元数据
@@ -79,13 +86,21 @@ DATA_ROOT = "$__DATA_ROOT__"
 
 
 def load_model(checkpoint_path: str):
-    """加载模型权重，返回已加载 state_dict 的模型实例。"""
+    """加载模型权重，返回已加载 state_dict 的模型实例。
+
+    使用 load_checkpoint_flexible 兼容 Lightning checkpoint（含 state_dict 顶层 key
+    + model. 前缀）与裸 state_dict 两种格式。旧代码直接 torch.load +
+    model.load_state_dict(state_dict) 会在加载 Lightning .ckpt 时触发
+    `Unexpected key(s) in state_dict: "epoch", "global_step", ...` 错误。
+    """
     scene = get_scene("wifi_csi")
     model = scene.build_model_for_dataset(
         MODEL_ID, DATASET, NUM_CLASSES, learning_mode=LEARNING_MODE,
     )
-    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    model.load_state_dict(state_dict)
+    # weights_only=False 兼容 Lightning ckpt 的 callbacks 字段（含 Python 对象）
+    load_checkpoint_flexible(
+        checkpoint_path, model, map_location="cpu", weights_only=False,
+    )
     model.eval()
     return model
 
@@ -262,8 +277,8 @@ def generate_inference_script(metadata_path: str, output_path: str = None) -> st
     if not metadata_file.exists():
         raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
 
-    with open(metadata_file, "r", encoding="utf-8") as f:
-        metadata = json.load(f)
+    # P3：通过 load_metadata 自动协商 schema_version 迁移
+    metadata = load_metadata(metadata_file)
 
     # 提取关键字段
     model_id = metadata.get("model_id", "Unknown")

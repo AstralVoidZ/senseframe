@@ -325,9 +325,13 @@ class ResourceRouter:
         _base_workers = route_config["num_workers"]
         if _sys.platform == "win32" and _base_workers == 0 and route_config["device"] == "cpu":
             # Windows CPU 环境：尝试 2 个 worker（persistent_workers 加速）
-            # 注意：如遇 multiprocessing 问题，回退到 0（通过 try/except 在 datamodule 处理）
+            # 多进程启动失败时由 datamodule._safe_dataloader 自动降级到 num_workers=0
             _base_workers = 2
         resolved["num_workers"] = min(_base_workers, _os.cpu_count() or 1, 8)
+        # 用户显式配置 num_workers 优先于 routing 派生
+        _yaml_nw = yaml_config.get("num_workers")
+        if _yaml_nw is not None:
+            resolved["num_workers"] = int(_yaml_nw)
         # pin_memory 仅 GPU 路由启用，加速 CPU→GPU 数据搬运
         resolved["pin_memory"] = route_config["device"] == "cuda"
         # persistent_workers 避免每 epoch 重建 worker（num_workers>0 时）

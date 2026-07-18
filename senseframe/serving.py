@@ -18,6 +18,22 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+# 模块级 try/except 导入 fastapi 类型（PEP 563 兼容性）。
+# from __future__ import annotations 使类型注解存储为字符串，fastapi 用
+# typing.get_type_hints() 解析时需从模块 __globals__ 查找。
+# 若在 start() 方法内部导入（局部变量），get_type_hints() 无法解析，
+# fastapi 会把 request: Request 当成查询参数返回 422。
+try:
+    from fastapi import FastAPI, HTTPException, Request
+    from pydantic import BaseModel
+    import uvicorn
+    _HAS_FASTAPI = True
+except ImportError:
+    FastAPI = HTTPException = Request = BaseModel = uvicorn = None  # type: ignore[assignment]
+    _HAS_FASTAPI = False
+
+from .engine.metadata import load_metadata
+
 
 class InferenceServer:
     """推理服务（P3）。
@@ -39,10 +55,10 @@ class InferenceServer:
         self.config = None
         self._model_type: str = "unknown"
 
-        # 加载元数据
+        # 加载元数据（P3：通过 load_metadata 自动协商 schema_version 迁移）
         meta_path = self.output_dir / "metadata.json"
         if meta_path.exists():
-            self.metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.metadata = load_metadata(meta_path)
 
         # 加载模型
         self._load_model()
@@ -60,14 +76,25 @@ class InferenceServer:
             except ImportError:
                 pass  # 回退到 state_dict
 
-        # state_dict
+        # state_dict：通过 inference.load_model_for_inference 从 metadata 重建模型架构，
+        # 并用 load_checkpoint_flexible 加载权重（兼容 Lightning ckpt 与裸 state_dict）。
+        # 旧代码直接 self.model = torch.load(pth_path) 把 state_dict（一个 dict）赋给
+        # self.model，未重建模型架构，_predict_torch 永远抛 NotImplementedError，是死代码。
         pth_path = self.output_dir / "model.pth"
         if pth_path.exists():
+            meta_path = self.output_dir / "metadata.json"
+            if not meta_path.exists():
+                raise FileNotFoundError(
+                    f"state_dict inference requires metadata.json to rebuild model "
+                    f"architecture, but not found in {self.output_dir}. "
+                    f"Either export ONNX with `senseframe export --formats onnx`, "
+                    f"or ensure metadata.json exists alongside model.pth."
+                )
             try:
-                import torch
-                # 需要 metadata 中的模型架构信息来重建模型
-                # 简化：只加载 state_dict，实际推理需要重建模型实例
-                self.model = torch.load(pth_path, map_location=self.device, weights_only=False)
+                from .inference import load_model_for_inference
+                self.model = load_model_for_inference(
+                    pth_path, meta_path, device=self.device,
+                )
                 self._model_type = "state_dict"
                 return
             except ImportError:
@@ -116,11 +143,30 @@ class InferenceServer:
         return result.tolist()
 
     def _predict_torch(self, input_data: Any) -> Any:
-        """state_dict 推理（简化：需要外部提供模型架构）。"""
-        raise NotImplementedError(
-            "state_dict inference requires model architecture. "
-            "Use ONNX export for production inference, or provide a model_factory."
-        )
+        """state_dict 推理：委托给 InferenceModel.predict_single。
+
+        self.model 是 load_model_for_inference 返回的 InferenceModel 实例，
+        已通过 metadata 重建模型架构 + load_checkpoint_flexible 加载权重。
+        """
+        import numpy as np
+        if not isinstance(input_data, np.ndarray):
+            input_data = np.array(input_data, dtype=np.float32)
+
+        result = self.model.predict_single(input_data)
+        # 与 _predict_onnx 返回格式对齐：{"prediction": int, "probabilities": [...]}
+        # InferenceModel.predict_single 返回 PredictionResult，含 label/confidence/logits
+        # 重建 probabilities：从 logits softmax
+        if result.logits is not None:
+            logits_arr = np.array(result.logits, dtype=np.float32)
+            probs = np.exp(logits_arr - logits_arr.max()).tolist()
+            s = sum(probs)
+            probs = [p / s for p in probs]
+        else:
+            probs = []
+        return {
+            "prediction": result.label,
+            "probabilities": probs,
+        }
 
     def info(self) -> Dict[str, Any]:
         """返回模型和服务信息。"""
@@ -154,6 +200,8 @@ class InferenceServer:
                 f"FastAPI/uvicorn not installed: {e}. "
                 f"Install with: pip install fastapi uvicorn"
             ) from e
+        # 注：fastapi 类型已在模块级 try/except 导入（PEP 563 兼容性），
+        # 此处局部导入仅为运行时使用；类型注解解析依赖模块级导入。
 
         app = FastAPI(title="SenseFrame Inference Server")
 

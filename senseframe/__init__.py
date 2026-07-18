@@ -10,6 +10,19 @@ SenseFrame: AI Agent 驱动的 AutoML 训练框架（RFC 控制权反转）。
 
 __version__ = "0.2.0"
 
+# Python 3.14+ Linux 默认 multiprocessing start method 从 fork 改为 forkserver。
+# forkserver 在 python -c / REPL 模式下无法重新导入 <stdin> 主模块，导致
+# DataLoader worker 崩溃（ConnectionResetError: forkserver can't find <stdin>）。
+# 此处显式设置为 spawn，跨平台行为一致，避免 fork/forkserver/spawn 三种路径分歧。
+# spawn 要求 worker 用对象（Dataset/Transform/collate_fn）可 pickle，框架已修复闭包问题。
+# 若外部已设置 start method（如用户在脚本中显式 mp.set_start_method），则跳过不覆盖。
+import multiprocessing as _mp
+try:
+    if _mp.get_start_method(allow_none=True) is None:
+        _mp.set_start_method("spawn")
+except RuntimeError:
+    pass  # start method 已被外部设置，不覆盖
+
 # Phase 10：动态注册中心对外暴露（Phase R2：统一从 registry 导入）
 from .registry import (
     ModelSpec,

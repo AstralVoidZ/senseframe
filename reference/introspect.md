@@ -33,7 +33,7 @@ sf.context_schema()  # 顶层便捷入口
 
 | Stage | 填充字段 |
 |-------|----------|
-| `init`（构造注入） | `config`, `dry_run` |
+| `init`（构造注入，伪 stage） | `config`, `dry_run` |
 | `stage_validate` | `scene`, `meta`, `model_id`, `dataset`, `learning_mode` |
 | `stage_preflight` | `report`, `route_level`, `route_config`, `output` |
 | `stage_resolve` | `scene_info`, `num_classes`, `task_spec`, `feature_spec`, `resolved`, `lightning_params`, `distributed_kwargs` |
@@ -44,7 +44,16 @@ sf.context_schema()  # 顶层便捷入口
 | `stage_export`（metadata） | `best_epoch`, `best_model_path`, `best_model_score`, `epoch_utilization` 持久化到 metadata.json + pipeline_checkpoint.json |
 | `stage_eval` | `final_eval`, `training_log`, `early_stopped`, `feedback` |
 | `stage_export` | `artifact_registry` |
-| `agent`（运行时） | `trial_id`, `parent_trial_id`, `exploration_history`, `extra`, `completed_stages`, `stage_checkpoint_path`, `failed_stage`, `failed_error` |
+| `agent`（运行时，伪 stage） | `trial_id`, `parent_trial_id`, `exploration_history`, `extra`, `completed_stages`, `stage_checkpoint_path`, `failed_stage`, `failed_error` |
+
+**伪 stage 说明**（schema v1.1）：`init` 和 `agent` 不是真实 pipeline stage，
+不由任何 stage 函数产出，分别由 `PipelineContext.__init__()` 构造函数注入和
+Agent 运行时控制流设置（如 `Pipeline.run` 的 except 块写 `failed_stage`）。
+
+`context_schema()` 返回的每个字段含 `is_pseudo_stage: bool` 标记（伪 stage 为 True），
+以及 `stage_name: Optional[str]`（真实 stage 名，去掉 `stage_` 前缀，与 `list_stages()`
+输出对齐；伪 stage 为 None）。Agent 程序化消费时应优先用 `stage_name` 而非 `fill_stage`
+与 `list_stages()` / `stage_io()` 的 stage 名匹配。
 
 ### 运行时状态查询
 

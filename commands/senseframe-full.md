@@ -133,63 +133,65 @@ print(f"class_distribution: {profile.class_distribution}")
 
 **Do**:
 ```python
-from senseframe.engine.config import (
-    ExperimentConfig, SceneConfig, InputFeature, OutputFeature, TrainerConfig
-)
+from senseframe.engine.config import ExperimentConfig
 
-# B1: 自监督预训练
-# 注意：trainer 仅覆盖 epochs/seed，其余字段（weight_decay/early_stopping/
-# scheduler/early_stopping_min_delta）使用 TrainerConfig 默认值（方案 E 默认最佳实践）
+# AutoFi 范式契约（reference/self_supervised_paradigm.md）：
+# - 单次 run_experiment 内完成两阶段（Stage 1 自监督预训练 + Stage 2 监督微调）
+# - 框架通过 ctx.module 对象引用传递权重，无需显式 save/load
+# - 跨运行加载（两次独立 run_experiment + trainer.resume）不支持：
+#   _Parrallel 模型与监督模型的 forward 签名和 state_dict key 结构不兼容
+#
+# 修复（反模式根因）：旧文档用两次独立 run_experiment（B1 预训练 + B2 微调），
+# B2 config 无 trainer.resume，stage_train 从零训练，且 epochs 过少导致 val_acc=0.14
+# 等同随机猜测。改为单次 run_experiment，让框架在 stage_train 的 is_self_supervised
+# 分支自动完成两阶段切换。
+#
 # 修复（文档契约）：ExperimentConfig 推荐用 from_dict(yaml_dict) + validate() 构造，
 # 自动解析嵌套 dict 为 dataclass 实例并做基本校验。
-# 旧文档把 scene 字段平铺到顶层、漏 input_features/output_features、用 max_epochs
-# 而非 epochs，全部与代码契约不符。
-config_pretrain_dict = {
+#
+# 修复（范式硬约束）：NTU-Fi_HAR 数据集的 supervised_source="NTU-Fi-HumanID"
+# 提供 Stage 2 监督数据，num_classes=14（NTU-Fi-HumanID 类别数），
+# input_shape=(3, 114, 500)。旧文档写 num_classes=7 / shape=[1, 250, 90] 与范式不符。
+config_dict = {
     "scene": {
-        "name": "wifi_csi", "dataset": "$1", "model_id": "ResNet18",
-        "learning_mode": "self_supervised",
-        "data_root": "$SENSEFRAME_DATA_ROOT",  # 必填：YAML/CLI/env 三选一
+        "name": "wifi_csi",
+        "dataset": "NTU-Fi_HAR",                  # 必填：自监督只支持此数据集
+        "model_id": "ResNet18",
+        "learning_mode": "self_supervised",        # 关键：单次运行内两阶段
+        "data_root": "$SENSEFRAME_DATA_ROOT",      # 必填：YAML/CLI/env 三选一
+        "params": {
+            "self_supervised_epochs": 50,           # Stage 1 预训练轮数（默认 100）
+        },
     },
-    "input_features": [{"name": "csi", "type": "csi", "shape": [1, 250, 90]}],
-    "output_features": [{"name": "label", "type": "category", "num_classes": 7}],
-    "trainer": {"epochs": 5, "seed": 42},
+    "input_features": [{"name": "csi", "type": "csi", "shape": [3, 114, 500]}],
+    "output_features": [{"name": "label", "type": "category", "num_classes": 14}],
+    "trainer": {
+        "epochs": 50,                              # Stage 2 微调轮数（ResNet18 需 50-200 收敛）
+        "seed": 42,
+    },
 }
-config_pretrain = ExperimentConfig.from_dict(config_pretrain_dict)
-config_pretrain.validate()
-output_pretrain = sf.run_experiment(config_pretrain)
+config = ExperimentConfig.from_dict(config_dict)
+config.validate()
+output = sf.run_experiment(config)
 # 字段契约（方案 C）：final_eval 使用 val_ 前缀
-print(f"pretrain val_loss: {output_pretrain.final_eval.get('val_loss')}")
-
-# B2: 监督微调（加载预训练权重）
-config_finetune_dict = {
-    "scene": {
-        "name": "wifi_csi", "dataset": "$1", "model_id": "ResNet18",
-        "learning_mode": "supervised",
-        "data_root": "$SENSEFRAME_DATA_ROOT",  # 必填：YAML/CLI/env 三选一
-    },
-    "input_features": [{"name": "csi", "type": "csi", "shape": [1, 250, 90]}],
-    "output_features": [{"name": "label", "type": "category", "num_classes": 7}],
-    "trainer": {"epochs": 10, "seed": 42},
-}
-config_finetune = ExperimentConfig.from_dict(config_finetune_dict)
-config_finetune.validate()
-output_finetune = sf.run_experiment(config_finetune)
-# 字段契约（方案 C）：读 val_accuracy 而非 accuracy
-print(f"finetune val_accuracy: {output_finetune.final_eval.get('val_accuracy')}")
-print(f"finetune val_macro_f1: {output_finetune.final_eval.get('val_macro_f1')}")
+# 框架内部自动完成：Stage 1 EntLoss 预训练 → Stage 2 CE 微调（encoder 冻结，仅训 classifier）
+print(f"val_loss: {output.final_eval.get('val_loss')}")
+print(f"val_accuracy: {output.final_eval.get('val_accuracy')}")
+print(f"val_macro_f1: {output.final_eval.get('val_macro_f1')}")
 ```
 
 **Output**: 两阶段训练曲线 + 最终指标
-**Gate**: 两阶段均完成，微调 `output.final_eval["val_accuracy"]` 非零
+**Gate**: 两阶段均完成，`output.final_eval["val_accuracy"]` 非零且高于随机基线（1/14≈0.071）
 
 **Introspect**:
 - [ ] EntLoss 无监督预训练是否正常执行？
-- [ ] 预训练 → 微调权重传递是否正确？
-- [ ] 自监督对 val_accuracy 提升是多少？（对比有/无预训练）
+- [ ] Stage 1 → Stage 2 权重是否通过 `ctx.module` 对象引用正确传递？（不应有显式 save/load）
+- [ ] 自监督对 val_accuracy 提升是多少？（对比有/无预训练，需独立跑一次 `learning_mode="supervised"` 对照）
 - [ ] 自监督数据契约（unsupervised/train/test 填充规则）是否被校验？
 - [ ] 早停是否在两阶段都生效？
 - [ ] **方案 E 验证**：两阶段是否都继承了默认的 `weight_decay=1e-4` / `early_stopping=5` / `scheduler="cosine"` / `early_stopping_min_delta=0.001`？（检查 `config.trainer` 字段）
 - [ ] **方案 C 验证**：`final_eval` 是否含 `val_loss`/`val_accuracy`/`val_macro_f1` 等 `val_` 前缀字段？（而非旧的无前缀 `accuracy`/`macro_f1`）
+- [ ] **AutoFi 范式验证**：是否使用单次 `run_experiment` + `learning_mode="self_supervised"`？（**禁止**两次独立 run_experiment + trainer.resume，跨运行加载不支持）
 
 ### 阶段 C: Pipeline 自定义编排
 

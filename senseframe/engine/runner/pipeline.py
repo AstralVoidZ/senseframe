@@ -57,6 +57,10 @@ except ImportError:
 import yaml
 
 from ..config import ExperimentConfig
+# 遗留问题 3 修复（2026-07-19）：pipeline 不再直接引用版本常量，
+# 版本字段由 make_metadata_skeleton() 统一注入，版本管理职责完全内聚到 metadata 模块。
+from ..metadata import make_metadata_skeleton
+from ...common import load_checkpoint_flexible
 from ...observability import IncrementalLogWriter, Timer, setup_logging as _setup_logging
 from ...observability_otel import (
     record_training_metric, record_trial_metric,
@@ -339,6 +343,13 @@ _FIELD_FILL_STAGE: Dict[str, str] = {
 }
 
 
+# 伪 stage 集合（模块级常量，避免被 dataclasses.fields 识别为 PipelineContext 字段）：
+# 不由任何 pipeline stage 产出，由构造函数或 Agent 运行时注入。
+# schema() 用此集合设置 is_pseudo_stage=True，让 Agent 程序化区分真实 stage 产出
+# 与非 stage 产出字段，避免误把 "init"/"agent" 当作 stage 名传给 stage_io()。
+_PSEUDO_STAGES: frozenset = frozenset({"init", "agent"})
+
+
 # ============================================================
 # RFC-004 方案 C：training_log 字段结构契约
 # ============================================================
@@ -561,27 +572,53 @@ class PipelineContext:
         """
         return [k for k, v in _FIELD_FILL_STAGE.items() if v == stage_name]
 
+    # 伪 stage 集合：不由任何 pipeline stage 产出，由构造函数或 Agent 运行时注入。
+    # schema() 用此集合设置 is_pseudo_stage=True，让 Agent 程序化区分真实 stage 产出
+    # 与非 stage 产出字段，避免误把 "init"/"agent" 当作 stage 名传给 stage_io()。
+    # （模块级常量 _PSEUDO_STAGES 定义在 _FIELD_FILL_STAGE 旁，避免被 dataclasses.fields
+    # 识别为 PipelineContext 字段触发 test_field_fill_stage_complete 误报。）
+
     @classmethod
     def schema(cls) -> dict:
         """返回完整字段契约（RFC-003 DSP-1）。
 
-        返回 JSON 可序列化 dict，含 schema_version 与每个字段的
-        name / type / fill_stage / has_default 元信息。
+        返回 JSON 可序列化 dict，含 schema_version 与每个字段的元信息：
+        - name: 字段名
+        - type: 类型字符串
+        - fill_stage: _FIELD_FILL_STAGE 中的原始值（"init"/"agent"/"stage_validate"/...）
+        - stage_name: 真实 pipeline stage 名（去掉 "stage_" 前缀），伪 stage 为 None。
+                      与 list_stages() / stage_io() / Pipeline.default() 返回的 stage 名对齐。
+        - is_pseudo_stage: True 表示 fill_stage 是伪 stage（init/agent），
+                          非 pipeline stage 产出，由构造函数或 Agent 注入。
+        - has_default: 是否有默认值
         """
+        fields_info = []
+        for f in _dataclass_fields(cls):
+            fill_stage = _FIELD_FILL_STAGE.get(f.name, "unknown")
+            is_pseudo = fill_stage in _PSEUDO_STAGES
+            # 真实 stage 名：去掉 "stage_" 前缀（如 "stage_validate" → "validate"），
+            # 与 Pipeline.default() 的 tuple 第一项 / list_stages() 输出对齐。
+            # 伪 stage / "unknown" 无对应真实 stage，stage_name=None。
+            if is_pseudo or fill_stage == "unknown":
+                stage_name = None
+            elif fill_stage.startswith("stage_"):
+                stage_name = fill_stage[len("stage_"):]
+            else:
+                stage_name = fill_stage
+            fields_info.append({
+                "name": f.name,
+                "type": str(f.type) if hasattr(f, "type") else "Any",
+                "fill_stage": fill_stage,
+                "stage_name": stage_name,
+                "is_pseudo_stage": is_pseudo,
+                "has_default": (
+                    f.default is not MISSING
+                    or f.default_factory is not MISSING  # type: ignore[misc]
+                ),
+            })
         return {
-            "schema_version": "1.0.0",
-            "fields": [
-                {
-                    "name": f.name,
-                    "type": str(f.type) if hasattr(f, "type") else "Any",
-                    "fill_stage": _FIELD_FILL_STAGE.get(f.name, "unknown"),
-                    "has_default": (
-                        f.default is not MISSING
-                        or f.default_factory is not MISSING  # type: ignore[misc]
-                    ),
-                }
-                for f in _dataclass_fields(cls)
-            ],
+            "schema_version": "1.1.0",  # 1.1: 新增 stage_name + is_pseudo_stage 字段
+            "fields": fields_info,
         }
 
     def describe(self) -> dict:
@@ -1424,13 +1461,22 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
     return ctx
 
 
-@stage(
-    name="probe_vram",
-    reads=["model", "datamodule", "module", "resolved", "report",
-           "dry_run", "route_level", "model_id"],
-    writes=["vram_probe_result"],
-    description="Stage 5.5: 动态显存探测（方案 B：前向+反向+optimizer step 测峰值显存）",
-)
+def _probe_json_default(obj):
+    """JSON 序列化 dataclass / pydantic BaseModel 的 default handler。
+
+    SceneParams / FeatureSpec 等 dataclass 无法被 json.dump 直接序列化，
+    需通过 dataclasses.asdict 转换为 dict。
+    P1 演进（2026-07-18）：兼容 pydantic v2 BaseModel（用 model_dump()）。
+    """
+    from dataclasses import asdict, is_dataclass
+    # pydantic v2 BaseModel
+    if hasattr(obj, "model_dump") and callable(obj.model_dump):
+        return obj.model_dump()
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return asdict(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def _run_probe_in_subprocess(params: Dict[str, Any]) -> Dict[str, Any]:
     """在子进程中执行显存探测，隔离 CUDA 计算不影响主进程。
 
@@ -1483,7 +1529,7 @@ def _run_probe_in_subprocess(params: Dict[str, Any]) -> Dict[str, Any]:
     if complex_params:
         fd, params_file = tempfile.mkstemp(suffix=".json", prefix="probe_params_")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(complex_params, f, ensure_ascii=False)
+            json.dump(complex_params, f, ensure_ascii=False, default=_probe_json_default)
         cmd.extend(["--params-file", params_file])
 
     # 3. 启动子进程
@@ -1551,6 +1597,13 @@ def _run_probe_in_subprocess(params: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+@stage(
+    name="probe_vram",
+    reads=["model", "datamodule", "module", "resolved", "report",
+           "dry_run", "route_level", "model_id"],
+    writes=["vram_probe_result"],
+    description="Stage 5.5: 动态显存探测（方案 B：前向+反向+optimizer step 测峰值显存）",
+)
 def stage_probe_vram(ctx: PipelineContext) -> PipelineContext:
     """Stage 5.5: 动态显存探测（子进程隔离）。
 
@@ -2158,42 +2211,34 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
     # 旧逻辑训练结束后 ctx.model 仍是最后一代权重，导出的 model.pth 是最后一代
     # 而非最优，final_eval 反映最后一代性能（可能因 early stopping 远差于 best）。
     # 改为：若有 best checkpoint，加载回 ctx.model，确保后续 export/eval 用最优权重。
+    # 复用 load_checkpoint_flexible（senseframe/common/checkpoint.py）统一三处
+    # checkpoint 加载逻辑（stage_train / export / inference），消除反模式重复。
     if ctx.best_model_path:
-        import os
-        if os.path.exists(ctx.best_model_path):
-            try:
-                # Lightning checkpoint 含 state_dict + optimizer + scheduler 等，
-                # 加载时只取 state_dict，避免 optimizer/scheduler 状态覆盖
-                ckpt = torch.load(ctx.best_model_path, map_location="cpu", weights_only=False)
-                state_dict_key = "state_dict"
-                if state_dict_key in ckpt:
-                    # LightningModule 的 state_dict 键前缀是 "model."，去掉后加载到裸 model
-                    raw_state = {k[len("model."):]: v for k, v in ckpt[state_dict_key].items()
-                                 if k.startswith("model.")}
-                    if raw_state:
-                        ctx.model.load_state_dict(raw_state)
-                        _logger.info(
-                            f"stage_train: loaded best model weights from {ctx.best_model_path} "
-                            f"into ctx.model (best_score={ctx.best_model_score})"
-                        )
-                    else:
-                        _logger.warning(
-                            f"stage_train: best checkpoint {ctx.best_model_path} has no "
-                            f"'model.' prefixed keys in state_dict, skip loading"
-                        )
-                else:
-                    _logger.warning(
-                        f"stage_train: best checkpoint {ctx.best_model_path} missing "
-                        f"'state_dict' key, skip loading"
-                    )
-            except Exception as e:
-                _logger.warning(
-                    f"stage_train: failed to load best checkpoint {ctx.best_model_path}: {e}",
-                    exc_info=True,
-                )
-        else:
+        try:
+            load_info = load_checkpoint_flexible(
+                ctx.best_model_path, ctx.model,
+                map_location="cpu", weights_only=False,
+            )
+            _logger.info(
+                "stage_train: loaded best model weights from %s into ctx.model "
+                "(best_score=%s, format=%s, keys=%d, prefix=%r)",
+                ctx.best_model_path,
+                ctx.best_model_score,
+                load_info["source_format"],
+                load_info["num_keys_loaded"],
+                load_info["stripped_prefix"],
+            )
+        except FileNotFoundError:
             _logger.warning(
-                f"stage_train: best_model_path does not exist: {ctx.best_model_path}"
+                "stage_train: best_model_path does not exist: %s",
+                ctx.best_model_path,
+            )
+        except Exception as e:
+            _logger.warning(
+                "stage_train: failed to load best checkpoint %s: %s",
+                ctx.best_model_path,
+                e,
+                exc_info=True,
             )
 
     # P0-1 防御性兜底：stage_train 后冻结 intermediate_values
@@ -2497,7 +2542,10 @@ def stage_eval(ctx: PipelineContext) -> PipelineContext:
     if ctx.exploration_history:
         feedback = ctx.feedback
         last_trial = ctx.exploration_history[-1]
-        last_trial["feedback"] = feedback
+        # P0 修复：exploration_history 会被 ExplorationTracker.save 序列化为 JSON，
+        # FeedbackResult dataclass 不可直接 json.dumps。调 to_dict() 转为原生 dict。
+        # hpo.py 路径已在传给 tracker 前转换；直接走 Pipeline.run() 路径需在此处转换。
+        last_trial["feedback"] = feedback.to_dict() if hasattr(feedback, "to_dict") else feedback
         last_trial["result"] = {
             k: v for k, v in final_eval.items()
             if isinstance(v, (int, float, str)) or v is None
@@ -2643,15 +2691,21 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
                 except Exception:
                     pass
 
-        metadata = {
-            "model_id": ctx.model_id,
-            "dataset": ctx.dataset,
-            "learning_mode": ctx.learning_mode,
-            "num_classes": ctx.num_classes,
-            "input_shape": list(ctx.scene_info.get("input_shape", [])),
-            "normalization": normalization_info,
-            "label_map": {str(k): v for k, v in label_map.items()},
-            "manifest": manifest_info,
+        # P3 演进（2026-07-18）：metadata.json schema_version 版本管理。
+        # 写入端通过 make_metadata_skeleton() 统一注入 schema_version（当前版本），
+        # 读取端通过 load_metadata() 协商迁移。pipeline 不直接引用版本常量，
+        # 版本管理职责完全内聚到 metadata 模块。
+        # 遗留问题 3 修复（2026-07-19）：从 dict 字面量改为 make_metadata_skeleton(**kwargs)，
+        # 消除 make_metadata_skeleton 死代码状态，schema_version 注入由骨架函数统一负责。
+        metadata = make_metadata_skeleton(
+            model_id=ctx.model_id,
+            dataset=ctx.dataset,
+            learning_mode=ctx.learning_mode,
+            num_classes=ctx.num_classes,
+            input_shape=list(ctx.scene_info.get("input_shape", [])),
+            normalization=normalization_info,
+            label_map={str(k): v for k, v in label_map.items()},
+            manifest=manifest_info,
             # metadata.config 是完整配置快照，供实验复现与下游消费者（generate_inference 等）使用。
             # 根因修复：ctx.resolved 仅含路由运行时字段（device/batch_size/precision/...），
             # 缺失 14 个训练级字段（epochs/seed/deterministic/max_time/...）和场景级字段（data_root/...）。
@@ -2659,42 +2713,43 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
             # 与 ctx.resolved（路由解析后实际生效值），重叠字段以 ctx.resolved 为准。
             # 这样复现所需字段（epochs/seed/data_root/learning_mode/...）全部进入 metadata.config，
             # 且未来 ExperimentConfig 新增字段自动进入，无需逐字段补录。
-            "config": {
+            config={
                 **experiment_config_to_dict(ctx.config),
                 **ctx.resolved,
             },
-            "metrics": list(final_eval.keys()),
-            "final_eval": final_eval,
+            metrics=list(final_eval.keys()),
+            final_eval=final_eval,
             # 对称性修复：显式提取 test_eval 字段，便于下游消费者直接访问 test 指标
-            "test_eval": {
+            test_eval={
                 k: v for k, v in final_eval.items()
                 if k.startswith("test_")
             } if any(k.startswith("test_") for k in final_eval) else None,
-            "env": build_env_snapshot(ctx.resolved, {"seed": ctx.config.trainer.seed}),
-            "resource": {
+            env=build_env_snapshot(ctx.resolved, {"seed": ctx.config.trainer.seed}),
+            # 方案 B：动态显存探测结果（stage_probe_vram 写入）
+            # None/跳过时记 skipped 原因；探测成功时含 measured_vram_mb/needed_vram_mb/free_vram_mb/ok
+            resource={
                 **ctx.report.to_dict(),
-                # 方案 B：动态显存探测结果（stage_probe_vram 写入）
-                # None/跳过时记 skipped 原因；探测成功时含 measured_vram_mb/needed_vram_mb/free_vram_mb/ok
                 "vram_probe": ctx.vram_probe_result,
             },
-            "route_level": ctx.route_level,
-            "task_spec": ctx.task_spec.to_dict(),
-            "feature_spec": ctx.feature_spec.to_dict(),
+            route_level=ctx.route_level,
+            task_spec=ctx.task_spec.to_dict(),
+            feature_spec=ctx.feature_spec.to_dict(),
             # Part 2：best checkpoint 溯源 + epoch 利用率（风险推演 R1/R4）
             # best_epoch/best_model_path/best_model_score 从 ctx 读取（stage_train 写入）
             # epoch_utilization = best_epoch / epochs，供 Agent 判断预算是否合理
             # （<0.3 预算过大，>0.9 预算不足）
-            "best_epoch": ctx.best_epoch,
-            "best_model_path": ctx.best_model_path,
-            "best_model_score": ctx.best_model_score,
-            "epoch_utilization": round(ctx.best_epoch / ctx.config.trainer.epochs, 3) if ctx.best_epoch and ctx.config.trainer.epochs else None,
-            "created_at": datetime.now().isoformat(),
-        }
+            best_epoch=ctx.best_epoch,
+            best_model_path=ctx.best_model_path,
+            best_model_score=ctx.best_model_score,
+            epoch_utilization=round(ctx.best_epoch / ctx.config.trainer.epochs, 3) if ctx.best_epoch and ctx.config.trainer.epochs else None,
+            created_at=datetime.now().isoformat(),
+        )
         # P5 P2-6：strict_schema=True 时对 metadata 关键字段做类型校验
         # 旧代码 strict_schema 仅控制 training_log，metadata 无类型校验，
         # 允许 num_classes=str / best_epoch=float 等类型污染传播到下游
         if getattr(ctx.config, "strict_schema", False):
             _type_checks = [
+                ("schema_version", metadata["schema_version"], str),
                 ("model_id", ctx.model_id, str),
                 ("dataset", ctx.dataset, str),
                 ("num_classes", ctx.num_classes, int),
@@ -2720,6 +2775,7 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
     # 构建 TrainOutput
     if ctx.output:
         ctx.output.status = "success"
+        ctx.output.error_code = "SUCCESS"
         # P5 P2-7 阶段2：构造 TrainingSummary dataclass 实例（不再还原为 dict）。
         # 下游消费方已迁移为属性访问 + to_dict() 序列化兼容。
         # TrainOutput.to_dict() 已有多态序列化 helper，会自动调用 .to_dict()。
@@ -2959,7 +3015,10 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
 _NON_SERIALIZABLE_STAGES = frozenset({"load", "build", "probe_vram", "train", "eval"})
 
 # P2：pipeline checkpoint 版本号，结构变更时递增
-_PIPELINE_VERSION = "2.0"
+# v2.1：_serialize_stage_outputs 新增 preflight/resolve 产出持久化（report/route_config/
+#       task_spec/feature_spec/scene_info/resolved/lightning_params/distributed_kwargs）；
+#       _restore_stage_outputs 从 checkpoint 恢复这些字段，根治可序列化 stage 契约矛盾
+_PIPELINE_VERSION = "2.1"
 
 
 def _compute_config_hash(config: ExperimentConfig) -> str:
@@ -3347,11 +3406,55 @@ class Pipeline:
                         f"{ctx.completed_stages}"
                     )
 
+            # 方案 A：从 checkpoint 恢复可序列化 stage 的产出（根治契约矛盾）。
+            # _NON_SERIALIZABLE_STAGES 声明 validate/preflight/resolve 可跨进程跳过，
+            # 其产出（report/route_config/task_spec/feature_spec 等）必须从 checkpoint 恢复，
+            # 否则下游 stage 会因字段为 None 而失败。
+            self._restore_stage_outputs(ctx)
+
+            # Fallback：若可序列化 stage 的产出未从 checkpoint 恢复（无 checkpoint 或旧格式），
+            # 从 completed_stages 移除以重跑，确保产出可用。对象引用 stage（load/build 等）
+            # 已由 _NON_SERIALIZABLE_STAGES 强制重跑，无需检查。
+            _serializable_output_checks = {
+                "preflight": lambda c: c.report is not None and bool(c.route_config),
+                "resolve": lambda c: c.task_spec is not None and c.feature_spec is not None,
+            }
+            for _s_name, _has_outputs in _serializable_output_checks.items():
+                if _s_name in ctx.completed_stages and not _has_outputs(ctx):
+                    ctx.completed_stages = [s for s in ctx.completed_stages if s != _s_name]
+                    _logger.warning(
+                        f"Stage '{_s_name}' in completed_stages but outputs not restored, "
+                        f"re-running to regenerate outputs"
+                    )
+
         # RFC-004 方案 F：try/finally 确保所有出口（成功/失败/异常）都释放资源
         try:
             for name, fn in self.stages:
                 # P1：跳过已完成 stage
                 if name in ctx.completed_stages:
+                    # 补偿：validate 产出的 ctx.scene 是对象引用，跨进程不可恢复。
+                    # 跳过 validate 时从注册表重建 scene 和 meta，避免下游 stage AttributeError。
+                    if name == "validate" and ctx.scene is None:
+                        if has_scene(ctx.config.scene.name):
+                            ctx.scene = get_scene(ctx.config.scene.name)
+                            ctx.meta = ctx.scene.meta()
+                            _logger.info("Compensated ctx.scene after skipping validate")
+                    # 补偿：validate 产出的标量字段（可从 config 重派生）。
+                    # _restore_stage_outputs 优先从 checkpoint 恢复；此处为 fallback。
+                    if name == "validate":
+                        if not ctx.model_id:
+                            ctx.model_id = ctx.config.scene.model_id
+                        if not ctx.dataset:
+                            ctx.dataset = ctx.config.scene.dataset
+                        if not ctx.learning_mode:
+                            ctx.learning_mode = ctx.config.scene.learning_mode
+                    # 补偿：preflight 产出 set_seed 调用，跳过时需重新 set_seed 恢复 RNG 状态。
+                    # 否则 resume 后 RNG 继承自上一次 run 的残留状态，导致 DataLoader shuffle
+                    # 顺序与模型初始化非确定，val_acc 严重漂移（实测 0.982 → 0.129）。
+                    if name == "preflight":
+                        set_seed(ctx.config.trainer.seed,
+                                 deterministic=ctx.config.trainer.deterministic)
+                        _logger.info("Compensated set_seed after skipping preflight")
                     _logger.info(f"Skipping completed stage: {name}")
                     continue
 
@@ -3608,7 +3711,92 @@ class Pipeline:
         if ctx.completed_stages:
             snapshot["completed_stages"] = list(ctx.completed_stages)
 
+        # preflight 产出持久化（可序列化 stage，跨进程恢复所需）
+        if ctx.report is not None:
+            snapshot["report"] = ctx.report.to_dict()
+        if ctx.route_config:
+            snapshot["route_config"] = ctx.route_config
+
+        # resolve 产出持久化（可序列化 stage，跨进程恢复所需）
+        # TaskSpec/FeatureSpec 有 to_dict/from_dict；其余为原生 dict
+        if ctx.task_spec is not None and hasattr(ctx.task_spec, "to_dict"):
+            snapshot["task_spec"] = ctx.task_spec.to_dict()
+        if ctx.feature_spec is not None and hasattr(ctx.feature_spec, "to_dict"):
+            snapshot["feature_spec"] = ctx.feature_spec.to_dict()
+        if ctx.scene_info:
+            snapshot["scene_info"] = ctx.scene_info
+        if ctx.resolved:
+            snapshot["resolved"] = ctx.resolved
+        if ctx.lightning_params:
+            snapshot["lightning_params"] = ctx.lightning_params
+        if ctx.distributed_kwargs:
+            snapshot["distributed_kwargs"] = ctx.distributed_kwargs
+
         return snapshot
+
+    @staticmethod
+    def _restore_stage_outputs(ctx: PipelineContext) -> None:
+        """从 checkpoint 恢复可序列化 stage 的产出（根治契约矛盾）。
+
+        _NON_SERIALIZABLE_STAGES 声明 validate/preflight/resolve 可跨进程跳过，
+        但这些 stage 的产出（report/route_config/task_spec/feature_spec 等）
+        若不从 checkpoint 恢复，下游 stage 会因字段为 None 而失败。
+
+        本方法在 Pipeline.run 的 stage 循环前调用，从 pipeline_checkpoint.json
+        的 stage_outputs 中恢复所有可序列化字段。仅恢复 ctx 中为 None/空的字段，
+        不覆盖已由调用方或上游 stage 设置的值。
+
+        对象引用（scene/meta/bundle/model 等）不可序列化，由补偿逻辑处理。
+        """
+        ckpt_path = ctx.stage_checkpoint_path
+        if ckpt_path is None or not Path(ckpt_path).exists():
+            return
+
+        try:
+            ckpt = json.loads(Path(ckpt_path).read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+
+        stage_outputs = ckpt.get("stage_outputs", {})
+        if not stage_outputs:
+            return
+
+        # validate 标量产出
+        if not ctx.model_id and stage_outputs.get("model_id"):
+            ctx.model_id = stage_outputs["model_id"]
+        if not ctx.dataset and stage_outputs.get("dataset"):
+            ctx.dataset = stage_outputs["dataset"]
+        if not ctx.learning_mode and stage_outputs.get("learning_mode"):
+            ctx.learning_mode = stage_outputs["learning_mode"]
+
+        # preflight 产出
+        if ctx.report is None and stage_outputs.get("report"):
+            from ...schemas import ResourceReport
+            ctx.report = ResourceReport.from_dict(stage_outputs["report"])
+        if not ctx.route_level and stage_outputs.get("route_level"):
+            ctx.route_level = stage_outputs["route_level"]
+        if not ctx.route_config and stage_outputs.get("route_config"):
+            ctx.route_config = stage_outputs["route_config"]
+
+        # resolve 产出
+        if ctx.num_classes is None and stage_outputs.get("num_classes") is not None:
+            ctx.num_classes = stage_outputs["num_classes"]
+        if ctx.task_spec is None and stage_outputs.get("task_spec"):
+            from ...core.task import TaskSpec
+            ctx.task_spec = TaskSpec.from_dict(stage_outputs["task_spec"])
+        if ctx.feature_spec is None and stage_outputs.get("feature_spec"):
+            from ...core.features import FeatureSpec
+            ctx.feature_spec = FeatureSpec.from_dict(stage_outputs["feature_spec"])
+        if not ctx.scene_info and stage_outputs.get("scene_info"):
+            ctx.scene_info = stage_outputs["scene_info"]
+        if not ctx.resolved and stage_outputs.get("resolved"):
+            ctx.resolved = stage_outputs["resolved"]
+        if not ctx.lightning_params and stage_outputs.get("lightning_params"):
+            ctx.lightning_params = stage_outputs["lightning_params"]
+        if not ctx.distributed_kwargs and stage_outputs.get("distributed_kwargs"):
+            ctx.distributed_kwargs = stage_outputs["distributed_kwargs"]
+
+        _logger.info("Restored stage outputs from checkpoint")
 
     @classmethod
     def resume(cls, output_dir, pipeline_run=None) -> Tuple["Pipeline", List[str]]:

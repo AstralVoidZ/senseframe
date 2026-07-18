@@ -24,6 +24,8 @@ import sys
 import traceback
 from pathlib import Path
 
+from .errors import get_error_code
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -58,7 +60,7 @@ def main():
         except Exception as e:
             print(json.dumps({
                 "error": f"读取 params-file 失败: {e}",
-                "error_type": type(e).__name__,
+                "error_type": get_error_code(e),
             }))
             sys.exit(1)
 
@@ -83,7 +85,7 @@ def main():
         tb = traceback.format_exc()
         print(json.dumps({
             "error": str(e),
-            "error_type": type(e).__name__,
+            "error_type": get_error_code(e),
             "traceback": tb,
         }))
         sys.exit(1)
@@ -202,7 +204,10 @@ def _do_probe(
     use_autocast = isinstance(precision, str) and precision.startswith("16")
     with torch.no_grad():
         with torch.autocast("cuda", enabled=use_autocast):
-            output = model(x)
+            if learning_mode == "self_supervised":
+                output = model(x, x)
+            else:
+                output = model(x)
 
     # 测量峰值
     peak_bytes = torch.cuda.max_memory_allocated(device)

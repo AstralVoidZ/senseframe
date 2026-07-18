@@ -113,6 +113,19 @@ class SelfSupervisedModule(pl.LightningModule):
             task="multiclass", num_classes=num_classes,
         )
         self._final_confusion_matrix: Optional[List[List[int]]] = None
+        # test 阶段指标（与 val 对称）
+        self.test_metrics = nn.ModuleDict()
+        for name in metrics:
+            if has_metric(name):
+                m = get_metric(name, num_classes)
+                if m is not None:
+                    self.test_metrics[name] = m
+        self._test_confusion_matrix = ConfusionMatrix(
+            task="multiclass", num_classes=num_classes,
+        )
+        self._final_test_confusion_matrix: Optional[List[List[int]]] = None
+        self._last_test_metrics: Dict[str, float] = {}
+        self._is_final_test: bool = False
 
         # 训练日志
         self.training_log: List[Dict[str, Any]] = []
@@ -183,6 +196,48 @@ class SelfSupervisedModule(pl.LightningModule):
             self.log(f"val_{name}", self.val_metrics[name], prog_bar=True, on_step=False, on_epoch=True)
 
         return loss
+
+    def test_step(self, batch, batch_idx):
+        """测试阶段：与 validation_step 对称，使用 test_metrics 和 test_ 前缀。"""
+        x, y = batch
+        y = y.long()
+
+        y1, y2 = self.model(x, x, flag="supervised")
+        loss = self.ce_criterion(y1, y) + self.ce_criterion(y2, y)
+
+        preds = torch.argmax(y1, dim=1)
+        for name, metric in self.test_metrics.items():
+            metric(preds, y)
+        self._test_confusion_matrix(preds, y)
+
+        self.log("test_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        for name in self.test_metrics:
+            self.log(f"test_{name}", self.test_metrics[name], prog_bar=True, on_step=False, on_epoch=True)
+
+        return loss
+
+    def on_test_epoch_end(self):
+        """收集 test 指标，与 on_validation_epoch_end 的 final_eval 路径对称。"""
+        if self.trainer.sanity_checking:
+            return
+
+        self._last_test_metrics = {}
+        cb_metrics = self.trainer.callback_metrics if self.trainer else {}
+        test_loss_cb = cb_metrics.get("test_loss")
+        if test_loss_cb is not None:
+            self._last_test_metrics["test_loss"] = round(
+                float(test_loss_cb.item() if hasattr(test_loss_cb, "item") else test_loss_cb), 6
+            )
+        for name in self.test_metrics:
+            key = f"test_{name}"
+            val = cb_metrics.get(key)
+            if val is not None:
+                self._last_test_metrics[key] = round(float(val.item()
+                                                   if hasattr(val, "item") else val), 6)
+        if self._test_confusion_matrix is not None:
+            cm = self._test_confusion_matrix.compute()
+            self._final_test_confusion_matrix = cm.long().tolist()
+            self._test_confusion_matrix.reset()
 
     def on_train_epoch_end(self):
         """Phase 2.2c：每 epoch 结束 log 当前学习率，便于监控 scheduler 衰减。"""
@@ -280,6 +335,11 @@ class SelfSupervisedModule(pl.LightningModule):
         # Phase 2.2b：附加 confusion_matrix（如有）
         if self._final_confusion_matrix is not None:
             results["confusion_matrix"] = self._final_confusion_matrix
+        # 合并 test 指标（与 GenericLightningModule 对称）
+        if self._last_test_metrics:
+            results.update(self._last_test_metrics)
+            if self._final_test_confusion_matrix is not None:
+                results["test_confusion_matrix"] = self._final_test_confusion_matrix
         return results
 
     def configure_optimizers(self):

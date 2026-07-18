@@ -19,7 +19,6 @@
       scripts/               # CLI 脚本
       configs/               # 配置示例
       examples/              # 示例代码
-      schemas/               # JSON Schema
       requirements.txt       # 依赖清单
       AGENTS.md              # opencode 项目入口（向上遍历发现）
       CLAUDE.md              # Claude Code 兼容入口
@@ -851,7 +850,6 @@ thepot/
 ├── scripts/               # CLI 脚本
 ├── configs/               # 配置示例
 ├── examples/              # 示例代码
-├── schemas/               # JSON Schema
 ├── requirements.txt       # Python 依赖
 ├── resource/              # 资源输入
 │   ├── CSI_DATASETS.zip   # 原始数据集 zip

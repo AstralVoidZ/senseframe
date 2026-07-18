@@ -12,32 +12,19 @@ SenseFrame 让 Agent 持有训练流程控制权：框架提供可组合的 Stag
 
 ## 特性
 
-### 核心
-- **开放策略空间** — task_type / loss / metric / model / scene / normalization 均可运行时注册
-- **数据驱动** — DataProfiler 探查数据特征并推荐策略（task_type / loss / metric / normalization）
+- **开放策略空间** — `task_type` / `loss` / `metric` / `model` / `scene` / `normalization` 均可运行时注册
+- **数据驱动** — `DataProfiler` 探查数据特征并推荐策略（task_type / loss / metric / normalization）
 - **可编程训练流程** — 8 个 Stage 可替换、插入 hook、跳过、断点续跑
 - **声明式 + 命令式** — YAML 快速启动，代码注入自定义逻辑
 - **资源感知路由** — 自动探测 CPU/GPU/内存，五级路由选择训练路线
-- **自愈重试** — OOM 自动降 batch_size 重试
-
-### v0.2.0 架构改进（RFC-003 / 004 / 005）
-- **结构化异常层级** — `SenseFrameError` 基类 + 12 个子类，每个携带 `error_code`，消除字符串匹配
-- **产物溯源** — `ArtifactManifest` 记录全部产物（model/metadata/config/metrics/feedback）SHA-256，`verify_artifacts()` 可校验完整性
-- **资源安全** — `release_resources()` 主动清理 Trainer/DataLoader/Logger；修复 DataLoader persistent_workers pipe 泄露；OTel `shutdown_otel()` + atexit 兜底
-- **显式入口点契约** — `activate_lazy_scenes()` 替代查询时自动注册（CQS 合规）
+- **自愈重试** — OOM 自动降 `batch_size` 重试
+- **结构化异常** — `SenseFrameError` 基类 + 12 个子类，每个携带 `error_code`，消除字符串匹配
+- **产物溯源** — `ArtifactManifest` 记录全部产物 SHA-256，`verify_artifacts()` 校验完整性
+- **资源安全** — `release_resources()` 主动清理 Trainer / DataLoader / Logger / GPU 显存
 - **自省协议** — `context_schema()` / `stage_io()` / `pipeline_graph()` 查询字段契约，无需读源码
 - **探索闭环** — `record_trial` 记录历史，`save_skill` 策略复用，`Pipeline.resume` 断点续跑
-
-### v0.3.0 类型安全加固（P5 全面源码审查）
-- **TrainOutput dataclass 化** — `training`/`env_snapshot`/`feedback` 从 `Dict[str, Any]` 收窄为 `Optional[TrainingSummary/EnvSnapshot/FeedbackResult]`，运行时校验捕获类型污染
-- **SceneParams 正交化** — `SceneConfig.params` 从 `Dict[str, Any]` 收窄为 `Optional[SceneParams]`，11 标准字段接口契约 + dict-like 兼容层（`__getitem__`/`__setitem__`/`__contains__`/`items`），下游零改动
-- **Loader spec 驱动** — hdf5/parquet/csi_mat/tensor 4 个 loader 统一从 `DatasetSpec.dir_names` 派生候选路径，删除全部 glob 兜底
-- **validate 函数体系** — `validate_feedback`/`validate_training_summary`/`validate_env_snapshot`/`validate_scene_params` 在构造出口和入口校验类型
-- **渐进式 dataclass 化方法论** — 阶段1 dataclass+validate → Step 1 validate+to_dict 还原 → 阶段2 构造点切换 → 阶段3 类型收窄，每阶段零破坏或可控破坏
-
-### 训练能力
+- **搜索协议（SP）** — HPO / NAS / AutoAugment / 元学习 / ε6 对比实验统一走 Ask-Tell 接口
 - **自监督学习** — 两阶段训练（AutoFi 风格 EntLoss 预训练 + 监督微调）
-- **HPO 超参搜索** — Optuna + 断点续搜
 - **多格式导出** — ONNX / TorchScript / state_dict / 量化 ONNX
 - **推理服务** — KServe v2 兼容 HTTP API + OTel 指标
 
@@ -49,6 +36,9 @@ SenseFrame 让 Agent 持有训练流程控制权：框架提供可组合的 Stag
 git clone <repo-url>
 cd SenseFrame
 pip install -r requirements.txt
+
+# ONNX 导出为可选依赖（按需安装）
+pip install onnx  # 导出 onnx 格式时需要
 ```
 
 ### 声明式训练
@@ -81,6 +71,9 @@ if output.status == "success":
 ```python
 import senseframe as sf
 
+# 激活场景（查询注册表前必调）
+sf.activate_lazy_scenes()
+
 # 数据画像 → 策略推荐
 profile = sf.DataProfiler().profile_bundle(bundle, dataset_name="my_data")
 print(f"推荐: task_type={profile.recommended_task_type}, loss={profile.recommended_loss}")
@@ -110,30 +103,22 @@ SenseFrame 采用 **通用训练框架 + 场景包** 分层架构：
 - **场景包** — WiFi CSI（4 数据集 / 11 模型）/ Detection / Generic / Custom / 模板
 
 两条执行路径归一到 `Pipeline.run()`（单一真相源）：
+
 - **声明式** — YAML → `run_experiment(config)` → 内部委托 `run_pipeline`
-- **命令式** — DataProfiler + register_* + Pipeline + load_extension
+- **命令式** — `DataProfiler` + `register_*` + `Pipeline` + `load_extension`
 
 ## 项目结构
 
 ```
 senseframe/
-├── core/                # 核心抽象
-│   ├── task.py          # TaskType 开放注册表 + TaskSpec
-│   ├── losses.py        # 损失函数工厂
-│   ├── metrics.py       # 指标工厂
-│   ├── features.py      # 特征规格
-│   ├── profiler.py      # DataProfiler 数据画像
-│   ├── params.py        # 参数量估算
-│   ├── validators.py    # 数据/签名/性能校验器
-│   ├── ent_loss.py      # 自监督 EntLoss
-│   └── compatibility.py # 兼容性矩阵
+├── core/                # 核心抽象：TaskType / losses / metrics / features / profiler / params
 ├── data/                # 数据加载与归一化
-│   ├── loaders/         # CSI/CSV/HDF5/Parquet/Tensor 加载器
+│   ├── loaders/         # CSI / CSV / HDF5 / Parquet / Tensor 加载器
 │   ├── manifest.py      # DatasetManifest 动态数据集
 │   └── normalization.py # 归一化策略
 ├── engine/              # 训练引擎
 │   ├── config.py        # ExperimentConfig
-│   ├── datamodule.py    # GenericDataModule（含 persistent_workers pipe 泄露修复）
+│   ├── datamodule.py    # GenericDataModule
 │   ├── module.py        # GenericLightningModule
 │   ├── self_supervised.py
 │   ├── hpo.py           # 超参搜索
@@ -148,15 +133,18 @@ senseframe/
 │   ├── base.py          # SceneContainer 抽象基类
 │   ├── wifi_csi/        # WiFi CSI 场景
 │   └── ...
-├── registry.py          # 模型/数据集/归一化注册表
+├── search_protocol.py   # SP 搜索协议（Ask-Tell + Study/Trial/Sampler）
+├── orchestration.py     # OP 编排协议（PipelineRun 状态机 + CloudEvent）
+├── nas/                 # 神经架构搜索（DARTS / ENAS / Evolutionary）
+├── autoaugment/         # AutoAugment 数据增强搜索
+├── automl/              # 损失搜索 + 元学习 warm-start
+├── experiment/          # ε6 对比实验（Method / Baseline / ExperimentRunner）
+├── registry.py          # 模型 / 数据集 / 归一化注册表
 ├── routing.py           # 资源路由
-├── observability.py     # 可观测性（IncrementalLogWriter）
-├── observability_otel.py # OpenTelemetry + shutdown_otel
 ├── introspect.py        # 自省协议
 ├── exploration.py       # 探索状态管理
 ├── skills.py            # 技能库
-├── serving.py           # 推理服务（KServe v2）
-└── ...
+└── serving.py           # 推理服务（KServe v2）
 ```
 
 ## CLI
@@ -169,66 +157,10 @@ senseframe/
 | `list-models` | 列出可用模型 | `python -m senseframe.cli list-models --dataset UT_HAR_data` |
 | `list-datasets` | 列出可用数据集 | `python -m senseframe.cli list-datasets` |
 | `list-scenes` | 列出场景容器 | `python -m senseframe.cli list-scenes` |
+| `paradigms` | 列出 SOTA 范式 | `python -m senseframe.cli paradigms --category cnn` |
 | `recommend` | 根据资源推荐模型 | `python -m senseframe.cli recommend --dataset UT_HAR_data` |
 | `experiment` | YAML 配置驱动训练 | `python -m senseframe.cli experiment --config configs/config.yaml` |
 | `export` | 多格式模型导出 | `python -m senseframe.cli export --formats onnx` |
-
-## 错误处理
-
-基于 `error_code` 做程序化决策，而非字符串匹配。所有训练错误抛出 `SenseFrameError` 子类：
-
-| error_code | 异常类 | 建议动作 |
-|------------|--------|---------|
-| `CONFIG_VALIDATION_ERROR` | `ConfigValidationError` | 修正配置，不重试 |
-| `SCENE_NOT_FOUND` | `SceneNotRegisteredError` | 检查 scene.name |
-| `DATASET_NOT_SUPPORTED` | `DatasetNotSupportedError` | 检查 dataset 名 |
-| `MODEL_NOT_SUPPORTED` | `ModelNotSupportedError` | 检查 model_id |
-| `DATA_NOT_FOUND` | `DataNotFoundError` | 检查 data_root，不重试 |
-| `OOM_ERROR` | `OOMError` | 降 batch_size 重试 |
-| `PREFLIGHT_ERROR` | `PreflightError` | 升级硬件或换小模型 |
-| `TRAINING_ERROR` | `TrainingError` | 查看 traceback |
-
-```python
-from senseframe.engine.runner.errors import SenseFrameError, OOMError
-
-try:
-    output = run_experiment(config)
-except OOMError as e:
-    # e.error_code == "OOM_ERROR"
-    config.trainer.batch_size //= 2
-    output = run_experiment(config)
-except SenseFrameError as e:
-    print(f"[{e.error_code}] {e}")
-```
-
-## 产物溯源
-
-每次训练自动生成 `artifact_manifest.json`，记录全部产物的 SHA-256：
-
-```python
-from senseframe import load_manifest, verify_artifacts
-
-manifest = load_manifest("runs/<exp>/artifact_manifest.json")
-# manifest.artifacts: {name: ArtifactDescriptor(path, sha256, size)}
-
-# 校验产物完整性（未被篡改/丢失）— 返回 {产物名: hash 是否匹配}
-result = verify_artifacts("runs/<exp>/")
-tampered = [name for name, ok in result.items() if not ok]
-if tampered:
-    print(f"产物校验失败: {tampered}")
-```
-
-## 资源安全
-
-`PipelineContext.release_resources()` 主动释放训练资源，避免长任务/HPO 中的资源泄露：
-
-```python
-ctx = sf.PipelineContext(config=my_config)
-result = pipeline.run(ctx)
-ctx.release_resources()  # 主动清理 Trainer/DataLoader/Logger/GPU 显存
-```
-
-清理顺序：log_writer close → Logger finalize → Trainer `_teardown` → DataModule teardown → model `.cpu()` → 置 None → CUDA empty_cache → gc.collect。
 
 ## 配置
 
@@ -264,6 +196,67 @@ save_model: true
 
 参考：[配置 Schema](reference/config_schema.md) | [配置模板](reference/training_templates.md)
 
+## 错误处理
+
+基于 `error_code` 做程序化决策，而非字符串匹配。所有训练错误抛出 `SenseFrameError` 子类：
+
+| error_code | 异常类 | 建议动作 |
+|------------|--------|---------|
+| `CONFIG_VALIDATION_ERROR` | `ConfigValidationError` | 修正配置，不重试 |
+| `SCENE_NOT_FOUND` | `SceneNotRegisteredError` | 检查 scene.name |
+| `DATASET_NOT_SUPPORTED` | `DatasetNotSupportedError` | 检查 dataset 名 |
+| `MODEL_NOT_SUPPORTED` | `ModelNotSupportedError` | 检查 model_id |
+| `DATA_NOT_FOUND` | `DataNotFoundError` | 检查 data_root，不重试 |
+| `DATA_LOAD_ERROR` | `DataCorruptedError` | 检查数据完整性 / 格式 / 权限 |
+| `OOM_ERROR` | `OOMError` | 降 batch_size 重试 |
+| `CHECKPOINT_ERROR` | `CheckpointError` | 检查 checkpoint 路径 / 版本 / 完整性 |
+| `PREFLIGHT_ERROR` | `PreflightError` | 升级硬件或换小模型 |
+| `TRAINING_ERROR` | `TrainingError` | 查看 traceback |
+| `MODEL_BUILD_ERROR` | `ModelBuildError` | 检查 model_id |
+| `SAVE_ERROR` | `SaveError` | 检查磁盘空间 / 权限 |
+
+```python
+from senseframe.engine.runner.errors import SenseFrameError, OOMError
+
+try:
+    output = run_experiment(config)
+except OOMError as e:
+    # e.error_code == "OOM_ERROR"
+    config.trainer.batch_size //= 2
+    output = run_experiment(config)
+except SenseFrameError as e:
+    print(f"[{e.error_code}] {e}")
+```
+
+## 产物溯源
+
+每次训练自动生成 `artifact_manifest.json`，记录全部产物的 SHA-256：
+
+```python
+from senseframe import load_manifest, verify_artifacts
+
+manifest = load_manifest("runs/<exp>/artifact_manifest.json")
+# manifest.artifacts: {name: ArtifactDescriptor(path, sha256, size)}
+
+# 校验产物完整性（未被篡改 / 丢失）— 返回 {产物名: hash 是否匹配}
+result = verify_artifacts("runs/<exp>/")
+tampered = [name for name, ok in result.items() if not ok]
+if tampered:
+    print(f"产物校验失败: {tampered}")
+```
+
+## 资源安全
+
+`PipelineContext.release_resources()` 主动释放训练资源，避免长任务 / HPO 中的资源泄露：
+
+```python
+ctx = sf.PipelineContext(config=my_config)
+result = pipeline.run(ctx)
+ctx.release_resources()  # 主动清理 Trainer / DataLoader / Logger / GPU 显存
+```
+
+HPO 路径自动调用；命令式路径需手动调用。
+
 ## 数据集与模型
 
 参考：[数据集与模型支持表](reference/datasets_and_models.md)
@@ -288,9 +281,13 @@ class TimeSeriesScene(SceneContainer):
 
 - [SKILL.md](SKILL.md) — Agent 技能说明与工作流
 - [自省协议](reference/introspect.md) — 字段契约 / 探索状态 / 技能库 / 断点续跑
+- [配置 Schema](reference/config_schema.md) — 完整字段与校验规则
+- [配置模板](reference/training_templates.md) — YAML 配置模板
+- [数据集与模型](reference/datasets_and_models.md) — 数据集与模型支持表
 - [资源路由](reference/resource_routing.md) — 五级路由表 + 模型推荐
-- [自监督训练](reference/self_supervised_paradigm.md)
-- [错误排查](reference/troubleshooting.md)
+- [自监督训练](reference/self_supervised_paradigm.md) — 自监督训练范式
+- [场景开发指南](reference/scene_development.md) — 新增场景容器
+- [错误排查](reference/troubleshooting.md) — error_code 枚举与排查指南
 - [SenseFi](https://github.com/Marsrocky/Awesome-WiFi-CSI-Sensing) — Yang et al., Patterns, Cell Press, 2023
 
 ## License

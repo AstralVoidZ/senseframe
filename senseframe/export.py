@@ -17,14 +17,21 @@
 
 import hashlib
 import json
+import logging
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .engine.metadata import load_metadata
+
 import torch
 import torch.nn as nn
+
+from .common import load_checkpoint_flexible
+
+_logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -584,8 +591,8 @@ def export_from_metadata(
     from .scenes import get_scene
 
     metadata_path = Path(metadata_path)
-    with open(metadata_path, "r", encoding="utf-8") as f:
-        metadata = json.load(f)
+    # P3：通过 load_metadata 自动协商 schema_version 迁移
+    metadata = load_metadata(metadata_path)
 
     model_id = metadata["model_id"]
     dataset = metadata["dataset"]
@@ -624,8 +631,22 @@ def export_from_metadata(
         model = scene.build_model_for_dataset(
             model_id, dataset, num_classes, learning_mode=learning_mode,
         )
-    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    model.load_state_dict(state_dict)
+    # 修复：使用 load_checkpoint_flexible 兼容 Lightning checkpoint 与裸 state_dict。
+    # 旧代码直接 torch.load + model.load_state_dict(state_dict) 会因 Lightning ckpt
+    # 顶层含 epoch/global_step/optimizer_states 等非权重字段触发
+    # `Unexpected key(s) in state_dict: "epoch", "global_step", ...` 错误，
+    # 且未剥离 "model." 前缀导致 key 不匹配，F 阶段 ONNX 导出全部失败。
+    # weights_only=False 兼容 Lightning ckpt 的 callbacks 字段（含 Python 对象）。
+    load_info = load_checkpoint_flexible(
+        checkpoint_path, model, map_location="cpu", weights_only=False,
+    )
+    _logger.info(
+        "export_from_metadata: loaded checkpoint %s (format=%s, keys=%d, prefix=%r)",
+        checkpoint_path,
+        load_info["source_format"],
+        load_info["num_keys_loaded"],
+        load_info["stripped_prefix"],
+    )
     model.eval()
 
     return export_model(

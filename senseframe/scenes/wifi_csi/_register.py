@@ -67,10 +67,10 @@ def register_metadata() -> None:
     _DATASET_META = [
         # UT_HAR: data/label 子目录内扁平 .npy 文件
         ("UT_HAR_data",    7,  (1, 250, 90),  ("UT_HAR",),              "npy",  "tensor",  "flat"),
-        # NTU-Fi-HumanID: train_amp/test_amp 子目录内扁平 .mat 文件
-        ("NTU-Fi-HumanID", 14, (3, 114, 500), ("NTU-Fi-HumanID",),      "mat",  "csi_mat", "flat"),
+        # NTU-Fi-HumanID: train_amp/test_amp 下按类别子目录组织（如 test_amp/015/*.mat）
+        ("NTU-Fi-HumanID", 14, (3, 114, 500), ("NTU-Fi-HumanID",),      "mat",  "csi_mat", "nested"),
         # NTU-Fi_HAR: train_amp/test_amp 下类别子目录（box/circle/clean/fall/run/walk）
-        # 官方数据集按类别子目录组织，与 NTU-Fi-HumanID 的扁平结构不同
+        # NTU-Fi_HAR 与 NTU-Fi-HumanID 目录结构相同，均按类别子目录组织（nested layout）
         ("NTU-Fi_HAR",     6,  (3, 114, 500), ("NTU-Fi_HAR",),          "mat",  "csi_mat", "nested",
          "", "NTU-Fi-HumanID"),  # unsupervised_source="", supervised_source="NTU-Fi-HumanID"
         # Widar: train/test 子目录下类别子目录 <class_dir>/<sample>.csv

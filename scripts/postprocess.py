@@ -33,6 +33,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from senseframe.engine.metadata import load_metadata  # noqa: E402
+
 
 def _file_sha256(path: Path) -> str:
     """计算文件 SHA256 校验和（分块读取，支持大文件）。"""
@@ -146,9 +148,8 @@ def postprocess(output_dir: str) -> dict:
     if not model_path.exists():
         raise FileNotFoundError(f"model.pth not found in {output_dir}")
 
-    # 读取 metadata
-    with open(metadata_path, "r", encoding="utf-8") as f:
-        metadata = json.load(f)
+    # 读取 metadata（P3：通过 load_metadata 自动协商 schema_version 迁移）
+    metadata = load_metadata(metadata_path)
 
     model_id = metadata.get("model_id", "unknown")
     dataset = metadata.get("dataset", "unknown")

@@ -436,6 +436,9 @@ class TestEpsilon3SPProtocol:
         class CustomSampler:
             name = "custom_test_sampler"
 
+            def __init__(self, seed=None):
+                pass
+
             def sample(self, search_space, history):
                 return {p.name: "fixed" for p in search_space.parameters}
 

@@ -7,7 +7,7 @@
 4. add_category 空 list 不更新 PreflightReport.status
 5. CheckResult.to_dict 字段完整性
 6. _build_unified_report 保留 failed 状态及 error/error_code 字段
-7. layout 声明一致性：NTU-Fi_HAR=nested, NTU-Fi-HumanID=flat
+7. layout 声明一致性：NTU-Fi_HAR=nested, NTU-Fi-HumanID=nested
 """
 
 import pytest
@@ -206,7 +206,7 @@ class TestBuildUnifiedReportFailedPreservation:
 class TestDatasetLayoutConsistency:
     """数据集 layout 声明一致性测试。
 
-    确保 NTU-Fi_HAR=nested（按类别子目录），NTU-Fi-HumanID=flat（扁平结构）。
+    确保 NTU-Fi_HAR=nested（按类别子目录），NTU-Fi-HumanID=nested（按类别子目录）。
     防止 layout 声明与实际数据集目录结构不匹配的 bug 再次出现。
     """
 
@@ -224,12 +224,12 @@ class TestDatasetLayoutConsistency:
             f"NTU-Fi_HAR layout 应为 'nested'（类别子目录），实际为 '{spec.layout}'"
         )
 
-    def test_ntu_fi_humanid_layout_is_flat(self):
-        """NTU-Fi-HumanID 的 layout 应为 flat（扁平 .mat 文件）。"""
+    def test_ntu_fi_humanid_layout_is_nested(self):
+        """NTU-Fi-HumanID 的 layout 应为 nested（类别子目录，如 test_amp/015/*.mat）。"""
         from senseframe.registry import get_dataset_spec
         spec = get_dataset_spec("NTU-Fi-HumanID")
-        assert spec.layout == "flat", (
-            f"NTU-Fi-HumanID layout 应为 'flat'，实际为 '{spec.layout}'"
+        assert spec.layout == "nested", (
+            f"NTU-Fi-HumanID layout 应为 'nested'（类别子目录），实际为 '{spec.layout}'"
         )
 
     def test_widar_layout_is_nested(self):

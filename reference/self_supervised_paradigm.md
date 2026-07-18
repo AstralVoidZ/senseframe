@@ -119,6 +119,10 @@ bundle = DatasetBundle(
    - Stage 1：AdamW（训练全部参数）
    - Stage 2：Adam（仅训练 classifier 参数）
 
+6. **权重传递机制**：
+   - **单次运行内（`learning_mode=self_supervised`）**：Stage 1 和 Stage 2 复用同一个 `ctx.model` 对象（`SelfSupervisedModule` 包装），通过 `phase` 属性切换行为。Stage 1 训练的 encoder 权重通过 Python 对象引用自然延续到 Stage 2，无需显式 save/load。这是框架支持的标准路径。
+   - **跨运行加载（先 self_supervised 保存 checkpoint，再 supervised 加载）**：**不支持**。`_Parrallel` 模型与监督模型（`NTU_Fi_*`）的 forward 签名（`(x1, x2, flag)` vs `(x)`）和 state_dict key 结构完全不同，框架不提供 key 映射函数。如需跨运行迁移 encoder 权重，需在外部 SenseFi 项目层面实现。
+
 ## 数据增强
 
 Stage 1 使用 `gaussian_noise` 数据增强生成两个增强视图：

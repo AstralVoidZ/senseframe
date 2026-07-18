@@ -170,12 +170,14 @@ class WiFiCSIContainer(SceneContainer):
                 supervised_finetune=dm.supervised_dataset,
                 val=dm.val_dataset,
                 test=dm.test_dataset,
+                learning_mode="self_supervised",  # P0-B: 显式传 learning_mode
             )
         # P2-3 修复：填充 bundle.val，打通 val 传播链路
         return DatasetBundle(
             train=dm.train_dataset,
             val=dm.val_dataset,
             test=dm.test_dataset,
+            learning_mode="supervised",  # P0-B: 显式传 learning_mode
         )
 
     def build_model_for_dataset(self, model_id: str, dataset: str,

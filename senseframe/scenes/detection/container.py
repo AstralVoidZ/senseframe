@@ -178,6 +178,7 @@ class DetectionContainer(SceneContainer):
             supported_tasks=["detection"],
             supported_models=list(_DETECTION_MODELS.keys()),
             supported_datasets=list(_DETECTION_DATASETS.keys()),
+            modality="image",
         )
 
     def load_dataset(

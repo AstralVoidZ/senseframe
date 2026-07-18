@@ -72,6 +72,18 @@ class ConfigValidationError(SenseFrameError, ValueError):
     error_code = "CONFIG_VALIDATION_ERROR"
 
 
+class MetadataVersionError(SenseFrameError):
+    """metadata.json schema_version 不兼容且无迁移路径。
+
+    P3 演进（2026-07-18）：metadata 版本管理引入。
+    触发场景：
+    - metadata.json 的 schema_version 高于 CURRENT_METADATA_VERSION（用户需升级 SenseFrame）
+    - MIGRATIONS 中无对应迁移路径（metadata.json 损坏或来自不兼容分支）
+    落地点：engine.metadata.migrate_metadata 抛出，classify_error 直接命中 SenseFrameError 分支。
+    """
+    error_code = "METADATA_VERSION_ERROR"
+
+
 def classify_error(exc: Exception, stage: Optional[str] = None) -> str:
     """
     根据异常类型映射到结构化错误码。
@@ -201,3 +213,25 @@ def classify_error(exc: Exception, stage: Optional[str] = None) -> str:
 
     # 12. 兜底
     return "UNKNOWN_ERROR"
+
+
+def get_error_code(exc: Exception, stage: Optional[str] = None) -> str:
+    """获取异常的结构化错误码（供 CLI / API JSON 输出使用）。
+
+    Review 修复（2026-07-18）：替代 `type(e).__name__`，让 JSON 输出的 "code" 字段
+    与 SKILL.md 错误码表对齐，Agent 可程序化解析。
+
+    优先级：
+    1. SenseFrameError 子类 → exc.error_code（isinstance 检查）
+    2. 非 SenseFrame 异常 → classify_error(exc, stage) heuristic 兜底
+
+    Args:
+        exc: 捕获的异常
+        stage: 可选的 stage 上下文（如 "predict"/"export"），用于 classify_error 的 stage 感知分类
+
+    Returns:
+        结构化错误码字符串（如 "METADATA_VERSION_ERROR" / "CONFIG_VALIDATION_ERROR"）
+    """
+    if isinstance(exc, SenseFrameError):
+        return exc.error_code
+    return classify_error(exc, stage=stage)

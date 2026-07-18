@@ -58,6 +58,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 # 单一数据源：bootstrap 后从 senseframe.common.paths 导入 PROJECT_ROOT
 from senseframe.common.paths import PROJECT_ROOT  # noqa: E402
+from senseframe.engine.metadata import load_metadata  # noqa: E402
 
 
 # ============================================================================
@@ -540,9 +541,8 @@ def _run_opencode(test_case, run_id, output_base):
                     metadata_path = exp_dir / "metadata.json"
                     if metadata_path.exists():
                         try:
-                            metadata = json.loads(
-                                metadata_path.read_text(encoding="utf-8")
-                            )
+                            # P3：通过 load_metadata 自动协商 schema_version 迁移
+                            metadata = load_metadata(metadata_path)
                             # 确认是本次运行的（通过 model_id 和 dataset 匹配）
                             if (metadata.get("model_id") == model_id and
                                     metadata.get("dataset") == dataset):

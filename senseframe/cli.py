@@ -25,6 +25,7 @@ import yaml
 
 from .engine import ExperimentConfig, run_hpo
 from .engine.runner import run_experiment
+from .engine.runner.errors import get_error_code
 from .observability import setup_logging
 from .registry import DATASET_INFO, list_datasets, list_models
 from .routing import ResourceProbe, ResourceRouter
@@ -389,6 +390,14 @@ def _has_factory(model_id: str, dataset: str) -> bool:
         return False
 
 
+def _resolve_modality_from_scene(scene_name: str) -> str:
+    """从已注册的 scene 元数据读取 modality，避免硬编码场景名到模态的映射。"""
+    from .scenes import get_scene, has_scene
+    if has_scene(scene_name):
+        return get_scene(scene_name).meta().modality
+    return "unknown"
+
+
 def _cmd_recommend(args):
     """根据资源推荐可用模型。"""
     activate_lazy_scenes()
@@ -434,6 +443,8 @@ def _cmd_recommend(args):
     elif priority == "speed":
         recommendations.sort(key=lambda x: x.get("estimated_params_m", 0))
     elif priority == "memory":
+        recommendations.sort(key=lambda x: x.get("estimated_vram_mb", 0))
+    elif priority == "balanced":
         recommendations.sort(key=lambda x: x.get("estimated_vram_mb", 0))
 
     _print_json({
@@ -940,7 +951,7 @@ def _cmd_dry_run(config: ExperimentConfig, static_only: bool = False) -> dict:
         dyn_detail = dyn_result.get("detail", {})
         profile = DataProfile(
             n_samples=n_samples,
-            modality="csi" if config.scene.name == "wifi_csi" else "unknown",
+            modality=_resolve_modality_from_scene(config.scene.name),
             class_distribution=dyn_detail.get("class_distribution", {}),
             imbalance_ratio=dyn_detail.get("imbalance_ratio"),
             missing_rate=0.0,
@@ -1107,7 +1118,7 @@ def _cmd_predict(args):
     except Exception as e:
         print(json.dumps({
             "error": f"Inference failed: {e}",
-            "code": type(e).__name__,
+            "code": get_error_code(e, stage="predict"),
         }, ensure_ascii=False))
         sys.exit(1)
 
@@ -1158,10 +1169,12 @@ def _cmd_experiment(args):
 
     # 加载 YAML 配置
     if not args.config:
+        # P2 演进（2026-07-18）：错误输出到 stderr（与 _cmd_export 对齐，
+        # 符合 cli.py:977 注释 "P5 P3-13：错误输出到 stderr" 设计原则）
         print(json.dumps({
             "error": "--config is required for experiment command",
             "code": "MISSING_CONFIG",
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
     config_path = Path(args.config)
@@ -1169,7 +1182,7 @@ def _cmd_experiment(args):
         print(json.dumps({
             "error": f"Config file not found: {args.config}",
             "code": "CONFIG_NOT_FOUND",
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
     with open(config_path, "r", encoding="utf-8") as f:
@@ -1179,7 +1192,7 @@ def _cmd_experiment(args):
         print(json.dumps({
             "error": "Config file must contain a YAML mapping at top level",
             "code": "INVALID_CONFIG_FORMAT",
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
     # 解析为 ExperimentConfig（暂不 validate，CLI 覆盖 + env fallback 后再校验）
@@ -1189,7 +1202,7 @@ def _cmd_experiment(args):
         print(json.dumps({
             "error": str(e),
             "code": "CONFIG_VALIDATION_ERROR",
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
     # CLI 覆盖（可选）
@@ -1223,7 +1236,7 @@ def _cmd_experiment(args):
         print(json.dumps({
             "error": str(e),
             "code": "CONFIG_VALIDATION_ERROR",
-        }, ensure_ascii=False))
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
     # s2: export_formats 已纳入 ExperimentConfig schema，直接赋值
@@ -1235,7 +1248,7 @@ def _cmd_experiment(args):
                 print(json.dumps({
                     "error": f"Unsupported export format '{fmt}'. Supported: {SUPPORTED_FORMATS}",
                     "code": "UNSUPPORTED_FORMAT",
-                }, ensure_ascii=False))
+                }, ensure_ascii=False), file=sys.stderr)
                 sys.exit(1)
         config.export_formats = formats
 
@@ -1802,7 +1815,7 @@ def main():
         tb = traceback.format_exc()
         print(json.dumps({
             "error": str(e),
-            "code": type(e).__name__,
+            "code": get_error_code(e),
             "traceback": tb,
         }, ensure_ascii=False))
         sys.exit(1)

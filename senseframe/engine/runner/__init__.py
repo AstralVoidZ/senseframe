@@ -19,6 +19,7 @@ from .resolver import (
 )
 from .errors import (
     classify_error,
+    get_error_code,
     SenseFrameError,
     SceneNotRegisteredError,
     DatasetNotSupportedError,
@@ -32,6 +33,7 @@ from .errors import (
     ModelBuildError,
     SaveError,
     ConfigValidationError,
+    MetadataVersionError,
 )
 # RFC Phase D：可编程 Stage Pipeline
 from .pipeline import (

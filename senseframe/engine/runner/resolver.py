@@ -34,6 +34,10 @@ def experiment_config_to_dict(cfg: ExperimentConfig) -> Dict[str, Any]:
 
     缺省字段使用 None，由 run_experiment 内部走默认值/路由填充逻辑。
     """
+    # P1 演进（2026-07-18）：SceneConfig 已迁移到 pydantic v2 BaseModel，
+    # 用 _dataclass_to_dict 替代 dataclasses.asdict（兼容 pydantic + dataclass 嵌套）。
+    from ...engine.config import _dataclass_to_dict
+
     d: Dict[str, Any] = {
         # 场景
         "model_id": cfg.scene.model_id,
@@ -43,8 +47,7 @@ def experiment_config_to_dict(cfg: ExperimentConfig) -> Dict[str, Any]:
         # P2 修复：递归序列化完整 SceneConfig（含嵌套 task_spec dataclass），
         # 供 metadata.config.scene 使用。根因：原实现仅展开 scene 标量字段到顶层，
         # 无 scene 整体 dict，导致下游 metadata.config.scene 为 None。
-        # asdict() 递归转换嵌套 dataclass（TaskSpec）/dict/list/tuple，原始类型保持不变。
-        "scene": dataclasses.asdict(cfg.scene) if cfg.scene is not None else None,
+        "scene": _dataclass_to_dict(cfg.scene) if cfg.scene is not None else None,
         # 训练器
         "epochs": cfg.trainer.epochs,
         "learning_rate": cfg.trainer.learning_rate,
@@ -76,10 +79,11 @@ def experiment_config_to_dict(cfg: ExperimentConfig) -> Dict[str, Any]:
             "direction": cfg.hpo.direction,
         },
         # 特征声明（Stage 5+ 使用，当前仅作为元数据保存）
+        # P1 演进：InputFeature/OutputFeature 已迁移到 pydantic，用 model_dump() 序列化
         "_features": {
-            "input": [f.__dict__ if hasattr(f, "__dict__") else dict(f)
+            "input": [f.model_dump() if hasattr(f, "model_dump") else f.__dict__
                       for f in cfg.input_features],
-            "output": [f.__dict__ if hasattr(f, "__dict__") else dict(f)
+            "output": [f.model_dump() if hasattr(f, "model_dump") else f.__dict__
                        for f in cfg.output_features],
         },
     }
@@ -92,6 +96,14 @@ def experiment_config_to_dict(cfg: ExperimentConfig) -> Dict[str, Any]:
     d["resume"] = cfg.trainer.resume
     # Phase 14.3.3：mixed_precision 正交化
     d["mixed_precision"] = cfg.trainer.mixed_precision
+    # P2 修复（2026-07-18）：分布式训练字段从 ExperimentConfig 透传到 routing 层
+    # 旧实现这些字段未声明在 ExperimentConfig 中，被 extra="ignore" 丢弃，
+    # routing.py 永远读到默认值——分布式训练 YAML 配置不生效。
+    d["devices"] = cfg.devices
+    d["strategy"] = cfg.strategy
+    d["num_nodes"] = cfg.num_nodes
+    d["sync_batchnorm"] = cfg.sync_batchnorm
+    d["num_processes"] = cfg.num_processes
 
     # scene.params 透传到顶层（允许覆盖 trainer 字段，提供 escape hatch）
     # 已知透传键：self_supervised_epochs, metrics, average, scheduler,

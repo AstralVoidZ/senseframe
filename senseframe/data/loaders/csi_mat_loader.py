@@ -127,8 +127,8 @@ class CSIMatLoader(DatasetLoader):
                 )
             supervised_dir_name = supervised_spec.dir_names[0]
             supervised_layout = supervised_spec.layout
-            # 修复连带 bug：HumanID 应使用自己的 layout，而非沿用 NTU-Fi_HAR 的
-            # NTU-Fi_HAR=nested, NTU-Fi-HumanID=flat，两者目录结构不同
+            # HumanID 应使用自己的 layout，而非沿用 NTU-Fi_HAR 的
+            # NTU-Fi_HAR=nested, NTU-Fi-HumanID=nested，两者目录结构相同（均按类别子目录）
             supervised_dir = resolve_data_path(root, supervised_dir_name, "test_amp")
             supervised = CSIDataset(supervised_dir, layout=supervised_layout)
             supervised_test_dir = resolve_data_path(root, supervised_dir_name, "train_amp")

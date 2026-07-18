@@ -312,6 +312,37 @@ class GenericDataModule(pl.LightningDataModule):
             _logger.warning("Cache save failed (next startup will reload data): %s", e)
             return None
 
+    def _safe_dataloader(self, dataset, **dl_kwargs) -> "DataLoader":
+        """创建 DataLoader，多进程启动失败时自动降级到 num_workers=0。
+
+        兑现 routing.py 的注释承诺："如遇 multiprocessing 问题，回退到 0"。
+        触发场景：Python 3.14+ Linux forkserver 模式 + python -c/REPL 无法
+        重新导入 <stdin> 主模块；或 worker 用对象不可 pickle。
+
+        Args:
+            dataset: 传给 DataLoader 的 dataset
+            **dl_kwargs: DataLoader 关键字参数（num_workers/pin_memory/...）
+
+        Returns:
+            DataLoader 实例（原配置或降级到 num_workers=0）
+        """
+        try:
+            dl = DataLoader(dataset, **dl_kwargs)
+            # num_workers>0 时触发一次迭代以提早发现 worker 启动失败
+            if dl_kwargs.get("num_workers", 0) > 0:
+                _ = next(iter(dl))
+            return dl
+        except (ConnectionResetError, RuntimeError, OSError) as e:
+            _logger.warning(
+                "DataLoader multi-process failed (%s), retry with num_workers=0", e
+            )
+            # 降级到 num_workers=0
+            self.num_workers = 0
+            self.persistent_workers = False
+            dl_kwargs["num_workers"] = 0
+            dl_kwargs["persistent_workers"] = False
+            return DataLoader(dataset, **dl_kwargs)
+
     def train_dataloader(self):
         if "train" in self._dl_cache:
             return self._dl_cache["train"]
@@ -322,7 +353,7 @@ class GenericDataModule(pl.LightningDataModule):
             # collate 可正确批化，无需自定义 collate_fn。
             # 但仍透传 self.collate_fn（默认 None=默认 collate）以保持与
             # 监督分支一致，并允许用户注入 batch 级增强（如 mixup collate）。
-            dl = DataLoader(
+            dl = self._safe_dataloader(
                 self.unsupervised_dataset,
                 batch_size=self.batch_size,
                 shuffle=True,
@@ -335,7 +366,7 @@ class GenericDataModule(pl.LightningDataModule):
             actual_dataset = self.unsupervised_dataset
         elif self.streaming:
             # 流式模式：IterableDataset 不支持 shuffle/drop_last
-            dl = DataLoader(
+            dl = self._safe_dataloader(
                 self.train_dataset,
                 batch_size=self.batch_size,
                 num_workers=self.num_workers,
@@ -345,7 +376,7 @@ class GenericDataModule(pl.LightningDataModule):
             )
             actual_dataset = self.train_dataset
         else:
-            dl = DataLoader(
+            dl = self._safe_dataloader(
                 self.train_dataset,
                 batch_size=self.batch_size,
                 shuffle=True,
@@ -376,7 +407,7 @@ class GenericDataModule(pl.LightningDataModule):
             return self._dl_cache["val"]
         # Phase 1.2d：使用独立的 val_dataset（无独立 val 时回退到 test_dataset）
         if self.streaming:
-            dl = DataLoader(
+            dl = self._safe_dataloader(
                 self.val_dataset,
                 batch_size=self.batch_size * 2,
                 num_workers=self.num_workers,
@@ -385,7 +416,7 @@ class GenericDataModule(pl.LightningDataModule):
                 worker_init_fn=_np_random_worker_init_fn,
             )
         else:
-            dl = DataLoader(
+            dl = self._safe_dataloader(
                 self.val_dataset,
                 batch_size=self.batch_size * 2,
                 shuffle=False,
@@ -413,7 +444,7 @@ class GenericDataModule(pl.LightningDataModule):
         if "test" in self._dl_cache:
             return self._dl_cache["test"]
         if self.streaming:
-            dl = DataLoader(
+            dl = self._safe_dataloader(
                 self.test_dataset,
                 batch_size=self.batch_size * 2,
                 num_workers=self.num_workers,
@@ -422,7 +453,7 @@ class GenericDataModule(pl.LightningDataModule):
                 worker_init_fn=_np_random_worker_init_fn,
             )
         else:
-            dl = DataLoader(
+            dl = self._safe_dataloader(
                 self.test_dataset,
                 batch_size=self.batch_size * 2,
                 shuffle=False,
@@ -452,7 +483,7 @@ class GenericDataModule(pl.LightningDataModule):
             raise RuntimeError("supervised_dataloader only available in self_supervised mode")
         if "supervised" in self._dl_cache:
             return self._dl_cache["supervised"]
-        dl = DataLoader(
+        dl = self._safe_dataloader(
             self.supervised_dataset,
             batch_size=self.batch_size,
             shuffle=True,

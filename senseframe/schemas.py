@@ -15,9 +15,16 @@ from typing import Any, Dict, List, Optional
 # Phase 6.1：结构化错误码枚举
 # ============================================================
 # Agent 可基于 error_code 做程序化分支，无需字符串匹配
+# P2 演进（2026-07-18）：补全 cli.py / validate_config.py 中使用的 5 个幽灵错误码，
+# 消除"代码用了但字典没定义"的契约缺口，Agent 可基于 ERROR_CODES 做完整程序化分支。
 ERROR_CODES = {
     "OK": "成功",
     "CONFIG_VALIDATION_ERROR": "配置校验失败",
+    "CONFIG_PARSE_ERROR": "配置解析失败（YAML 语法错误或结构不匹配）",
+    "CONFIG_NOT_FOUND": "配置文件未找到",
+    "MISSING_CONFIG": "必需配置参数缺失（如 --config 未提供）",
+    "INVALID_CONFIG_FORMAT": "配置格式无效（YAML 顶层非 mapping）",
+    "UNSUPPORTED_FORMAT": "不支持的格式（如 export_formats 中的非法值）",
     "SCENE_NOT_FOUND": "场景未注册",
     "DATASET_NOT_SUPPORTED": "数据集不被场景支持",
     "MODEL_NOT_SUPPORTED": "模型不被场景支持",
@@ -29,6 +36,8 @@ ERROR_CODES = {
     "CHECKPOINT_ERROR": "Checkpoint 加载/保存失败",
     "SAVE_ERROR": "模型/元数据保存失败",
     "PREFLIGHT_ERROR": "预检失败（显存/磁盘不足）",
+    "METADATA_NOT_FOUND": "metadata.json 未找到（推理/导出需要训练产物 metadata.json）",
+    "METADATA_VERSION_ERROR": "metadata.json schema_version 不兼容且无迁移路径",
     "UNKNOWN_ERROR": "未知错误",
 }
 
@@ -58,6 +67,11 @@ class ResourceReport:
             "cpu_memory_available_mb": self.cpu_memory_available_mb,
             "has_mps": self.has_mps,
         }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ResourceReport":
+        """从 dict 恢复 ResourceReport（用于 checkpoint 恢复）。"""
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 @dataclass
