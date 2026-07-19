@@ -33,6 +33,7 @@ from p3_eval_common import (
     CROSS_DOMAIN_EXPERIMENTS,
     add_common_args,
     aggregate_results,
+    apply_arg_overrides,
     compute_transfer_gain,
     run_single_experiment,
     setup_logging,
@@ -43,13 +44,18 @@ def build_experiment_configs(
     experiments: list[str],
     output_dir: str,
     seed: int,
+    args=None,
 ) -> list[ExperimentConfig]:
-    """构造 B1-B8 实验配置列表。"""
+    """构造 B1-B8 实验配置列表。
+
+    若传入 args（argparse Namespace），用 apply_arg_overrides 把
+    --epochs/--batch-size 等覆盖到每个 ExperimentConfig。
+    """
     configs = []
     for exp_def in CROSS_DOMAIN_EXPERIMENTS:
         if exp_def["id"] not in experiments:
             continue
-        configs.append(ExperimentConfig(
+        cfg = ExperimentConfig(
             experiment_id=exp_def["id"],
             experiment_group="cross_domain",
             pretrain_source=exp_def["pretrain"],
@@ -57,7 +63,10 @@ def build_experiment_configs(
             target_dataset=exp_def["target"],
             output_dir=output_dir,
             seed=seed,
-        ))
+        )
+        if args is not None:
+            cfg = apply_arg_overrides(args, cfg)
+        configs.append(cfg)
     return configs
 
 
@@ -75,6 +84,7 @@ def main():
         experiments=args.experiments,
         output_dir=args.output_dir,
         seed=args.seed,
+        args=args,
     )
 
     print(f"=== 10.4 跨场景迁移评估 ===")
