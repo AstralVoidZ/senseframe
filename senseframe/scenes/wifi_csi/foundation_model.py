@@ -358,6 +358,65 @@ class CSIFoundationModel(nn.Module):
         )
         return PEFTBuilder.build(foundation_copy, params)
 
+    def replace_patch_embedder(
+        self,
+        new_input_shape: Tuple[int, int],
+        new_patch_len: int,
+    ) -> None:
+        """替换 patch_embedder + 相关 modality-specific 参数（跨模态迁移用）。
+
+        用于 B5/B6 跨场景迁移：在 CSI 数据上 MAE 预训练后，替换 patch_embedder
+        为目标模态（如 EEG）的维度，保留 transformer encoder + decoder 主体
+        （modality-agnostic 部分）。
+
+        重新初始化的模块（modality-specific，维度依赖 input_shape / patch_len）：
+        - patch_embedder：proj 权重形状 (d_model, patch_len * C) 改变
+        - pos_embed：n_patches 改变（L // patch_len）
+        - decoder_pos_embed：n_patches 改变
+        - decoder_proj：输出维度 (patch_len * C) 改变
+
+        保留的模块（modality-agnostic，仅依赖 d_model / decoder_dim / n_heads）：
+        - encoder / encoder_norm
+        - decoder_embed / decoder / decoder_norm
+        - mask_token
+
+        Args:
+            new_input_shape: 新模态的 (C, L)
+            new_patch_len: 新模态的 patch_len
+
+        Raises:
+            ValueError: new_input_shape 不是 (C, L) 元组或 L 不能被 patch_len 整除
+        """
+        # 构建新 patch_embedder（CSIPatchEmbedder.__init__ 内部会校验 input_shape / patch_len）
+        new_patch_embedder = CSIPatchEmbedder(
+            new_input_shape, new_patch_len, self.d_model
+        )
+        new_n_patches = new_patch_embedder.n_patches
+
+        # 替换 modality-specific 模块
+        self.patch_embedder = new_patch_embedder
+        self.input_shape = tuple(new_input_shape)
+        self.patch_len = new_patch_len
+
+        # 重新初始化 pos_embed（n_patches 改变）
+        # 对齐 __init__ 的 P3-P2-10 优化：torch.empty + trunc_normal_，跳过冗余 zeros
+        self.pos_embed = nn.Parameter(torch.empty(1, new_n_patches, self.d_model))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        # 重新初始化 decoder_pos_embed（n_patches 改变）
+        self.decoder_pos_embed = nn.Parameter(
+            torch.empty(1, new_n_patches, self.decoder_dim)
+        )
+        nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
+
+        # 重新初始化 decoder_proj（输出维度 patch_len * C 改变）
+        new_C = new_patch_embedder.C
+        new_pl = new_patch_embedder.patch_len
+        self.decoder_proj = nn.Linear(self.decoder_dim, new_pl * new_C)
+
+        # encoder / encoder_norm / decoder_embed / mask_token / decoder / decoder_norm
+        # 保持不变（modality-agnostic，跨模态迁移的核心价值所在）
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """forward 调用 encode（供 PEFTBuilder 注入 LoRA 等模块时使用）。"""
         return self.encode(x)

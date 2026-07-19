@@ -478,3 +478,229 @@ class TestCrossDatasetTransfer:
         with torch.no_grad():
             base_out = model.encode(x)
         assert base_out.shape == (8, 8, 32)
+
+
+# ============================================================
+# TestReplacePatchEmbedder
+# ============================================================
+class TestReplacePatchEmbedder:
+    """验证 replace_patch_embedder 跨模态迁移行为（B5/B6 跨场景迁移核心 API）。
+
+    测试原则（对齐 reference/p3_lessons_learned.md 教训 10）：
+    - modality-specific 模块（patch_embedder/pos_embed/decoder_pos_embed/decoder_proj）必须重新初始化
+    - modality-agnostic 模块（encoder/encoder_norm/decoder_embed/decoder/decoder_norm/mask_token）必须保留
+    - 替换后 backbone 能 forward 新模态 shape 输入
+    - 替换后 n_patches 与新模态一致
+    """
+    # CSI 模态测试配置：input_shape=(3, 64), patch_len=8 → patch_len*C=24, n_patches=8
+    # EEG 模态测试配置：input_shape=(4, 48), patch_len=8 → patch_len*C=32, n_patches=6
+    # 两个模态 patch_len*C 与 n_patches 都不同，能严格验证替换生效
+    CSI_SHAPE = (3, 64)
+    CSI_PATCH_LEN = 8
+    EEG_SHAPE = (4, 48)
+    EEG_PATCH_LEN = 8
+
+    def _make_csi_model(self) -> CSIFoundationModel:
+        """构建 CSI 维度的小模型（模拟 CSI MAE 预训练后的 backbone）。"""
+        return _make_small_model(
+            input_shape=self.CSI_SHAPE,
+            patch_len=self.CSI_PATCH_LEN,
+        )
+
+    def test_replace_changes_patch_embedder_proj_dim(self):
+        """替换后 patch_embedder.proj 输入维度 = new_patch_len * new_C。"""
+        model = self._make_csi_model()
+        old_proj_weight = model.patch_embedder.proj.weight
+        # CSI: proj 输入维度 = 8 * 3 = 24
+        assert old_proj_weight.shape[1] == self.CSI_PATCH_LEN * self.CSI_SHAPE[0]
+
+        model.replace_patch_embedder(self.EEG_SHAPE, self.EEG_PATCH_LEN)
+        new_proj_weight = model.patch_embedder.proj.weight
+        # EEG: proj 输入维度 = 8 * 4 = 32
+        assert new_proj_weight.shape[1] == self.EEG_PATCH_LEN * self.EEG_SHAPE[0], (
+            f"替换后 proj 输入维度应为 {self.EEG_PATCH_LEN * self.EEG_SHAPE[0]}, "
+            f"实际 {new_proj_weight.shape[1]}"
+        )
+
+    def test_replace_changes_n_patches(self):
+        """替换后 n_patches = new_L / new_patch_len。"""
+        model = self._make_csi_model()
+        assert model.n_patches == self.CSI_SHAPE[1] // self.CSI_PATCH_LEN  # 64/8=8
+
+        model.replace_patch_embedder(self.EEG_SHAPE, self.EEG_PATCH_LEN)
+        assert model.n_patches == self.EEG_SHAPE[1] // self.EEG_PATCH_LEN, (
+            f"替换后 n_patches 应为 {self.EEG_SHAPE[1] // self.EEG_PATCH_LEN}, "
+            f"实际 {model.n_patches}"
+        )
+
+    def test_replace_reinitializes_pos_embed_shape(self):
+        """替换后 pos_embed shape 变为新 n_patches。"""
+        model = self._make_csi_model()
+        old_pos_embed = model.pos_embed
+        assert old_pos_embed.shape == (1, 8, 32)  # CSI: n_patches=8, d_model=32
+
+        model.replace_patch_embedder(self.EEG_SHAPE, self.EEG_PATCH_LEN)
+        new_pos_embed = model.pos_embed
+        # EEG: n_patches=6, d_model=32
+        assert new_pos_embed.shape == (1, 6, 32), (
+            f"替换后 pos_embed shape 应为 (1, 6, 32), 实际 {new_pos_embed.shape}"
+        )
+
+    def test_replace_reinitializes_decoder_pos_embed_shape(self):
+        """替换后 decoder_pos_embed shape 变为新 n_patches。"""
+        model = self._make_csi_model()
+        assert model.decoder_pos_embed.shape == (1, 8, 16)  # CSI: n_patches=8, decoder_dim=16
+
+        model.replace_patch_embedder(self.EEG_SHAPE, self.EEG_PATCH_LEN)
+        assert model.decoder_pos_embed.shape == (1, 6, 16), (
+            f"替换后 decoder_pos_embed shape 应为 (1, 6, 16), "
+            f"实际 {model.decoder_pos_embed.shape}"
+        )
+
+    def test_replace_reinitializes_decoder_proj_dim(self):
+        """替换后 decoder_proj 输出维度 = new_patch_len * new_C。"""
+        model = self._make_csi_model()
+        # CSI: decoder_proj 输出维度 = 8 * 3 = 24
+        assert model.decoder_proj.weight.shape[0] == self.CSI_PATCH_LEN * self.CSI_SHAPE[0]
+
+        model.replace_patch_embedder(self.EEG_SHAPE, self.EEG_PATCH_LEN)
+        # EEG: decoder_proj 输出维度 = 8 * 4 = 32
+        assert model.decoder_proj.weight.shape[0] == self.EEG_PATCH_LEN * self.EEG_SHAPE[0], (
+            f"替换后 decoder_proj 输出维度应为 {self.EEG_PATCH_LEN * self.EEG_SHAPE[0]}, "
+            f"实际 {model.decoder_proj.weight.shape[0]}"
+        )
+
+    def test_replace_preserves_encoder_weights(self):
+        """替换后 encoder 权重保持不变（modality-agnostic 核心验证）。"""
+        model = self._make_csi_model()
+        # 记录替换前 encoder 第一层权重
+        old_encoder_weight = model.encoder[0].attn.query.weight.clone()
+        old_encoder_norm_weight = model.encoder_norm.weight.clone()
+
+        model.replace_patch_embedder(self.EEG_SHAPE, self.EEG_PATCH_LEN)
+
+        new_encoder_weight = model.encoder[0].attn.query.weight
+        new_encoder_norm_weight = model.encoder_norm.weight
+        assert torch.equal(old_encoder_weight, new_encoder_weight), (
+            "替换后 encoder[0].attn.query.weight 应保持不变（modality-agnostic）"
+        )
+        assert torch.equal(old_encoder_norm_weight, new_encoder_norm_weight), (
+            "替换后 encoder_norm.weight 应保持不变（modality-agnostic）"
+        )
+
+    def test_replace_preserves_decoder_main_body_weights(self):
+        """替换后 decoder 主体（decoder_embed/decoder/decoder_norm）权重保持。"""
+        model = self._make_csi_model()
+        old_decoder_embed_weight = model.decoder_embed.weight.clone()
+        old_decoder_weight = model.decoder[0].attn.query.weight.clone()
+        old_decoder_norm_weight = model.decoder_norm.weight.clone()
+        old_mask_token = model.mask_token.clone()
+
+        model.replace_patch_embedder(self.EEG_SHAPE, self.EEG_PATCH_LEN)
+
+        assert torch.equal(old_decoder_embed_weight, model.decoder_embed.weight), (
+            "替换后 decoder_embed.weight 应保持不变"
+        )
+        assert torch.equal(old_decoder_weight, model.decoder[0].attn.query.weight), (
+            "替换后 decoder[0].attn.query.weight 应保持不变"
+        )
+        assert torch.equal(old_decoder_norm_weight, model.decoder_norm.weight), (
+            "替换后 decoder_norm.weight 应保持不变"
+        )
+        assert torch.equal(old_mask_token, model.mask_token), (
+            "替换后 mask_token 应保持不变"
+        )
+
+    def test_replace_then_forward_new_modality(self):
+        """替换后能 forward 新模态 shape 输入，输出 shape 正确。"""
+        model = self._make_csi_model()
+        model.replace_patch_embedder(self.EEG_SHAPE, self.EEG_PATCH_LEN)
+        model.eval()
+
+        # EEG 输入: (B=2, C=4, L=48)
+        x_eeg = torch.randn(2, *self.EEG_SHAPE)
+        with torch.no_grad():
+            out = model.encode(x_eeg)
+        # 输出: (B=2, n_patches=6, d_model=32)
+        assert out.shape == (2, 6, 32), (
+            f"替换后 encode 输出 shape 应为 (2, 6, 32), 实际 {out.shape}"
+        )
+        assert torch.isfinite(out).all(), "encode 输出应为有限值"
+
+    def test_replace_then_mae_forward_loss_new_modality(self):
+        """替换后 MAE loss 在新模态输入上可计算（验证 decoder 链路完整）。"""
+        model = self._make_csi_model()
+        model.replace_patch_embedder(self.EEG_SHAPE, self.EEG_PATCH_LEN)
+        model.eval()
+
+        x_eeg = torch.randn(4, *self.EEG_SHAPE)
+        with torch.no_grad():
+            torch.manual_seed(42)
+            loss = model._mae_forward_loss(x_eeg, mask_ratio=0.5)
+        assert torch.isfinite(loss), f"MAE loss 应为有限值, 实际 {loss}"
+        assert loss.item() > 0, "MAE loss 应为正"
+
+    def test_replace_invalid_shape_raises(self):
+        """无效 input_shape（L 不能被 patch_len 整除）抛 ValueError。"""
+        model = self._make_csi_model()
+        # L=50, patch_len=8 → 50 % 8 != 0
+        with pytest.raises(ValueError, match="divisible by patch_len"):
+            model.replace_patch_embedder((4, 50), new_patch_len=8)
+
+    def test_replace_invalid_shape_dim_raises(self):
+        """无效 input_shape（不是 (C, L) 元组）抛 ValueError。"""
+        model = self._make_csi_model()
+        with pytest.raises(ValueError, match="input_shape must be"):
+            model.replace_patch_embedder((4, 48, 3), new_patch_len=8)  # 3D
+
+    def test_cross_modal_pretrain_then_replace_then_encode(self):
+        """端到端跨模态迁移流程：CSI pretrain → replace → EEG forward。
+
+        验证 B5/B6 跨场景迁移的完整链路：
+        1. 用 CSI 维度构建 backbone + MAE 预训练（encoder 权重应变化）
+        2. replace_patch_embedder 切换到 EEG 维度
+        3. EEG 维度输入能 forward，输出 shape 正确
+        4. encoder 权重在 replace 前后保持不变（modality-agnostic 保留）
+        """
+        torch.manual_seed(0)
+        model = self._make_csi_model()
+
+        # 1. 记录 pretrain 前 encoder 权重
+        encoder_weight_before_pretrain = (
+            model.encoder[0].attn.query.weight.clone()
+        )
+
+        # 2. CSI 维度 MAE 预训练
+        x_csi = torch.randn(8, *self.CSI_SHAPE)
+        pretrain_config = PretrainConfig(
+            epochs=2, mask_ratio=0.5, learning_rate=1e-3
+        )
+        model.pretrain([(x_csi,)], config=pretrain_config)
+
+        # 3. 验证 pretrain 确实改变了 encoder 权重
+        encoder_weight_after_pretrain = model.encoder[0].attn.query.weight
+        assert not torch.equal(encoder_weight_before_pretrain, encoder_weight_after_pretrain), (
+            "pretrain 后 encoder 权重应发生变化（验证预训练真的在训练）"
+        )
+
+        # 4. 记录 replace 前 encoder 权重
+        encoder_weight_before_replace = encoder_weight_after_pretrain.clone()
+
+        # 5. replace_patch_embedder 切换到 EEG 维度
+        model.replace_patch_embedder(self.EEG_SHAPE, self.EEG_PATCH_LEN)
+
+        # 6. 验证 replace 后 encoder 权重保持不变
+        encoder_weight_after_replace = model.encoder[0].attn.query.weight
+        assert torch.equal(encoder_weight_before_replace, encoder_weight_after_replace), (
+            "replace_patch_embedder 后 encoder 权重应保持不变（核心：modality-agnostic 保留）"
+        )
+
+        # 7. EEG 维度输入能 forward
+        model.eval()
+        x_eeg = torch.randn(4, *self.EEG_SHAPE)
+        with torch.no_grad():
+            out = model.encode(x_eeg)
+        assert out.shape == (4, 6, 32), (
+            f"跨模态迁移后 EEG 输入 encode 输出 shape 应为 (4, 6, 32), 实际 {out.shape}"
+        )
+        assert torch.isfinite(out).all()

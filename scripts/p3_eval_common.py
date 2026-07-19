@@ -444,6 +444,103 @@ def _build_peft_model(backbone: nn.Module, finetune_method: str, finetune_params
         raise ValueError(f"Unknown finetune_method: {finetune_method}")
 
 
+def _resolve_pretrain_dataset(pretrain_source: str, target_dataset: str) -> Optional[str]:
+    """解析 pretrain_source 到具体预训练数据集名（跨模态迁移用）。
+
+    B 系列跨模态迁移：pretrain_source 是模态聚合标签，需映射到具体数据集名。
+    A 系列同模态预训练：pretrain_source="csi_4datasets" + target=CSI → target_dataset 自己。
+
+    映射规则：
+    - "none" → None（无预训练）
+    - "csi_4datasets" + target 是 EEG/Radio → "NTU-Fi_HAR"（B5/B6/B7/B8 默认 CSI 预训练）
+    - "csi_4datasets" + target 是 CSI → target_dataset（A 系列同数据集预训练）
+    - "radioml" → "RadioML2018"
+    - "eegmmidb" → "PhysioNet_MI"
+    - 显式数据集名（如 "NTU-Fi_HAR"）→ 直接返回
+
+    Args:
+        pretrain_source: ExperimentConfig.pretrain_source
+        target_dataset: ExperimentConfig.target_dataset
+
+    Returns:
+        预训练数据集名（如 "NTU-Fi_HAR"），或 None（无预训练）
+    """
+    if pretrain_source == "none":
+        return None
+
+    if pretrain_source == "csi_4datasets":
+        # 跨模态：target 是 EEG/Radio → 默认用 NTU-Fi_HAR 做 CSI MAE 预训练
+        if target_dataset in EEG_DATASET_CONFIG or target_dataset in RADIO_DATASET_CONFIG:
+            return "NTU-Fi_HAR"
+        # 同模态：target 是 CSI → target_dataset 自己（A 系列行为）
+        return target_dataset
+
+    if pretrain_source == "radioml":
+        return "RadioML2018"
+
+    if pretrain_source == "eegmmidb":
+        return "PhysioNet_MI"
+
+    # 显式数据集名：直接返回（让 _get_dataset_config 后续校验有效性）
+    if pretrain_source in CSI_DATASET_CONFIG:
+        return pretrain_source
+    if pretrain_source in EEG_DATASET_CONFIG:
+        return pretrain_source
+    if pretrain_source in RADIO_DATASET_CONFIG:
+        return pretrain_source
+
+    logger.warning(
+        "Unknown pretrain_source=%s, treating as 'none'. "
+        "Valid: none/csi_4datasets/radioml/eegmmidb/<dataset_name>",
+        pretrain_source,
+    )
+    return None
+
+
+def _load_pretrain_dataset(pretrain_dataset_name: str):
+    """加载预训练数据集（独立于 target_dataset，跨模态迁移用）。
+
+    Returns:
+        (pretrain_ds, pretrain_collate_fn, pretrain_dataset_config)
+    """
+    pretrain_dataset_config = _get_dataset_config(pretrain_dataset_name)
+    if pretrain_dataset_config is None:
+        raise ValueError(f"Unknown pretrain_dataset: {pretrain_dataset_name}")
+
+    if pretrain_dataset_name in CSI_DATASET_CONFIG:
+        bundle = _load_csi_dataset(
+            pretrain_dataset_name, _CSI_DATA_ROOT, learning_mode="supervised"
+        )
+        pretrain_ds = bundle.train
+    elif pretrain_dataset_name in EEG_DATASET_CONFIG:
+        pretrain_ds, _, _ = _load_eeg_dataset(
+            pretrain_dataset_name, pretrain_dataset_config["data_root"]
+        )
+    elif pretrain_dataset_name in RADIO_DATASET_CONFIG:
+        from senseframe.scenes.radio.datasets import load_radioml_dataset
+        radio_root = pretrain_dataset_config["data_root"]
+        if not Path(radio_root).exists():
+            raise FileNotFoundError(
+                f"RadioML 数据目录不存在: {radio_root}。"
+                f"RadioML 2018.01A 下载完成后启用 RF 预训练。"
+            )
+        bundle = load_radioml_dataset(pretrain_dataset_name, root=radio_root)
+        pretrain_ds = bundle["train"]
+    else:
+        raise ValueError(f"Unsupported pretrain_dataset: {pretrain_dataset_name}")
+
+    pretrain_target_shape = (
+        pretrain_dataset_config["reshape_to"]
+        if "reshape_to" in pretrain_dataset_config
+        else pretrain_dataset_config["input_shape"]
+    )
+    pretrain_collate_fn = _make_collate_fn(
+        pretrain_target_shape, dataset_name=pretrain_dataset_name
+    )
+
+    return pretrain_ds, pretrain_collate_fn, pretrain_dataset_config
+
+
 # ============================================================
 # SP 搜索驱动 PEFT 超参搜索（10.5 C4/C5 用）
 # ============================================================
@@ -766,36 +863,19 @@ def run_single_experiment(
         is_eeg = config.target_dataset in EEG_DATASET_CONFIG
         is_radio = config.target_dataset in RADIO_DATASET_CONFIG
 
-        # ---- 2. 加载数据集 ----
-        logger.info("experiment %s: loading dataset %s",
+        # ---- 2. 加载 target 数据集（预训练数据集在步骤 4 单独加载）----
+        logger.info("experiment %s: loading target dataset %s",
                     config.experiment_id, config.target_dataset)
 
         if is_csi:
             data_root = _CSI_DATA_ROOT
-            if config.pretrain_source == "csi_4datasets":
-                # P3 验证 A2-A5：在 target_dataset 上做 MAE 预训练 + PEFT 微调
-                # 设计说明：不使用 scene 的 self_supervised 模式加载，原因：
-                # 1. UT_HAR_data 是 .npy 张量，没有 unsupervised/supervised_finetune 划分
-                # 2. NTU-Fi_HAR 的 self_supervised 模式设计为"用 NTU-Fi-HumanID 做监督微调"
-                #    （跨数据集迁移），但 A3 期望"用 NTU-Fi_HAR 自己的 6 类标签微调"，
-                #    会导致标签越界（HumanID 14 类 vs HAR 6 类）触发 CUDA nll_loss 断言
-                # 3. P3 验证目标是"同数据集预训练 + 微调"，不是跨数据集迁移（那是 B 系列的事）
-                # 因此统一走 supervised 模式加载，pretrain_ds = train_ds（MAE 只用 x，不用标签）
-                bundle = _load_csi_dataset(config.target_dataset, data_root,
-                                           learning_mode="supervised")
-                train_ds = bundle.train
-                val_ds = bundle.val if bundle.val else bundle.test
-                pretrain_ds = train_ds  # 复用 train 集做自监督 mask 重建
-            else:
-                bundle = _load_csi_dataset(config.target_dataset, data_root,
-                                           learning_mode="supervised")
-                train_ds = bundle.train
-                val_ds = bundle.val if bundle.val else bundle.test
-                pretrain_ds = None
+            bundle = _load_csi_dataset(config.target_dataset, data_root,
+                                       learning_mode="supervised")
+            train_ds = bundle.train
+            val_ds = bundle.val if bundle.val else bundle.test
         elif is_eeg:
             data_root = dataset_config["data_root"]
             train_ds, val_ds, _ = _load_eeg_dataset(config.target_dataset, data_root)
-            pretrain_ds = None  # EEG 预训练待 RadioML 就绪后扩展
         elif is_radio:
             data_root = dataset_config["data_root"]
             if not Path(data_root).exists():
@@ -807,11 +887,10 @@ def run_single_experiment(
             bundle = load_radioml_dataset(config.target_dataset, root=data_root)
             train_ds = bundle["train"]
             val_ds = bundle["val"]
-            pretrain_ds = None
         else:
             raise ValueError(f"Unsupported dataset: {config.target_dataset}")
 
-        # ---- 3. 构造 DataLoader ----
+        # ---- 3. 构造 target DataLoader ----
         target_shape = (dataset_config["reshape_to"] if "reshape_to" in dataset_config
                         else dataset_config["input_shape"])
         collate_fn = _make_collate_fn(target_shape, dataset_name=config.target_dataset)
@@ -825,14 +904,61 @@ def run_single_experiment(
             collate_fn=collate_fn, num_workers=0,
         )
 
-        # ---- 4. 构建 backbone ----
+        # ---- 4. 解析预训练数据集 + 构建 backbone + MAE 预训练 ----
+        # 设计：pretrain_source 驱动真实跨数据集预训练（B5/B6 跨场景迁移）
+        # - 同模态（A 系列）：pretrain_dataset == target_dataset，用 target train_ds 做 MAE 预训练
+        # - 跨模态（B 系列）：pretrain_dataset != target_dataset，独立加载预训练数据集 +
+        #   用预训练数据集 input_shape 构建 backbone + MAE 预训练 + replace_patch_embedder 切换到目标模态
         d_model = 128
-        backbone = _build_backbone(dataset_config, d_model=d_model)
+        pretrain_dataset_name = _resolve_pretrain_dataset(
+            config.pretrain_source, config.target_dataset
+        )
 
-        # ---- 5. MAE 预训练（若 pretrain_source != "none"）----
-        if config.pretrain_source != "none" and pretrain_ds is not None:
-            logger.info("experiment %s: MAE pretraining %d epochs",
-                        config.experiment_id, config.pretrain_epochs)
+        if pretrain_dataset_name is None:
+            # 无预训练：用 target_dataset_config 构建 backbone（B1/B4 baseline 路径）
+            backbone = _build_backbone(dataset_config, d_model=d_model)
+        elif pretrain_dataset_name == config.target_dataset:
+            # 同模态预训练（A 系列）：用 target_dataset_config 构建 backbone + 用 train_ds 做 MAE 预训练
+            # 设计说明：不使用 scene 的 self_supervised 模式加载，原因：
+            # 1. UT_HAR_data 是 .npy 张量，没有 unsupervised/supervised_finetune 划分
+            # 2. NTU-Fi_HAR 的 self_supervised 模式设计为"用 NTU-Fi-HumanID 做监督微调"
+            #    （跨数据集迁移），但 A3 期望"用 NTU-Fi_HAR 自己的 6 类标签微调"，
+            #    会导致标签越界（HumanID 14 类 vs HAR 6 类）触发 CUDA nll_loss 断言
+            # 3. P3 验证目标是"同数据集预训练 + 微调"，不是跨数据集迁移（那是 B 系列的事）
+            # 因此统一走 supervised 模式加载，pretrain_ds = train_ds（MAE 只用 x，不用标签）
+            backbone = _build_backbone(dataset_config, d_model=d_model)
+            logger.info("experiment %s: MAE pretraining %d epochs on %s (same-modal)",
+                        config.experiment_id, config.pretrain_epochs,
+                        config.target_dataset)
+            from senseframe.core.foundation_model import PretrainConfig
+            pretrain_cfg = PretrainConfig(
+                epochs=config.pretrain_epochs,
+                batch_size=config.batch_size,
+                learning_rate=config.pretrain_lr,
+                mask_ratio=config.pretrain_mask_ratio,
+            )
+            pretrain_loader = DataLoader(
+                train_ds, batch_size=config.batch_size, shuffle=True,
+                collate_fn=collate_fn, num_workers=0,
+            )
+            backbone.pretrain(pretrain_loader, pretrain_cfg)
+        else:
+            # 跨模态预训练（B5/B6/B7/B8）：
+            # 1. 用预训练数据集 input_shape 构建 backbone
+            # 2. 加载预训练数据集 + MAE 预训练
+            # 3. replace_patch_embedder 切换到目标模态（保留 transformer 主体）
+            logger.info("experiment %s: cross-modal pretrain %s -> %s",
+                        config.experiment_id, pretrain_dataset_name,
+                        config.target_dataset)
+
+            pretrain_ds, pretrain_collate_fn, pretrain_dataset_config = (
+                _load_pretrain_dataset(pretrain_dataset_name)
+            )
+            backbone = _build_backbone(pretrain_dataset_config, d_model=d_model)
+
+            logger.info("experiment %s: MAE pretraining %d epochs on %s (cross-modal)",
+                        config.experiment_id, config.pretrain_epochs,
+                        pretrain_dataset_name)
             from senseframe.core.foundation_model import PretrainConfig
             pretrain_cfg = PretrainConfig(
                 epochs=config.pretrain_epochs,
@@ -842,11 +968,27 @@ def run_single_experiment(
             )
             pretrain_loader = DataLoader(
                 pretrain_ds, batch_size=config.batch_size, shuffle=True,
-                collate_fn=collate_fn, num_workers=0,
+                collate_fn=pretrain_collate_fn, num_workers=0,
             )
             backbone.pretrain(pretrain_loader, pretrain_cfg)
 
-        # ---- 6. 构建 PEFT 模型 ----
+            # 替换 patch_embedder 到目标模态（保留 transformer encoder + decoder 主体）
+            # 核心跨模态迁移：modality-specific 的 patch_embedder/pos_embed/decoder_proj 重新初始化，
+            # modality-agnostic 的 encoder/decoder 保留预训练权重
+            logger.info(
+                "experiment %s: replace_patch_embedder %s%s -> %s%s (transferred=encoder+decoder, "
+                "reinit=patch_embedder+pos_embed+decoder_proj)",
+                config.experiment_id,
+                pretrain_dataset_name, pretrain_dataset_config.get(
+                    "reshape_to", pretrain_dataset_config["input_shape"]),
+                config.target_dataset, target_shape,
+            )
+            backbone.replace_patch_embedder(
+                new_input_shape=target_shape,
+                new_patch_len=dataset_config["patch_len"],
+            )
+
+        # ---- 5. 构建 PEFT 模型 ----
         # 10.5 C4/C5: SP 搜索驱动 — 跳过单次 PEFT 构建，进入 SP 搜索循环
         if config.finetune_method == "sp_search" and config.sp_search:
             num_classes = dataset_config["num_classes"]
@@ -917,7 +1059,7 @@ def run_single_experiment(
         )
         training_time = time.time() - t0
 
-        # ---- 9. 收集结果 ----
+        # ---- 8. 收集结果 ----
         result.status = "success"
         result.val_accuracy = val_acc
         result.macro_f1 = macro_f1
