@@ -36,6 +36,7 @@ from p3_eval_common import (
     SP_SEARCH_DATASETS,
     add_common_args,
     aggregate_results,
+    apply_arg_overrides,
     compute_search_effectiveness,
     run_single_experiment,
     setup_logging,
@@ -47,8 +48,13 @@ def build_experiment_configs(
     datasets: list[str],
     output_dir: str,
     seed: int,
+    args=None,
 ) -> list[ExperimentConfig]:
-    """构造 C1-C5 × datasets 的实验配置列表。"""
+    """构造 C1-C5 × datasets 的实验配置列表。
+
+    若传入 args（argparse Namespace），用 apply_arg_overrides 把
+    --epochs/--batch-size 等覆盖到每个 ExperimentConfig。
+    """
     configs = []
     for exp_def in SP_SEARCH_EXPERIMENTS:
         if exp_def["id"] not in experiments:
@@ -68,7 +74,7 @@ def build_experiment_configs(
                 # C4/C5 用 SP 搜索，finetune_method 由搜索决定（占位 "sp_search"）
                 finetune_method = "sp_search"
 
-            configs.append(ExperimentConfig(
+            cfg = ExperimentConfig(
                 experiment_id=f"{exp_def['id']}_{ds}",
                 experiment_group="sp_search",
                 pretrain_source="csi_4datasets",  # C 组全部预训练
@@ -78,7 +84,10 @@ def build_experiment_configs(
                 sp_search=sp_search,
                 output_dir=output_dir,
                 seed=seed,
-            ))
+            )
+            if args is not None:
+                cfg = apply_arg_overrides(args, cfg)
+            configs.append(cfg)
     return configs
 
 
@@ -100,6 +109,7 @@ def main():
         datasets=args.datasets,
         output_dir=args.output_dir,
         seed=args.seed,
+        args=args,
     )
 
     print(f"=== 10.5 SP 搜索有效性验证 ===")

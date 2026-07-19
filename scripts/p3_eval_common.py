@@ -440,6 +440,193 @@ def _build_peft_model(backbone: nn.Module, finetune_method: str, finetune_params
 
 
 # ============================================================
+# SP 搜索驱动 PEFT 超参搜索（10.5 C4/C5 用）
+# ============================================================
+def _build_sp_peft_search_space():
+    """构造 SP 搜索空间（精简版，避免 GridSampler 爆炸）。
+
+    搜索 4 个参数：
+    - peft_method: {lora, adapter, prompt_tuning}（3 选 1）
+    - peft_rank: {4, 8, 16, 32}（仅 lora 用，其他 method 忽略）
+    - adapter_bottleneck: {32, 64, 128, 256}（仅 adapter 用）
+    - prompt_length: {5, 10, 20, 50}（仅 prompt_tuning 用）
+
+    GridSampler 全网格 = 3 × 4 × 4 × 4 = 192 个点。
+    为避免 GridSampler 爆炸，C5 实验组建议只搜 lora（peft_rank × peft_alpha），
+    通过 SP_SEARCH_EXPERIMENTS 的 search_space 参数控制（待 10.5 实际跑时调整）。
+    """
+    from senseframe.search_protocol import ParameterSpec, SearchSpace
+
+    parameters = [
+        ParameterSpec(name="peft_method", type="categorical",
+                      choices=["lora", "adapter", "prompt_tuning"]),
+        ParameterSpec(name="peft_rank", type="categorical",
+                      choices=[4, 8, 16, 32]),
+        ParameterSpec(name="adapter_bottleneck", type="categorical",
+                      choices=[32, 64, 128, 256]),
+        ParameterSpec(name="prompt_length", type="categorical",
+                      choices=[5, 10, 20, 50]),
+    ]
+    return SearchSpace(parameters=parameters)
+
+
+def _params_to_peft_config(params: Dict[str, Any]) -> Dict[str, Any]:
+    """把 SP 采样的参数转换为 PEFTBuilder.build() 的入参。
+
+    根据采样的 peft_method 选择对应的 PEFT 配置，忽略无关参数。
+    固定 freeze_backbone=True（与 A3/A4/A5 对齐），target_modules 用默认值。
+    """
+    method = params["peft_method"]
+    config: Dict[str, Any] = {"peft_method": method, "freeze_backbone": True}
+    if method == "lora":
+        config["peft_rank"] = int(params.get("peft_rank", 8))
+        config["peft_alpha"] = 16  # 固定 alpha=16（与 A3 对齐）
+        config["peft_target_modules"] = "query_value"
+    elif method == "adapter":
+        config["adapter_bottleneck"] = int(params.get("adapter_bottleneck", 128))
+        config["peft_target_modules"] = "all"
+    elif method == "prompt_tuning":
+        config["prompt_length"] = int(params.get("prompt_length", 10))
+    else:
+        raise ValueError(f"Unsupported peft_method from SP: {method}")
+    return config
+
+
+def _run_sp_search(
+    config: "ExperimentConfig",
+    backbone: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    num_classes: int,
+    d_model: int,
+    device: torch.device,
+) -> Tuple[float, float, int, Dict[str, Any], int, int, float]:
+    """SP 搜索驱动 PEFT 超参搜索（10.5 C4/C5 用）。
+
+    流程：
+    1. 创建 SP Study（search_space = _build_sp_peft_search_space()）
+    2. for _ in range(n_trials):
+         trial = sm.ask(study_id)
+         peft_config = _params_to_peft_config(trial.params)
+         peft_model = PEFTBuilder.build(backbone 深拷贝, peft_config)
+         classifier = CSIClassifier(peft_model, ...)
+         val_acc, macro_f1, trainable = _train_classifier(...)
+         sm.tell(trial.trial_id, val_acc, state="completed")
+    3. 返回 best (val_acc, macro_f1, trainable_params, best_params, n_completed, n_trials, search_cost)
+
+    Args:
+        config: ExperimentConfig（sp_search 字段含 sampler/n_trials）
+        backbone: 基础模型（MAE 预训练后的 backbone，不会被修改）
+        train_loader / val_loader: 训练/验证 DataLoader
+        num_classes: 分类类别数
+        d_model: backbone 输出维度
+        device: 训练设备
+
+    Returns:
+        (best_val_acc, best_macro_f1, best_trainable_params,
+         best_params, n_completed, n_trials, search_cost_seconds)
+    """
+    import copy as _copy
+    import time as _time
+    from senseframe.automl.peft_builder import PEFTBuilder
+    from senseframe.search_protocol import get_study_manager
+
+    sp_cfg = config.sp_search or {}
+    sampler_name = sp_cfg.get("sampler", "random")
+    n_trials = int(sp_cfg.get("n_trials", 20))
+
+    # 1. 创建 SP Study
+    sm = get_study_manager()
+    study_name = f"p3_c_sp_search_{config.experiment_id}_{int(_time.time())}"
+    search_space = _build_sp_peft_search_space()
+    study_id = sm.create_study(
+        name=study_name,
+        search_space=search_space,
+        direction="maximize",
+        sampler=sampler_name,
+    )
+    logger.info(
+        "SP search: study_id=%s, sampler=%s, n_trials=%d",
+        study_id, sampler_name, n_trials,
+    )
+
+    # 2. 搜索循环
+    best_val_acc = 0.0
+    best_macro_f1 = 0.0
+    best_trainable = 0
+    best_params: Dict[str, Any] = {}
+    n_completed = 0
+    t_search_start = _time.time()
+
+    for trial_idx in range(n_trials):
+        try:
+            trial = sm.ask(study_id)
+        except Exception as e:
+            logger.warning("SP ask failed at trial %d: %s", trial_idx, e)
+            break
+
+        params = trial.params
+        peft_config = _params_to_peft_config(params)
+        logger.info(
+            "SP trial %d/%d: params=%s -> peft_config=%s",
+            trial_idx + 1, n_trials, params, peft_config,
+        )
+
+        # 在 backbone 深拷贝上构建 PEFT（避免污染原模型）
+        backbone_copy = _copy.deepcopy(backbone)
+        try:
+            peft_model = PEFTBuilder.build(backbone_copy, peft_config)
+        except Exception as e:
+            logger.warning("PEFTBuilder.build failed at trial %d: %s", trial_idx, e)
+            sm.tell(trial.trial_id, 0.0, state="failed")
+            continue
+
+        classifier = CSIClassifier(peft_model, d_model=d_model, num_classes=num_classes)
+
+        # 训练（用 config 的 epochs/lr，每个 trial 完整训练一次）
+        try:
+            val_acc, macro_f1, trainable = _train_classifier(
+                model=classifier,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                num_classes=num_classes,
+                epochs=config.epochs,
+                learning_rate=config.learning_rate,
+                device=device,
+                d_model=d_model,
+            )
+        except Exception as e:
+            logger.warning("training failed at trial %d: %s", trial_idx, e)
+            sm.tell(trial.trial_id, 0.0, state="failed")
+            continue
+
+        # tell SP
+        sm.tell(trial.trial_id, float(val_acc), state="completed")
+        n_completed += 1
+
+        logger.info(
+            "SP trial %d/%d DONE: val_acc=%.4f, macro_f1=%.4f, trainable=%d",
+            trial_idx + 1, n_trials, val_acc, macro_f1, trainable,
+        )
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_macro_f1 = macro_f1
+            best_trainable = trainable
+            best_params = dict(params)
+
+    search_cost = _time.time() - t_search_start
+    logger.info(
+        "SP search DONE: best_val_acc=%.4f, best_params=%s, "
+        "n_completed=%d/%d, cost=%.1fs",
+        best_val_acc, best_params, n_completed, n_trials, search_cost,
+    )
+
+    return (best_val_acc, best_macro_f1, best_trainable,
+            best_params, n_completed, n_trials, search_cost)
+
+
+# ============================================================
 # 训练循环
 # ============================================================
 def _train_classifier(
@@ -655,6 +842,52 @@ def run_single_experiment(
             backbone.pretrain(pretrain_loader, pretrain_cfg)
 
         # ---- 6. 构建 PEFT 模型 ----
+        # 10.5 C4/C5: SP 搜索驱动 — 跳过单次 PEFT 构建，进入 SP 搜索循环
+        if config.finetune_method == "sp_search" and config.sp_search:
+            num_classes = dataset_config["num_classes"]
+            logger.info("experiment %s: SP search mode, sampler=%s, n_trials=%d",
+                        config.experiment_id,
+                        config.sp_search.get("sampler", "random"),
+                        config.sp_search.get("n_trials", 20))
+            t0 = time.time()
+            (val_acc, macro_f1, trainable_params, best_params,
+             n_completed, n_trials, search_cost) = _run_sp_search(
+                config=config,
+                backbone=backbone,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                num_classes=num_classes,
+                d_model=d_model,
+                device=device,
+            )
+            training_time = time.time() - t0
+
+            # SP 搜索的总参数量取 best trial 的参数量（分类头 + backbone + PEFT）
+            # 此处 total_params 用 backbone + 分类头的近似值（PEFT 模块参数量小，忽略）
+            total_params = sum(p.numel() for p in backbone.parameters()) + d_model * num_classes
+
+            result.status = "success"
+            result.val_accuracy = val_acc
+            result.macro_f1 = macro_f1
+            result.trainable_params = trainable_params
+            result.total_params = total_params
+            result.total_epochs = config.epochs * n_completed  # 总训练 epoch 数
+            result.training_time_seconds = training_time
+            result.best_params = best_params
+            result.n_completed = n_completed
+            result.n_trials = n_trials
+            result.search_cost_seconds = search_cost
+            result.finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+            logger.info(
+                "experiment %s DONE (SP search): val_acc=%.4f, macro_f1=%.4f, "
+                "best_params=%s, n_completed=%d/%d, cost=%.1fs",
+                config.experiment_id, val_acc, macro_f1, best_params,
+                n_completed, n_trials, training_time,
+            )
+            return result
+
+        # 常规路径：单次 PEFT 构建 + 训练
         peft_model = _build_peft_model(backbone, config.finetune_method, config.finetune_params)
 
         # ---- 7. 加分类头 ----
@@ -804,7 +1037,7 @@ SP_SEARCH_EXPERIMENTS: List[Dict[str, Any]] = [
     {"id": "C2", "method": "fixed",       "config": {"peft_method": "adapter",       "adapter_bottleneck": 128}},
     {"id": "C3", "method": "fixed",       "config": {"peft_method": "prompt_tuning", "prompt_length": 10}},
     {"id": "C4", "method": "sp_search",   "config": {"sampler": "random", "n_trials": 20}},
-    {"id": "C5", "method": "sp_search",   "config": {"sampler": "grid",   "n_trials": None}},  # None=全网格
+    {"id": "C5", "method": "sp_search",   "config": {"sampler": "grid",   "n_trials": 24}},  # 限制 24 个网格点（全网格 192 点过多）
 ]
 
 # 10.5 评估数据集

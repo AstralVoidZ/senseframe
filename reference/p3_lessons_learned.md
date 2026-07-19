@@ -13,6 +13,8 @@
 5. [依赖管理：从 requirements.txt 迁移到 pyproject.toml](#5-依赖管理从-requirementstxt-迁移到-pyprojecttoml)
 6. [PromptTuning 形状不匹配：d_model 推断错误 + 注入位置错误](#6-prompttuning-形状不匹配d_model-推断错误--注入位置错误)
 7. [长 epoch 训练的日志频率陷阱](#7-长-epoch-训练的日志频率陷阱)
+8. [SP 搜索 vs 固定配置：上限数据集上难显优势](#8-sp-搜索-vs-固定配置上限数据集上难显优势)
+9. [GridSampler 全网格爆炸：n_trials 必须显式限制](#9-gridsampler-全网格爆炸n_trials-必须显式限制)
 
 ---
 
@@ -394,6 +396,158 @@ logger.info(
 - 长 epoch 训练（每 epoch > 1 分钟）必须每 epoch 输出日志
 - 短 epoch 训练（每 epoch < 10 秒）可以每 10 epoch 输出，避免日志爆炸
 - 建议在 `_train_classifier` 中加自适应逻辑：`if avg_epoch_time > 60: log_every = 1; else: log_every = 10`
+
+---
+
+## 8. SP 搜索 vs 固定配置：上限数据集上难显优势
+
+### 现象
+
+10.5 C 系列 SP 搜索在 NTU-Fi_HAR 上跑完 5 个实验：
+
+| 实验 | 方法 | val_acc | macro_f1 | trainable_params | 时间 | best_params |
+|---|---|---|---|---|---|---|
+| C1 | 固定 lora (rank=8) | 88.17% | 88.45% | 21,254 | 90s | — |
+| C2 | 固定 adapter (bottleneck=128) | **100.00%** | **100.00%** | 3,275,526 | 81s | — |
+| C3 | 固定 prompt_tuning (length=10) | 63.44% | 57.66% | 2,054 | 79s | — |
+| C4 | SP random × 20 trials | **100.00%** | **100.00%** | 6,550,278 | 1577s | adapter bottleneck=256 |
+| C5 | SP grid × 24 trials | 91.40% | 91.59% | 11,014 | 1821s | lora rank=4 |
+
+**通过标准 1：C4 best_val_accuracy > max(C1, C2, C3) + 1%**
+- max(C1, C2, C3) = 100.00%（C2 已达上限）
+- C4 = 100.00%，improvement = **+0.00%**
+- **结果：未通过**（C4 与 C2 持平，无法超越）
+
+**通过标准 2：C4 n_completed / n_trials ≥ 90%**
+- C4: 20/20 = 100% ✓
+
+**通过标准 3：C5 best_val_accuracy ≥ C4（Grid 是上界）**
+- C5 = 91.40% vs C4 = 100.00%，grid_upper_bound_diff = **-8.60%**
+- **结果：未通过**（Grid 受限于 n_trials=24 个网格点，未覆盖到 C4 的最优 adapter 配置）
+
+### 根因
+
+**核心问题：NTU-Fi_HAR 是"上限数据集"**
+
+A 系列 10.2 验证已暴露此问题（参见附录 A1/A2 在 NTU-Fi_HAR 上都达 100%），C 系列在 NTU-Fi_HAR 上验证 SP 搜索存在结构性缺陷：
+
+1. **C2 固定 adapter (bottleneck=128) 已达 100%**，SP 搜索没有任何"提升空间"
+2. **C4 找到的最优配置是 adapter bottleneck=256**（参数量从 3.28M 翻倍到 6.55M），val_acc 仍为 100% — 与 C2 持平
+3. **C5 GridSampler 受 n_trials=24 限制**，24 个网格点未覆盖到 adapter bottleneck=256 的最优配置，最优停留在 lora rank=4 (91.40%)
+
+**SP 搜索的真正价值场景：**
+- 在"非上限数据集"上（如 Widar A1 仅 69.73%），SP 搜索有 ~30% 的提升空间，可以探索不同 PEFT 配置找最优
+- 在"上限数据集"上，SP 搜索退化为"参数量翻倍但不涨点"的资源浪费
+
+### 防御性建议
+
+- **SP 搜索评估必须避开"上限数据集"**：在 A 系列已发现某数据集 A1=100% 时，C 系列应在更难的子集上跑（如降低训练样本数 / 增加类别数 / 加入噪声）
+- **SP 搜索的通过标准应包含"参数效率"约束**：当前仅看 val_acc，但 C4 参数量翻倍（6.55M vs C2 的 3.28M）不涨点应判定为"无效搜索"。建议标准改为 `C4.val_acc > max(C1,C2,C3) + 1% AND C4.trainable_params ≤ 1.5 × min(C1,C2,C3).trainable_params`
+- **SP 搜索结果应记录"搜索轨迹"**：当前只保留 best_params，看不到搜索过程中 val_acc 的分布。建议在 `_run_sp_search` 中把每个 trial 的 (params, val_acc) 都存到结果中，便于后续分析"搜索是否真的探索了有效空间"
+- **后续应在 Widar / EEG / Radio 上重跑 C 系列**：这三个数据集 A 系列表现均不饱和（Widar 69.73%，EEG/Radio 待验证），SP 搜索有真实提升空间
+
+### 验证效果
+
+| 检查项 | 结果 |
+|---|---|
+| C4 vs max(C1,C2,C3) | +0.00%（上限数据集，无空间） |
+| C4 n_completed/n_trials | 100% ✓ |
+| C5 vs C4 | -8.60%（Grid 24 点未覆盖最优） |
+| **总体判定** | NTU-Fi_HAR 上 SP 搜索价值无法体现，需迁移到非上限数据集重验 |
+
+---
+
+## 9. GridSampler 全网格爆炸：n_trials 必须显式限制
+
+### 现象
+
+C5 原配置 `n_trials=None`（意图：跑完全网格 192 个点），实际启动后预估需 4 小时（192 × ~75s/trial）。改为 `n_trials=24` 后限制在 30 分钟内完成，但导致 grid search 没覆盖到 C4 的最优配置（adapter bottleneck=256），C5 val_acc (91.40%) 反而低于 C4 (100.00%)。
+
+附带问题：C4 与 C5 的 best_params 字段类型不一致：
+```json
+// C4 (RandomSampler)
+"best_params": {"peft_method": "adapter", "peft_rank": "8",
+                "adapter_bottleneck": "256", "prompt_length": "20"}  // 全是 str
+
+// C5 (GridSampler)
+"best_params": {"peft_method": "lora", "peft_rank": 4,
+                "adapter_bottleneck": 128, "prompt_length": 10}  // peft_rank/bottleneck/length 是 int
+```
+
+### 根因
+
+**问题 1：GridSampler 没有"完成全网格就停止"的语义**
+
+[search_protocol.py:GridSampler.sample](../senseframe/search_protocol.py) 的实现：
+```python
+def sample(self, search_space, history):
+    # 生成全网格 all_combos
+    all_combos = list(itertools.product(*grids))
+    idx = len(history) % len(all_combos)  # ← 永远不会停止
+    combo = all_combos[idx]
+    return {p.name: v for p, v in zip(search_space.parameters, combo)}
+```
+
+`idx = len(history) % len(all_combos)` 取模意味着：跑完 192 个 trial 后会从第 0 个开始重复。Sampler 自身没有"网格已耗尽"的信号，StudyManager.ask() 也只看 `n_trials` 是否达到，不看网格是否覆盖完。
+
+**问题 2：categorical 参数类型保留不一致**
+
+[search_protocol.py:RandomSampler.sample](../senseframe/search_protocol.py) 中：
+```python
+elif p.type == "categorical" and p.choices:
+    params[p.name] = str(self._rng.choice(p.choices))  # ← str() 强转
+```
+
+`np.random.Generator.choice` 对 list 返回 numpy scalar，作者用 `str()` 转换避免 numpy 类型泄漏，但副作用是把 `int` choices (`[4, 8, 16, 32]`) 转成了 `str` (`"4"`, `"8"`, ...)。GridSampler 则直接取 `p.choices` 中的原始 Python `int`，导致同一参数在两个 Sampler 下类型不同。
+
+当前 [`_params_to_peft_config`](../scripts/p3_eval_common.py) 用 `int(params.get("peft_rank", 8))` 兜底转换，所以 C4/C5 都能正常 build PEFT 模型，但这是**脆弱的**：如果某天某个参数不是数值型（如 `peft_target_modules` 这种字符串列表），`int()` 转换会直接报错。
+
+### 修复
+
+**修复 1：C5 n_trials 从 None 改为 24**
+
+[scripts/p3_eval_common.py:SP_SEARCH_EXPERIMENTS](../scripts/p3_eval_common.py)：
+```python
+# 修复前
+{"id": "C5", "method": "sp_search", "config": {"sampler": "grid", "n_trials": None}},
+
+# 修复后
+{"id": "C5", "method": "sp_search",
+ "config": {"sampler": "grid", "n_trials": 24}},  # 限制 24 个网格点（全网格 192 点过多）
+```
+
+**修复 2（建议，未落地）：RandomSampler 保留 choices 原始类型**
+
+```python
+# 修复前
+elif p.type == "categorical" and p.choices:
+    params[p.name] = str(self._rng.choice(p.choices))
+
+# 修复后
+elif p.type == "categorical" and p.choices:
+    # 用 random.choice 保留 choices 中的原始 Python 类型（int/str/...）
+    import random as _random
+    params[p.name] = _random.choice(p.choices)
+```
+
+但此修复涉及 `RandomSampler` 的独立 RNG（P3-1 修复：用 `np.random.default_rng(seed)` 避免被全局 set_seed 重置），改用 `random.choice` 会重新引入全局 random 依赖。需要用 `self._rng.choice(p.choices).item()` 把 numpy scalar 转回 Python 原生类型，保留独立 RNG。
+
+### 防御性建议
+
+- **GridSampler 必须显式设置 n_trials**：`n_trials=None` 在 SP 协议中没有"跑完全网格"的语义，只会无限循环。当前实现下 `None` 会被 `int(sp_cfg.get("n_trials", 20))` 兜底为 20，但这是隐式的，不应依赖
+- **GridSampler 应支持"全网格自动停止"**：建议在 `GridSampler.sample` 中检测 `len(history) >= len(all_combos)`，抛 `StopIteration` 或返回 sentinel，StudyManager.ask 捕获后自动结束 study（语义对齐 Optuna TPESampler 的 `n_trials=None` 行为）
+- **Sampler 应保留 choices 中的原始类型**：所有 categorical 参数的采样结果类型应与 `ParameterSpec.choices` 中的元素类型一致。建议把 `RandomSampler` 的 `str(self._rng.choice(p.choices))` 改为 `self._rng.choice(p.choices).item()`（numpy scalar → Python 原生类型）
+- **搜索空间设计应避免全网格爆炸**：当前 4 参数 × 3+4+4+4 = 192 个点已偏多。建议搜索空间设计时预估 `prod(len(p.choices) for p in params)`，超过 50 个点时应改用 RandomSampler 或缩减 choices
+- **CI 应增加 SP 搜索配置校验**：grep `SP_SEARCH_EXPERIMENTS` 中所有 `n_trials=None` 的 grid 配置，CI 报错（强制显式指定）
+
+### 验证效果
+
+| 修复项 | 修复前 | 修复后 |
+|---|---|---|
+| C5 n_trials | None（被兜底为 20） | 24（显式） |
+| C5 完成时间 | 预估 4 小时（192 trial） | 30 分钟（24 trial） |
+| C5 best_params 类型 | 与 C4 不一致（int） | 仍与 C4 不一致（待修复 2 落地） |
+| C5 val_acc vs C4 | 91.40% < 100% | 同（n_trials=24 限制下未覆盖最优 adapter） |
 
 ---
 

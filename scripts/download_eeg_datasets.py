@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 import urllib.request
@@ -29,7 +30,10 @@ from typing import List
 # ============================================================
 # 配置
 # ============================================================
-SENSEFRAME_DATA = Path(r"<SENSEFRAME_DATA_ROOT>")
+# 数据根目录：优先用环境变量 SENSEFRAME_DATA_ROOT，否则用 Windows 默认路径
+# WSL 部署时设置 SENSEFRAME_DATA_ROOT=~/projects/thepot/data 即可
+_DEFAULT_DATA_ROOT = r"<SENSEFRAME_DATA_ROOT>"
+SENSEFRAME_DATA = Path(os.environ.get("SENSEFRAME_DATA_ROOT", _DEFAULT_DATA_ROOT))
 PHYSIONET_DIR = SENSEFRAME_DATA / "eeg" / "physionet" / "eegmmidb"
 BCI_IV_2A_DIR = SENSEFRAME_DATA / "eeg" / "bci_iv_2a"
 
