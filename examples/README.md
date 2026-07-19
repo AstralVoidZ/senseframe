@@ -165,7 +165,7 @@
 
 ```bash
 cd <DEPLOY_ROOT>  # 或你的部署目录
-pip install -r requirements.txt
+pip install -e '.[eeg,radio,dev]'
 python -c "import senseframe; print(senseframe.__version__)"
 python -m senseframe.cli probe
 ```

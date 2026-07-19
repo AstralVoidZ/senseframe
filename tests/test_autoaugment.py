@@ -717,11 +717,12 @@ class TestGrepEvidence:
         assert "autoaugment" in samplers
 
     def test_grep_no_pipeline_modification(self):
-        """grep 实证：P3.1 未修改 pipeline.py（datamodule_factory 路径已存在）。
+        """grep 实证：P3.1 未修改 stage_build（datamodule_factory 路径已存在）。
 
         这是 P3.1 零侵入设计的核心：通过 datamodule_factory 注入，无需修改 stage_build。
+        拆分背景：原 pipeline.py 拆分为 pipeline/ 包，stage_build 位于 pipeline/stages/build.py。
         """
-        path = _source_path("engine/runner/pipeline.py")
+        path = _source_path("engine/runner/pipeline/stages/build.py")
         # datamodule_factory 分支应在 P3.1 之前就存在
         assert _grep_source(path, "datamodule_factory is not None")
 

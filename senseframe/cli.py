@@ -1,5 +1,5 @@
 """
-CLI 接口：7 个子命令，所有输出为结构化 JSON。
+CLI 接口：15 个子命令，所有输出为结构化 JSON。
 
 命令：
 - probe:         探测硬件资源
@@ -8,7 +8,15 @@ CLI 接口：7 个子命令，所有输出为结构化 JSON。
 - list-scenes:   列出已注册的场景容器
 - paradigms:     列出 SOTA 范式
 - recommend:     根据资源推荐可用模型
+- export:        基于训练产物导出多格式模型
+- predict:       批量推理
 - experiment:    执行声明式实验（YAML → ExperimentConfig → run_pipeline）
+- exploration:   探索状态管理（list/recommend/coverage/map/dashboard 子命令）
+- skills:        技能库管理（list/search/show/remove 子命令）
+- catalog:       技术目录查询（list/pipeline/augment 子命令）
+- monitor:       训练实时监控
+- serve:         启动推理服务（KServe v2 兼容 HTTP API）
+- create-scene:  创建场景包脚手架
 """
 
 import argparse

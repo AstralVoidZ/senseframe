@@ -27,7 +27,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 # ============================================================
@@ -219,6 +219,36 @@ class SkillLibrary:
         """列出所有技能名。"""
         return sorted(self._skills.keys())
 
+    def search_with_scores(
+        self, query: str, top_k: int = 5
+    ) -> List[Tuple[Skill, float]]:
+        """语义检索技能（带相关度分数，RFC-002 原则 3：基于嵌入的语义检索）。
+
+        默认 hash-based 轻量嵌入（字符 n-gram + 词级 hash），
+        若安装 sentence-transformers 则自动启用语义嵌入。
+        比关键词匹配更强：能捕捉词形变化（classify/classification）和语义近似。
+
+        Args:
+            query: 查询字符串
+            top_k: 返回前 K 个最相关技能
+
+        Returns:
+            (Skill, score) 元组列表，按 score 降序，仅含 score > 0 的项
+        """
+        if not self._skills:
+            return []
+        query_vec = _embed_text(query)
+        scored: List[Tuple[float, Skill]] = []
+        for name, skill in self._skills.items():
+            emb = self._embeddings.get(name)
+            if emb is None:
+                continue
+            score = _cosine_similarity(query_vec, emb)
+            if score > 0:
+                scored.append((score, skill))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [(skill, score) for score, skill in scored[:top_k]]
+
     def search(self, query: str, top_k: int = 5) -> List[Skill]:
         """语义检索技能（RFC-002 原则 3：基于嵌入的语义检索）。
 
@@ -233,19 +263,7 @@ class SkillLibrary:
         Returns:
             匹配的技能列表（按相关度降序）
         """
-        if not self._skills:
-            return []
-        query_vec = _embed_text(query)
-        scored: List[tuple] = []
-        for name, skill in self._skills.items():
-            emb = self._embeddings.get(name)
-            if emb is None:
-                continue
-            score = _cosine_similarity(query_vec, emb)
-            if score > 0:
-                scored.append((score, skill))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [s for _, s in scored[:top_k]]
+        return [skill for skill, _ in self.search_with_scores(query, top_k)]
 
     def remove(self, name: str, *, force: bool = False) -> bool:
         """移除技能（RFC-002 阶段 M：检查依赖）。
@@ -366,6 +384,16 @@ def search_skills(query: str, top_k: int = 5) -> List[Skill]:
     return get_skill_library().search(query, top_k=top_k)
 
 
+def search_skills_with_scores(
+    query: str, top_k: int = 5
+) -> List[Tuple[Skill, float]]:
+    """检索技能库（带相关度分数）。
+
+    返回 (Skill, score) 元组列表，按 score 降序，仅含 score > 0 的项。
+    """
+    return get_skill_library().search_with_scores(query, top_k=top_k)
+
+
 def list_skills() -> List[str]:
     """列出所有技能名。"""
     return get_skill_library().list_skills()
@@ -378,5 +406,6 @@ __all__ = [
     "save_skill",
     "load_skill",
     "search_skills",
+    "search_skills_with_scores",
     "list_skills",
 ]

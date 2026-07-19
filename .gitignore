@@ -1,5 +1,6 @@
 # 数据集与基准库
 CSI_DATASETS/
+data/
 
 # 开发文档暂时屏蔽
 docs/
@@ -83,6 +84,7 @@ coverage.xml
 logs/
 *.tmp
 *.bak
+results/
 
 # Jupyter
 .ipynb_checkpoints/

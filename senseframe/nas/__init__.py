@@ -1,4 +1,4 @@
-"""RFC-003 ε2 NAS：神经架构搜索（P2.6-P2.9 + P3.3 DARTS/ENAS）。
+"""RFC-003 ε2 NAS：神经架构搜索（P2.6-P2.9 + P3.3 DARTS/ENAS + P1.3 真实超网）。
 
 P2 范围（按规划文档第 336 行约束）：
 - ArchitectureSearchSpace：NAS 搜索空间数据结构（DSP 合规）
@@ -12,6 +12,11 @@ P3.3 范围（按规划文档第 429-432 行约束）：
 - DARTSPipelineRun：DARTS 特殊 PipelineRun（内部双优化）
 - ENASSampler：权重共享 NAS（controller-based）
 - ArchitectureSearchSpace 扩展 attention cell_type
+
+P1.3 范围（2026-07-19）：
+- DARTSSupernet：真实可微超网（所有候选 op 并行 + α softmax 加权）
+- DARTSCell：可微 cell（M 个候选 op 并行计算）
+- DARTSPipelineRun.use_real_supernet=True 走真实超网双优化路径
 """
 from __future__ import annotations
 
@@ -21,6 +26,7 @@ from .search_space import ArchitectureSearchSpace, ArchitectureParameterSpec
 from .builder import ArchitectureBuilder, AttentionNet
 from .sampler import EvolutionarySampler, ENASSampler
 from .darts import DARTSSampler, DARTSPipelineRun
+from .supernet import DARTSCell, DARTSSupernet, OP_NAMES
 
 
 def make_nas_module_factory(
@@ -82,5 +88,8 @@ __all__ = [
     "ENASSampler",
     "DARTSSampler",
     "DARTSPipelineRun",
+    "DARTSCell",
+    "DARTSSupernet",
+    "OP_NAMES",
     "make_nas_module_factory",
 ]

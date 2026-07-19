@@ -206,12 +206,24 @@ class TestExtraDiscipline:
     """PipelineContext.extra 仅限 Agent 自由扩展，框架代码不得写入。"""
 
     def _get_pipeline_source(self) -> str:
-        """读取 pipeline.py 源码。"""
+        """读取 pipeline 包源码（含所有 stage 文件 + context + runtime）。
+
+        拆分背景：原 pipeline.py 上帝文件拆分为 pipeline/ 包，需聚合所有子模块源码
+        才能完整检查框架代码不写入 ctx.extra 的契约。
+        """
         from senseframe.engine.runner import pipeline as pipeline_module
-        return inspect.getsource(pipeline_module)
+        import pkgutil
+        from pathlib import Path
+
+        # 收集 pipeline 包及其子包的所有 .py 源码
+        package_dir = Path(pipeline_module.__file__).parent
+        source_parts = []
+        for py_file in sorted(package_dir.rglob("*.py")):
+            source_parts.append(py_file.read_text(encoding="utf-8"))
+        return "\n".join(source_parts)
 
     def test_no_framework_writes_to_extra_in_pipeline(self):
-        """pipeline.py 中不应出现 ctx.extra[...] = 赋值。
+        """pipeline 包中不应出现 ctx.extra[...] = 赋值。
 
         框架内部状态应使用 first-class 字段，不应逃逸到 extra。
         """
@@ -670,12 +682,20 @@ class TestRegressionGuards:
             "_wifi_csi_auto_registered 全局变量仍存在于 registry.py"
 
     def test_pipeline_context_has_no_any_fields_in_extra_writes(self):
-        """pipeline.py 中 stage 函数体不应将框架内部状态写入 ctx.extra。
+        """pipeline 包中 stage 函数体不应将框架内部状态写入 ctx.extra。
 
         通过 AST 分析检测 ctx.extra[...] = ... 赋值语句。
+        拆分背景：原 pipeline.py 拆分为 pipeline/ 包，需聚合所有子模块源码检查。
         """
         from senseframe.engine.runner import pipeline as pipeline_module
-        src = inspect.getsource(pipeline_module)
+        from pathlib import Path
+
+        # 收集 pipeline 包及其子包的所有 .py 源码
+        package_dir = Path(pipeline_module.__file__).parent
+        source_parts = []
+        for py_file in sorted(package_dir.rglob("*.py")):
+            source_parts.append(py_file.read_text(encoding="utf-8"))
+        src = "\n".join(source_parts)
         tree = ast.parse(src)
 
         violations = []
@@ -689,7 +709,7 @@ class TestRegressionGuards:
                         target.value.value.id == "ctx"):
                         violations.append(node.lineno)
         assert violations == [], \
-            f"pipeline.py 在行 {violations} 写入 ctx.extra，框架内部状态应使用 first-class 字段"
+            f"pipeline 包在行 {violations} 写入 ctx.extra，框架内部状态应使用 first-class 字段"
 
 
 # ============================================================

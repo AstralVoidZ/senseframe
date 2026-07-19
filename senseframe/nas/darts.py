@@ -1,4 +1,4 @@
-"""RFC-003 ε2 NAS：DARTS 可微架构搜索（P3.3.2）。
+"""RFC-003 ε2 NAS：DARTS 可微架构搜索（P3.3.2 + P1.3 真实超网）。
 
 DARTS（Differentiable Architecture Search）：可微架构搜索，梯度-based。
 
@@ -7,11 +7,15 @@ DARTS（Differentiable Architecture Search）：可微架构搜索，梯度-base
 - 双优化：α（架构参数，验证集）↔ w（模型权重，训练集）交替更新
 - 收敛后用 argmax 离散化得到最终架构
 
-简化决策（详见 P3.3 规划文档）：
-- 完整 DARTS 需要构造超网（所有候选 op 的并集）+ 混合操作（softmax 加权）
-- 本模块实现"简化 DARTS"——用 ArchitectureBuilder 构造单个架构作为超网近似
+P1.3（2026-07-19）新增真实超网路径（use_real_supernet=True）：
+- DARTSSupernet（见 supernet.py）实现所有候选 op 并行 + α softmax 加权
+- DARTSPipelineRun.use_real_supernet=True 走真实双优化路径
+- DARTSSampler.attach_supernet() 可将超网实例附到 sampler
+
+简化路径（use_real_supernet=False，默认）：
+- 用 ArchitectureBuilder 构造单个架构作为超网近似
 - α 仅控制 cell_type / discrete hyperparams 的选择
-- 完整超网实现推迟到 P4
+- α 梯度用 randn_like 近似（保留作为对比基准和向后兼容）
 
 注册：
 - DARTSSampler 注册到 SP Sampler 注册表（register_sampler("darts", DARTSSampler)）
@@ -37,6 +41,37 @@ from ..search_protocol import (
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# P2.3-3 修复：BatchNorm 双优化 stats 更新两次
+# ============================================================
+# DARTS 双优化每 epoch 做 2 次 forward：w 更新（train batch）+ α 更新（val batch）。
+# BN1d 在 train 模式下每次 forward 都更新 running_mean / running_var，
+# 严格 DARTS 应仅在 w 更新阶段更新 BN stats（α 更新阶段冻结 BN stats）。
+#
+# 修复策略：α 更新前临时把所有 BN 的 momentum 设为 0.0（BN 仍用 batch stats
+# 归一化，但不更新 running stats），更新后恢复原 momentum。
+_BN_TYPES = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)
+
+
+def _set_bn_momentum(model: nn.Module, momentum: float) -> Dict[int, float]:
+    """临时修改所有 BN 模块的 momentum，返回 {id(module): original_momentum}。"""
+    original: Dict[int, float] = {}
+    for m in model.modules():
+        if isinstance(m, _BN_TYPES):
+            original[id(m)] = m.momentum
+            m.momentum = momentum
+    return original
+
+
+def _restore_bn_momentum(model: nn.Module, original: Dict[int, float]) -> None:
+    """恢复 BN momentum（按 id 匹配，避免重复模块被多次恢复）。"""
+    for m in model.modules():
+        if isinstance(m, _BN_TYPES):
+            mid = id(m)
+            if mid in original:
+                m.momentum = original[mid]
+
+
 class DARTSSampler:
     """DARTS：可微架构搜索（梯度-based）。
 
@@ -58,7 +93,7 @@ class DARTSSampler:
     def __init__(
         self,
         arch_alpha: Optional[Dict[str, torch.Tensor]] = None,
-        lr_arch: float = 0.001,
+        lr_arch: float = 3e-4,
         seed: Optional[int] = None,
     ):
         """初始化 DARTSSampler。
@@ -66,7 +101,8 @@ class DARTSSampler:
         Args:
             arch_alpha: 架构参数 α dict（{op_name: torch.Tensor requires_grad=True}）
                 None 时由 sample() 第一次调用时从 search_space 构造
-            lr_arch: 架构参数学习率
+            lr_arch: 架构参数学习率（默认 3e-4，DARTS 论文 Liu et al. 2018
+                第 4 节"Architecture Search"推荐值）
             seed: 随机种子
         """
         # arch_alpha: Dict[str, torch.Tensor]，每个 tensor 是某节点的 op 选择分布
@@ -76,6 +112,8 @@ class DARTSSampler:
         self._rng = random.Random(seed)
         # 保留 search_space 引用，用于 _discretize_to_arch_params
         self._search_space: Optional[SearchSpace] = None
+        # P1.3：真实超网实例（attach_supernet 后非 None）
+        self._supernet: Any = None
 
     # ============================================================
     # SP Sampler Protocol 实现
@@ -148,6 +186,8 @@ class DARTSSampler:
         # 释放 arch_alpha tensor
         self.arch_alpha.clear()
         self._search_space = None
+        # P1.3：解除超网引用（不 del，由调用方管理 supernet 生命周期）
+        self._supernet = None
 
     def warm_start(self, source_history: List[Dict[str, Any]]) -> None:
         """P3.2.1 ε4 元学习兼容：no-op（DARTS 用梯度更新 α，不从历史偏向）。
@@ -155,6 +195,24 @@ class DARTSSampler:
         保留此方法满足 SP Sampler Protocol（@runtime_checkable 要求所有方法存在）。
         """
         return None
+
+    # ============================================================
+    # P1.3：真实超网支持（可选）
+    # ============================================================
+    def attach_supernet(self, supernet: Any) -> None:
+        """将 DARTSSupernet 实例附到 sampler（P1.3 新增）。
+
+        附着后，sample() / discretize() 将基于真实超网的 α 参数，
+        而非 sampler 自身的 arch_alpha dict。
+
+        Args:
+            supernet: DARTSSupernet 实例（见 senseframe.nas.supernet）
+        """
+        self._supernet = supernet
+
+    def detach_supernet(self) -> None:
+        """解除附着的超网实例（P1.3 新增）。"""
+        self._supernet = None
 
     # ============================================================
     # 内部方法
@@ -200,23 +258,26 @@ register_sampler("darts", DARTSSampler)
 
 
 # ============================================================
-# P3.3.2: DARTSPipelineRun（特殊 PipelineRun，内部双优化）
+# P3.3.2 + P1.3: DARTSPipelineRun（特殊 PipelineRun，内部双优化）
 # ============================================================
 class DARTSPipelineRun:
     """DARTS 特殊 PipelineRun（内部双优化，不走标准 stage）。
 
     流程：
-    1. 构造超网（所有候选架构的并集，用 ArchitectureBuilder）
+    1. 构造超网（所有候选架构的并集）
     2. 交替更新：w（模型权重，训练集）↔ α（架构参数，验证集）
     3. 收敛后 sample() 得到最终架构
 
+    两条路径：
+    - use_real_supernet=False（默认）：简化 DARTS，α 用 randn_like 近似梯度。
+      用 ArchitectureBuilder 构造单个架构作为超网近似，α 仅控制
+      cell_type / discrete hyperparams 的选择。
+    - use_real_supernet=True（P1.3 新增）：真实 DARTS 可微超网。
+      用 DARTSSupernet（见 supernet.py）实现所有候选 op 并行 + α softmax
+      加权，α 通过验证集 backward 真实可微更新。
+
     注意：DARTSPipelineRun 不继承标准 Pipeline，因为 DARTS 的双优化
     不符合 stage-based 流程。它是独立的训练循环。
-
-    简化决策：
-    - 完整 DARTS 超网是所有候选 op 的并集；此处简化为单架构 + α 控制选择
-    - α 仅控制 cell_type / discrete hyperparams 的选择
-    - 完整超网实现推迟到 P4
     """
 
     def __init__(
@@ -228,19 +289,28 @@ class DARTSPipelineRun:
         num_classes: int,
         n_epochs: int = 50,
         lr_w: float = 0.025,
-        lr_arch: float = 0.001,
+        lr_arch: float = 3e-4,
+        use_real_supernet: bool = False,
+        supernet_kwargs: Optional[Dict[str, Any]] = None,
     ):
         """初始化 DARTSPipelineRun。
 
         Args:
             sampler: DARTSSampler 实例
-            builder: ArchitectureBuilder 实例
+            builder: ArchitectureBuilder 实例（use_real_supernet=True 时可传 None）
             search_space: SP SearchSpace
             input_shape: 模型输入形状（不含 batch 维），如 (channels, length)
             num_classes: 输出类别数
             n_epochs: 训练 epoch 数
-            lr_w: 模型权重 w 学习率
-            lr_arch: 架构参数 α 学习率
+            lr_w: 模型权重 w 学习率（默认 0.025，DARTS 论文 Liu et al. 2018
+                第 4 节"CIFAR-10"推荐值，带 momentum=0.9 / weight_decay=3e-4）
+            lr_arch: 架构参数 α 学习率（默认 3e-4，DARTS 论文推荐值，
+                Adam optimizer betas=(0.5, 0.999) / weight_decay=1e-3）
+            use_real_supernet: 是否使用真实 DARTS 可微超网（P1.3 新增）。
+                True 时使用 DARTSSupernet（supernet.py），α 通过验证集
+                backward 真实更新；False 时走简化路径（randn_like 近似梯度）。
+            supernet_kwargs: 传递给 DARTSSupernet 的额外参数（n_cells / c_stem /
+                c_cell / op_names），仅 use_real_supernet=True 时生效。
         """
         self.sampler = sampler
         self.builder = builder
@@ -250,13 +320,185 @@ class DARTSPipelineRun:
         self.n_epochs = n_epochs
         self.lr_w = lr_w
         self.lr_arch = lr_arch
+        self.use_real_supernet = use_real_supernet
+        self.supernet_kwargs = supernet_kwargs or {}
 
     def run(
         self,
         train_loader: Any,
         val_loader: Any,
     ) -> Dict[str, Any]:
-        """执行 DARTS 双优化训练。
+        """执行 DARTS 双优化训练（根据 use_real_supernet 分发）。
+
+        Args:
+            train_loader: 训练数据 loader（可迭代）
+            val_loader: 验证数据 loader（可迭代）
+
+        Returns:
+            use_real_supernet=False: {"best_arch", "final_alpha", "history"}
+            use_real_supernet=True: {"best_arch", "final_alpha", "history",
+                                      "discrete_model"(可选), "supernet_arch"}
+        """
+        if self.use_real_supernet:
+            return self._run_real_supernet(train_loader, val_loader)
+        return self._run_simplified(train_loader, val_loader)
+
+    # ============================================================
+    # P1.3：真实超网双优化路径
+    # ============================================================
+    def _run_real_supernet(
+        self,
+        train_loader: Any,
+        val_loader: Any,
+    ) -> Dict[str, Any]:
+        """真实 DARTS 可微超网双优化（P1.3 新增）。
+
+        流程：
+        1. 构造 DARTSSupernet（所有候选 op 并行 + α softmax 加权）
+        2. w_optimizer = SGD(supernet.w_parameters(), lr=lr_w, momentum=0.9)
+        3. alpha_optimizer = Adam(supernet.alpha_parameters(), lr=lr_arch)
+        4. for epoch in range(n_epochs):
+             - 训练集 batch：w_loss.backward() → w_optimizer.step()
+             - 验证集 batch：alpha_loss.backward() → alpha_optimizer.step()
+        5. supernet.discretize() 得到 best_arch
+
+        与简化路径的核心差异：
+        - α 真实参与 forward（softmax 加权所有 op），通过 autograd 反传梯度
+        - 不需要 randn_like 近似梯度
+        - 离散化基于真实超网 argmax α
+
+        资源管理（沿用简化路径的 try/finally 模式）：
+        - 异常时释放 supernet / optimizers / iterator
+        - zero_grad(set_to_none=True) 释放 grad 引用
+
+        Args:
+            train_loader: 训练数据 loader
+            val_loader: 验证数据 loader
+
+        Returns:
+            {"best_arch": discretize dict, "final_alpha": alpha_dict,
+             "history": [{"epoch", "w_loss", "alpha_loss"}],
+             "supernet_arch": discretize dict（与 best_arch 一致）}
+        """
+        from .supernet import DARTSSupernet
+
+        # 1. 构造真实超网
+        supernet = DARTSSupernet(
+            input_shape=self.input_shape,
+            num_classes=self.num_classes,
+            **self.supernet_kwargs,
+        )
+        supernet.train()
+
+        # 2. 双优化器：w 用 SGD（带动量），α 用 Adam
+        w_optimizer = torch.optim.SGD(
+            list(supernet.w_parameters()),
+            lr=self.lr_w,
+            momentum=0.9,
+            weight_decay=3e-4,
+        )
+        alpha_optimizer = torch.optim.Adam(
+            list(supernet.alpha_parameters()),
+            lr=self.lr_arch,
+            betas=(0.5, 0.999),
+            weight_decay=1e-3,
+        )
+
+        # 附着超网到 sampler（P1.3：使 sampler 可访问超网 α）
+        self.sampler.attach_supernet(supernet)
+
+        # 3. 训练循环
+        history: List[Dict[str, Any]] = []
+        criterion = nn.CrossEntropyLoss()
+
+        train_iter = _InfiniteLoader(train_loader)
+        val_iter = _InfiniteLoader(val_loader)
+
+        try:
+            for epoch in range(self.n_epochs):
+                # ---- w 更新（训练集，α 冻结）----
+                try:
+                    x_train, y_train = train_iter.next()
+                except StopIteration:
+                    break
+                w_optimizer.zero_grad(set_to_none=True)
+                logits = supernet(x_train)
+                w_loss = criterion(logits, y_train)
+                w_loss.backward()
+                w_optimizer.step()
+
+                # ---- α 更新（验证集，w 冻结）----
+                try:
+                    x_val, y_val = val_iter.next()
+                except StopIteration:
+                    break
+                # P2.3-3 修复：α 更新阶段暂停 BN running stats 更新。
+                # 原实现 w 和 α 各 forward 一次，BN running stats 被更新两次，
+                # 严格 DARTS 应只在 w 更新时更新 BN stats（α 更新时冻结）。
+                # 通过临时把 BN momentum 设为 0.0 实现：BN 仍用 batch stats
+                # 归一化（保留 train 模式行为），但 running stats 不再更新。
+                bn_momenta = _set_bn_momentum(supernet, 0.0)
+                try:
+                    alpha_optimizer.zero_grad(set_to_none=True)
+                    # 用 _real 后缀标识真实超网路径的中间变量，
+                    # 与简化路径的 val_logits / alpha_loss 区分（grep 实证清晰）
+                    val_logits_real = supernet(x_val)
+                    alpha_loss_real = criterion(val_logits_real, y_val)
+                    # 真实可微：α 通过 softmax 加权参与 forward，
+                    # backward 直接反传到 α（无需随机梯度近似）
+                    alpha_loss_real.backward()
+                    alpha_optimizer.step()
+                finally:
+                    _restore_bn_momentum(supernet, bn_momenta)
+
+                history.append({
+                    "epoch": epoch,
+                    "w_loss": float(w_loss.item()),
+                    "alpha_loss": float(alpha_loss_real.item()),
+                })
+                # 释放本轮 loss tensor 引用
+                del w_loss, alpha_loss_real, logits, val_logits_real
+
+            # 4. 离散化得到 best_arch
+            best_arch = supernet.discretize()
+
+            # 构造 final_alpha dict（detach + cpu 便于序列化）
+            final_alpha = {
+                k: v.detach().cpu().clone()
+                for k, v in supernet.alpha_dict().items()
+            }
+
+            return {
+                "best_arch": best_arch,
+                "final_alpha": final_alpha,
+                "history": history,
+                "supernet_arch": dict(best_arch),
+            }
+        finally:
+            # 资源泄露修复：显式释放训练资源
+            train_iter.close()
+            val_iter.close()
+            w_optimizer.zero_grad(set_to_none=True)
+            alpha_optimizer.zero_grad(set_to_none=True)
+            del w_optimizer
+            del alpha_optimizer
+            # 解除 sampler 对 supernet 的引用
+            self.sampler.detach_supernet()
+            del supernet
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    # ============================================================
+    # 简化路径（use_real_supernet=False）
+    # ============================================================
+    def _run_simplified(
+        self,
+        train_loader: Any,
+        val_loader: Any,
+    ) -> Dict[str, Any]:
+        """简化 DARTS 双优化（α 用 randn_like 近似梯度）。
 
         流程（简化 DARTS）：
         1. 用 sampler.sample() 得到初始 arch_params，构造超网近似模型
@@ -400,18 +642,38 @@ class _InfiniteLoader:
     - 持有 loader 引用，如果 loader 是 DataLoader 且 num_workers>0，会持有 worker 进程
     - 添加 close() 方法显式释放 loader 和 _iter 引用
     - 支持 context manager 协议（__exit__ 调用 close）
+
+    P2.3-6 修复：空 loader 防御。
+    - 原实现 next() 在 loader 为空（首次 iter 就 StopIteration）时
+      会陷入无限递归：next() -> StopIteration -> 重建 iter -> next() -> StopIteration -> ...
+    - 修复：记录重置次数，连续 2 次 StopIteration 视为空 loader，raise 清晰错误。
     """
 
     def __init__(self, loader: Any):
         self.loader = loader
         self._iter = iter(loader)
+        # P2.3-6 修复：连续 StopIteration 计数，用于空 loader 检测
+        self._consecutive_reset_count = 0
+        self._MAX_RESETS = 2  # 连续 2 次重置仍 StopIteration 视为空 loader
 
     def next(self) -> Tuple[torch.Tensor, torch.Tensor]:
         try:
-            return next(self._iter)
+            result = next(self._iter)
+            # 成功取到数据，重置计数
+            self._consecutive_reset_count = 0
+            return result
         except StopIteration:
+            # P2.3-6 修复：检测空 loader
+            self._consecutive_reset_count += 1
+            if self._consecutive_reset_count >= self._MAX_RESETS:
+                raise RuntimeError(
+                    f"_InfiniteLoader: loader 连续 {self._MAX_RESETS} 次 "
+                    f"StopIteration，疑似空 loader（无任何 batch）。"
+                    f"请检查 train_loader/val_loader 是否含数据。"
+                ) from None
             self._iter = iter(self.loader)
-            return next(self._iter)
+            # 递归一次：若新 iter 仍 StopIteration，下次 next() 会触发上面计数+1
+            return self.next()
 
     def close(self) -> None:
         """释放 loader 和 iterator 引用（资源泄露修复）。"""

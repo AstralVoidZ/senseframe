@@ -19,7 +19,7 @@
       scripts/               # CLI 脚本
       configs/               # 配置示例
       examples/              # 示例代码
-      requirements.txt       # 依赖清单
+      pyproject.toml         # 依赖清单与项目元数据（PEP 621）
       AGENTS.md              # opencode 项目入口（向上遍历发现）
       CLAUDE.md              # Claude Code 兼容入口
       .opencode/skills/senseframe/
@@ -83,7 +83,7 @@ COMMAND_DIRS = [
 
 # 项目根部署的目录/文件（代码本体）
 ROOT_PAYLOAD_DIRS = ["senseframe", "scripts", "configs", "examples", "schemas"]
-ROOT_PAYLOAD_FILES = ["requirements.txt"]
+ROOT_PAYLOAD_FILES = ["pyproject.toml"]
 
 # skills 目录部署的文件（SKILL.md + reference/）
 SKILL_PAYLOAD_FILES = ["SKILL.md"]
@@ -189,7 +189,7 @@ class EnvState:
     """
     venv_created: bool = False
     venv_python_hash: str = ""        # .venv/bin/python 的 sha256
-    requirements_hash: str = ""       # requirements.txt 的 sha256
+    requirements_hash: str = ""       # pyproject.toml 的 sha256（字段名保留以兼容已有 .senseframe_deploy.json）
     deps_installed_at: str = ""       # 依赖安装时间（ISO 格式）
     datasets_extracted: bool = False
     datasets_fingerprint: str = ""    # 解压后目录的指纹（顶层文件名 hash）
@@ -231,10 +231,10 @@ class EnvState:
         return wsl.test_exec(".venv/bin/python", cwd=ctx.wsl_path)
 
     def should_skip_deps(self, ctx: "DeployContext") -> bool:
-        """依赖是否可跳过安装：已安装 + requirements.txt hash 未变。"""
+        """依赖是否可跳过安装：已安装 + pyproject.toml hash 未变。"""
         if not self.deps_installed_at:
             return False
-        req_path = ctx.target / "requirements.txt"
+        req_path = ctx.target / "pyproject.toml"
         if not req_path.exists():
             return False
         current_hash = "sha256:" + file_hash(req_path)
@@ -256,7 +256,7 @@ class EnvState:
 
     def update_deps(self, ctx: "DeployContext") -> None:
         """标记依赖已安装。"""
-        req_path = ctx.target / "requirements.txt"
+        req_path = ctx.target / "pyproject.toml"
         self.requirements_hash = "sha256:" + file_hash(req_path) if req_path.exists() else ""
         self.deps_installed_at = datetime.now().isoformat()
 
@@ -505,7 +505,7 @@ def validate_source(source: Path) -> ValidationResult:
     details = []
     errors = []
 
-    required = ["senseframe/__init__.py", "SKILL.md", "requirements.txt"]
+    required = ["senseframe/__init__.py", "SKILL.md", "pyproject.toml"]
     for rel in required:
         if not (source / rel).exists():
             errors.append(f"缺少必需文件: {rel}")
@@ -585,8 +585,8 @@ def post_deploy_validate(target: Path) -> ValidationResult:
         else:
             details.append(f"{entry} 存在")
 
-    if not (target / "requirements.txt").exists():
-        errors.append("部署后 requirements.txt 不存在")
+    if not (target / "pyproject.toml").exists():
+        errors.append("部署后 pyproject.toml 不存在")
 
     for skill_rel in SKILL_DIRS:
         skill_md = target / skill_rel / "SKILL.md"
@@ -850,7 +850,7 @@ thepot/
 ├── scripts/               # CLI 脚本
 ├── configs/               # 配置示例
 ├── examples/              # 示例代码
-├── requirements.txt       # Python 依赖
+├── pyproject.toml         # Python 依赖与项目元数据（PEP 621）
 ├── resource/              # 资源输入
 │   ├── CSI_DATASETS.zip   # 原始数据集 zip
 │   └── CSI_DATASETS/      # 解压后的数据集
@@ -868,7 +868,7 @@ thepot/
 
 ```bash
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e '.[eeg,radio,dev]'
 ```
 
 或直接执行环境准备脚本：`bash setup.sh`
@@ -1014,9 +1014,9 @@ def install_requirements(
     env_state: EnvState,
     timeout: int = 1800,
 ) -> bool:
-    """在 .venv 中安装 requirements.txt 依赖。
+    """在 .venv 中安装 pyproject.toml 依赖。
 
-    增量：env_state 标记已安装 + requirements.txt hash 未变 → 跳过。
+    增量：env_state 标记已安装 + pyproject.toml hash 未变 → 跳过。
 
     Args:
         ctx: 部署上下文
@@ -1038,19 +1038,21 @@ def install_requirements(
 
     # 增量判断
     if not ctx.force and env_state.should_skip_deps(ctx):
-        print(f"  [OK] 依赖已安装且 requirements.txt 未变，跳过安装（增量）")
+        print(f"  [OK] 依赖已安装且 pyproject.toml 未变，跳过安装（增量）")
         return True
 
-    print(f"  → 在 .venv 中安装依赖（pip install -r requirements.txt）...")
+    # PEP 621 安装：pip install . 安装核心依赖；可选项通过 extras 按需安装
+    # 默认装 [eeg,radio,dev]：覆盖 SenseFrame 部署场景的常用依赖
+    print(f"  → 在 .venv 中安装依赖（pip install -e .[eeg,radio,dev]）...")
     print(f"    超时 {timeout}s（PyTorch 等大包下载可能较慢）")
     rc, _, _ = wsl.run(
         ".venv/bin/pip install --upgrade pip && "
-        ".venv/bin/pip install -r requirements.txt",
+        ".venv/bin/pip install -e '.[eeg,radio,dev]'",
         cwd=ctx.wsl_path, timeout=timeout,
     )
     if rc != 0:
         print(f"  [FAIL] 依赖安装失败 (rc={rc})")
-        print(f"  提示: 可在 WSL 内手动排查: cd {ctx.wsl_path} && .venv/bin/pip install -r requirements.txt")
+        print(f"  提示: 可在 WSL 内手动排查: cd {ctx.wsl_path} && .venv/bin/pip install -e '.[eeg,radio,dev]'")
         return False
 
     env_state.update_deps(ctx)
@@ -1247,7 +1249,7 @@ fi
 # 2. 安装依赖
 echo "[2/4] 安装依赖..."
 .venv/bin/pip install --upgrade pip
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -e '.[eeg,radio,dev]'
 
 # 3. 解压数据集（如 zip 存在且未解压）
 if [ -f "resource/CSI_DATASETS.zip" ] && [ ! -d "resource/CSI_DATASETS" ]; then
@@ -1574,7 +1576,7 @@ def main(argv: list = None) -> int:
         next_steps.append(f"  python -c \"import senseframe; print(senseframe.__version__)\"")
     else:
         next_steps.append(f"  cd {ctx.target}")
-        next_steps.append(f"  pip install -r requirements.txt")
+        next_steps.append(f"  pip install -e '.[eeg,radio,dev]'")
         next_steps.append(f"  python -c \"import senseframe; print(senseframe.__version__)\"")
     next_steps.append("  # 启动 opencode 或 Claude Code TUI，AI 会自动发现 senseframe skill")
     print("\n" + "\n".join(next_steps))

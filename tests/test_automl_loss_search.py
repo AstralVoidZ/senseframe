@@ -91,6 +91,41 @@ class TestBuildLossSearchSpace:
         loss_param = next(p for p in ss.parameters if p.name == "loss")
         assert "__custom_loss__" in loss_param.choices
 
+    def test_default_excludes_self_supervised(self):
+        """默认排除自监督损失（ent_loss），避免监督任务采样到不兼容 loss。
+
+        根因：EntLoss.forward(feat1, feat2) 返回 dict 且 feat2 不能是 long 标签，
+        在监督分类任务 (logits, y_long) 下必然抛 NotImplementedError，
+        污染 best_trial 候选集（trial failed value=0.0 也被 ExplorationTracker.best_trial 纳入）。
+        """
+        from senseframe.core import SELF_SUPERVISED_LOSSES, list_supervised_losses
+
+        # SELF_SUPERVISED_LOSSES 应包含 ent_loss
+        assert "ent_loss" in SELF_SUPERVISED_LOSSES
+
+        # list_supervised_losses 应排除 SELF_SUPERVISED_LOSSES
+        supervised = list_supervised_losses()
+        for ssl_name in SELF_SUPERVISED_LOSSES:
+            assert ssl_name not in supervised, (
+                f"list_supervised_losses 不应包含自监督损失: {ssl_name}"
+            )
+
+        # build_loss_search_space 默认排除自监督损失
+        ss = build_loss_search_space()
+        loss_param = next(p for p in ss.parameters if p.name == "loss")
+        for ssl_name in SELF_SUPERVISED_LOSSES:
+            assert ssl_name not in loss_param.choices, (
+                f"build_loss_search_space 默认不应包含自监督损失: {ssl_name}"
+            )
+
+    def test_include_self_supervised_true_keeps_ent_loss(self):
+        """include_self_supervised=True 时保留 ent_loss（用于自监督场景）。"""
+        ss = build_loss_search_space(include_self_supervised=True)
+        loss_param = next(p for p in ss.parameters if p.name == "loss")
+        assert "ent_loss" in loss_param.choices, (
+            "include_self_supervised=True 应保留 ent_loss"
+        )
+
 
 # ============================================================
 # LossSearchResult 数据结构测试

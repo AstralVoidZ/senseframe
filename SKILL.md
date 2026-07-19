@@ -34,7 +34,7 @@ the framework provides composable primitives, an execution substrate, and safety
 - Datasets placed in `CSI_DATASETS/` (WiFi CSI scene) or referenced via `data_root`
 - Self-supervised mode supports NTU-Fi_HAR only; declare `num_classes: 14`
 - For reproducibility: fix `trainer.seed`; strict mode `trainer.deterministic: true`
-- **ONNX export** requires `pip install onnx` (optional dependency, not in requirements.txt)
+- **ONNX export** requires `pip install -e '.[onnx]'` (optional extra declared in pyproject.toml)
 - **Call `sf.activate_lazy_scenes()` before querying any registry** (CQS compliance:
   queries must not trigger registration side-effects). The CLI already does this; the
   imperative path must call it manually.
@@ -96,7 +96,7 @@ python -m senseframe.cli experiment --config configs/exp.yaml
 
 ```python
 pipeline = sf.Pipeline.default()
-# 8 stages: validate → preflight → resolve → load → build → train → eval → export
+# 9 stages: validate → preflight → load → resolve → build → probe_vram → train → eval → export
 pipeline.replace_stage("eval", my_custom_eval)
 pipeline.before("train", data_check_hook)
 pipeline.skip("export")
@@ -300,6 +300,13 @@ All commands emit structured JSON.
 | `recommend` | Recommend models by resource and dataset |
 | `experiment` | Train from a YAML config (`--dry-run` to preflight only) |
 | `export` | Export a model to ONNX / TorchScript / state_dict |
+| `predict` | Batch inference from trained artifacts |
+| `exploration` | Exploration state management (list/recommend/coverage/map/dashboard) |
+| `skills` | Skill library management (list/search/show/remove) |
+| `catalog` | Technical catalog query (list/pipeline/augment) |
+| `monitor` | Real-time training monitor |
+| `serve` | Start inference server (KServe v2 compatible) |
+| `create-scene` | Scaffold a new scene package |
 
 ## Gotchas
 

@@ -14,7 +14,7 @@ Phase 11.2 — Loss 工厂可配置。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Set
 
 import torch
 import torch.nn as nn
@@ -29,6 +29,17 @@ LossFactory = Callable[..., nn.Module]
 # 注册项：factory + validator
 _LOSS_REGISTRY: Dict[str, LossFactory] = {}
 _LOSS_VALIDATORS: Dict[str, Optional[Validator]] = {}
+
+
+# ============================================================
+# 自监督损失标记（P1.3 收尾修复）
+# ============================================================
+# 自监督损失（如 EntLoss）的 forward 签名与监督损失不兼容
+# （EntLoss(feat1, feat2) 返回 dict，且 feat2 不能是 long 标签），
+# 不应进入监督任务的 loss 搜索空间。
+# 维护此集合使 build_loss_search_space 能按 tag 过滤，
+# 未来添加新自监督 loss 时只需在此处登记。
+SELF_SUPERVISED_LOSSES: Set[str] = {"ent_loss"}
 
 
 def register_loss(name: str, *, overwrite: bool = True, validator: Optional[Validator] = None):
@@ -72,6 +83,16 @@ def has_loss(name: str) -> bool:
 
 def list_losses() -> list:
     return list(_LOSS_REGISTRY.keys())
+
+
+def list_supervised_losses() -> list:
+    """返回监督任务可用的 loss 名称（排除 SELF_SUPERVISED_LOSSES）。
+
+    用于 build_loss_search_space 等监督任务搜索场景，
+    避免采样到 EntLoss 等自监督损失（forward 签名不兼容）。
+    """
+    return [name for name in _LOSS_REGISTRY.keys()
+            if name not in SELF_SUPERVISED_LOSSES]
 
 
 # ============================================================

@@ -266,10 +266,14 @@ class TestPipelineWritesSchemaVersion:
 
     @pytest.fixture
     def pipeline_source(self):
-        """读取 pipeline.py 源码。"""
+        """读取 pipeline 包源码（stage_export 现位于 pipeline/stages/export.py）。
+
+        拆分背景：原 pipeline.py 上帝文件拆分为 pipeline/ 包，
+        stage_export 迁移到 pipeline/stages/export.py。
+        """
         pipeline_path = (
             Path(__file__).resolve().parents[1]
-            / "senseframe" / "engine" / "runner" / "pipeline.py"
+            / "senseframe" / "engine" / "runner" / "pipeline" / "stages" / "export.py"
         )
         return pipeline_path.read_text(encoding="utf-8")
 
@@ -281,26 +285,26 @@ class TestPipelineWritesSchemaVersion:
         统一注入，版本管理职责完全内聚到 metadata 模块。
         """
         assert "make_metadata_skeleton(" in pipeline_source, (
-            "pipeline.py 未调用 make_metadata_skeleton()。"
+            "pipeline/stages/export.py 未调用 make_metadata_skeleton()。"
             "stage_export 应通过骨架函数构造 metadata，确保 schema_version 始终存在。"
         )
 
     def test_pipeline_imports_make_metadata_skeleton(self, pipeline_source):
-        """pipeline.py 导入 make_metadata_skeleton（schema_version 注入入口）。"""
-        assert "from ..metadata import make_metadata_skeleton" in pipeline_source, (
-            "pipeline.py 未导入 make_metadata_skeleton。"
+        """pipeline/stages/export.py 导入 make_metadata_skeleton（schema_version 注入入口）。"""
+        assert "make_metadata_skeleton" in pipeline_source, (
+            "pipeline/stages/export.py 未导入 make_metadata_skeleton。"
             "stage_export 应通过 make_metadata_skeleton() 注入 schema_version，"
             "而非直接引用 CURRENT_METADATA_VERSION（版本管理职责内聚到 metadata 模块）。"
         )
 
     def test_pipeline_does_not_directly_reference_current_version(self, pipeline_source):
-        """pipeline.py 不再直接引用 CURRENT_METADATA_VERSION（版本管理职责内聚）。
+        """pipeline/stages/export.py 不再直接引用 CURRENT_METADATA_VERSION（版本管理职责内聚）。
 
         遗留问题 3 修复（2026-07-19）：pipeline 不应知道版本号是什么，
         版本字段由 make_metadata_skeleton 统一注入。
         """
         assert "CURRENT_METADATA_VERSION" not in pipeline_source, (
-            "pipeline.py 仍在直接引用 CURRENT_METADATA_VERSION。"
+            "pipeline/stages/export.py 仍在直接引用 CURRENT_METADATA_VERSION。"
             "应通过 make_metadata_skeleton() 注入 schema_version，"
             "让版本管理职责完全内聚到 metadata 模块。"
         )

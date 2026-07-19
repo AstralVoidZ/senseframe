@@ -77,6 +77,12 @@ def _ensure_lazy_scene(name: str) -> None:
     if name == "wifi_csi":
         from ._wifi_csi_lazy import LazyWiFiCSIContainer
         proxy = LazyWiFiCSIContainer()
+    elif name == "radio":
+        from ._radio_lazy import LazyRadioContainer
+        proxy = LazyRadioContainer()
+    elif name == "eeg":
+        from ._eeg_lazy import LazyEEGContainer
+        proxy = LazyEEGContainer()
     else:
         return
 
@@ -347,6 +353,28 @@ def _register_builtin_scenes() -> None:
         supported_datasets=["UT_HAR_data", "NTU-Fi_HAR", "NTU-Fi-HumanID", "Widar"],
         requires_custom_dataloader=True,
         supported_learning_modes=["supervised", "self_supervised"],
+    ))
+
+    # P1.2: Radio 场景延迟注册（RadioML 调制识别）
+    declare_lazy_scene("radio", SceneMeta(
+        name="radio",
+        supported_tasks=["classification"],
+        supported_models=["CNN1D", "ResNet1D", "Transformer1D"],
+        supported_datasets=["RadioML2016A", "RadioML2018"],
+        requires_custom_dataloader=False,
+        supported_learning_modes=["supervised"],
+        modality="iq",
+    ))
+
+    # P1.2: EEG 场景延迟注册（BCI Competition / PhysioNet MI）
+    declare_lazy_scene("eeg", SceneMeta(
+        name="eeg",
+        supported_tasks=["classification", "self_supervised"],
+        supported_models=["EEGNet", "DeepConvNet", "TransformerEEG"],
+        supported_datasets=["BCI_Competition_IV_2a", "PhysioNet_MI"],
+        requires_custom_dataloader=False,
+        supported_learning_modes=["supervised", "self_supervised"],
+        modality="eeg",
     ))
 
 

@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from ..core import list_losses
+from ..core import list_losses, list_supervised_losses
 from ..engine.config import ExperimentConfig
 from ..engine.hpo import apply_params, extract_metric
 from ..engine.runner.pipeline import run_pipeline
@@ -41,12 +41,17 @@ logger = logging.getLogger(__name__)
 def build_loss_search_space(
     include_label_smoothing: bool = True,
     extra_losses: Optional[List[str]] = None,
+    include_self_supervised: bool = False,
 ) -> SearchSpace:
     """从 list_losses() 动态构造 SP SearchSpace（ε1）。
 
     Args:
         include_label_smoothing: 是否包含 label_smoothing 浮点参数
         extra_losses: 额外追加的 loss 名称（如自定义注册的 loss）
+        include_self_supervised: 是否包含自监督损失（如 ent_loss）。
+            默认 False，因为 ε1 是监督任务损失搜索，自监督损失
+            （EntLoss forward 返回 dict，签名不兼容监督 (logits, y_long)）
+            会被采样后必然失败，污染 best_trial 候选集。
 
     Returns:
         SearchSpace: 含 loss（categorical）+ 可选 label_smoothing（float）的搜索空间
@@ -54,8 +59,12 @@ def build_loss_search_space(
     验证：
         - choices 来自 list_losses()，动态反映注册表状态
         - label_smoothing 范围 0.0-0.3（常见值域）
+        - 默认排除 SELF_SUPERVISED_LOSSES（避免监督任务采样到 ent_loss）
     """
-    losses = list_losses()
+    if include_self_supervised:
+        losses = list_losses()
+    else:
+        losses = list_supervised_losses()
     if extra_losses:
         losses = list(set(losses) | set(extra_losses))
 

@@ -160,10 +160,15 @@ class ExplorationTracker:
 
         Returns:
             最优试验，无可用数据时返回 None
+
+        P1.3 收尾修复：只从 status="completed" 的 trial 中选 best，
+        排除 failed trial（failed trial value=0.0 是默认填充值，
+        不代表真实性能，纳入候选会污染 best_trial 选择）。
         """
         candidates = [
             t for t in self.history
-            if t.get("result") and metric in t["result"]
+            if t.get("status") == "completed"
+            and t.get("result") and metric in t["result"]
         ]
         if not candidates:
             return None

@@ -753,14 +753,20 @@ class TestGrepEvidence:
         assert _grep_source(path, "intermediate_values"), "应处理 intermediate_values"
 
     def test_pipeline_has_intermediate_values_field(self):
-        """pipeline.py 应定义 intermediate_values 字段。"""
-        path = _source_path("engine/runner/pipeline.py")
+        """pipeline/context.py 应定义 intermediate_values 字段。
+
+        拆分背景：原 pipeline.py 拆分为 pipeline/ 包，PipelineContext 位于 pipeline/context.py。
+        """
+        path = _source_path("engine/runner/pipeline/context.py")
         assert _grep_source(path, "intermediate_values: Dict[int, float]"), \
             "PipelineContext 应有 intermediate_values: Dict[int, float] 字段"
 
     def test_pipeline_has_intermediate_metric_logger(self):
-        """pipeline.py 应注入 IntermediateMetricLogger 回调。"""
-        path = _source_path("engine/runner/pipeline.py")
+        """pipeline/stages/build.py 应注入 IntermediateMetricLogger 回调。
+
+        拆分背景：原 pipeline.py 拆分为 pipeline/ 包，stage_build 位于 pipeline/stages/build.py。
+        """
+        path = _source_path("engine/runner/pipeline/stages/build.py")
         assert _grep_source(path, "IntermediateMetricLogger"), \
             "stage_build 应使用 IntermediateMetricLogger"
         assert _grep_source(path, "intermediate_values=ctx.intermediate_values"), \
@@ -775,14 +781,675 @@ class TestGrepEvidence:
             "IntermediateMetricLogger 应实现 on_validation_epoch_end"
 
     def test_pipeline_export_intermediate_values_to_train_output(self):
-        """pipeline.py 应将 intermediate_values 写入 TrainOutput.training。"""
-        path = _source_path("engine/runner/pipeline.py")
+        """pipeline/stages/export.py 应将 intermediate_values 写入 TrainOutput.training。
+
+        拆分背景：原 pipeline.py 拆分为 pipeline/ 包，stage_export 位于 pipeline/stages/export.py。
+        """
+        path = _source_path("engine/runner/pipeline/stages/export.py")
         # P5 P2-7 阶段2：构造点改为 validate_training_summary 调用
         assert _grep_source(path, '"intermediate_values": ctx.intermediate_values'), \
             "stage_export 应将 intermediate_values 写入 TrainingSummary 构造"
 
     def test_field_fill_stage_has_intermediate_values(self):
-        """_FIELD_FILL_STAGE 应包含 intermediate_values 映射。"""
-        path = _source_path("engine/runner/pipeline.py")
+        """_FIELD_FILL_STAGE 应包含 intermediate_values 映射。
+
+        拆分背景：原 pipeline.py 拆分为 pipeline/ 包，_FIELD_FILL_STAGE 位于 pipeline/context.py。
+        """
+        path = _source_path("engine/runner/pipeline/context.py")
         assert _grep_source(path, '"intermediate_values": "stage_train"'), \
             "_FIELD_FILL_STAGE 应映射 intermediate_values → stage_train"
+
+    # ============================================================
+    # P1.1 Multi-fidelity 实时早停修复 — 新增 grep 实证
+    # ============================================================
+
+    def test_context_has_pruner_field(self):
+        """pipeline/context.py 应定义 pruner 字段（agent 注入 pruner 实例）。"""
+        path = _source_path("engine/runner/pipeline/context.py")
+        assert _grep_source(path, "pruner: Optional[Any] = None"), \
+            "PipelineContext 应有 pruner: Optional[Any] = None 字段"
+
+    def test_context_has_pruned_fields(self):
+        """pipeline/context.py 应定义 pruned/pruned_epoch 字段（stage_train 写入）。"""
+        path = _source_path("engine/runner/pipeline/context.py")
+        assert _grep_source(path, "pruned: bool = False"), \
+            "PipelineContext 应有 pruned: bool = False 字段"
+        assert _grep_source(path, "pruned_epoch: Optional[int] = None"), \
+            "PipelineContext 应有 pruned_epoch: Optional[int] = None 字段"
+
+    def test_context_field_fill_stage_has_pruner(self):
+        """_FIELD_FILL_STAGE 应映射 pruner → agent。"""
+        path = _source_path("engine/runner/pipeline/context.py")
+        assert _grep_source(path, '"pruner": "agent"'), \
+            "_FIELD_FILL_STAGE 应映射 pruner → agent"
+
+    def test_context_field_fill_stage_has_pruned(self):
+        """_FIELD_FILL_STAGE 应映射 pruned/pruned_epoch → stage_train。"""
+        path = _source_path("engine/runner/pipeline/context.py")
+        assert _grep_source(path, '"pruned": "stage_train"'), \
+            "_FIELD_FILL_STAGE 应映射 pruned → stage_train"
+        assert _grep_source(path, '"pruned_epoch": "stage_train"'), \
+            "_FIELD_FILL_STAGE 应映射 pruned_epoch → stage_train"
+
+    def test_orchestrator_has_realtime_pruning(self):
+        """orchestrator.py IntermediateMetricLogger 应包含实时剪枝代码。"""
+        path = _source_path("engine/runner/orchestrator.py")
+        # pruner 注入参数
+        assert _grep_source(path, "pruner: Any = None"), \
+            "IntermediateMetricLogger.__init__ 应接受 pruner 参数"
+        assert _grep_source(path, "trial_id: str ="), \
+            "IntermediateMetricLogger.__init__ 应接受 trial_id 参数"
+        assert _grep_source(path, "on_pruned"), \
+            "IntermediateMetricLogger.__init__ 应接受 on_pruned 回调"
+        # 实时剪枝逻辑
+        assert _grep_source(path, "trainer.should_stop = True"), \
+            "IntermediateMetricLogger 应设 trainer.should_stop = True"
+        assert _grep_source(path, "_pruned_this_session"), \
+            "IntermediateMetricLogger 应有幂等标志 _pruned_this_session"
+        assert _grep_source(path, "self.pruner.should_prune("), \
+            "IntermediateMetricLogger 应调用 self.pruner.should_prune"
+
+    def test_build_py_injects_pruner(self):
+        """pipeline/stages/build.py 应将 ctx.pruner 注入 IntermediateMetricLogger。"""
+        path = _source_path("engine/runner/pipeline/stages/build.py")
+        assert _grep_source(path, "pruner=ctx.pruner"), \
+            "stage_build 应将 ctx.pruner 传给 IntermediateMetricLogger"
+        assert _grep_source(path, "trial_id=ctx.trial_id"), \
+            "stage_build 应将 ctx.trial_id 传给 IntermediateMetricLogger"
+        assert _grep_source(path, "on_pruned=_on_pruned"), \
+            "stage_build 应注入 on_pruned 回调"
+        # on_pruned 回调写 ctx.pruned/pruned_epoch
+        assert _grep_source(path, "ctx.pruned = True"), \
+            "on_pruned 回调应设 ctx.pruned = True"
+        assert _grep_source(path, "ctx.pruned_epoch = epoch_1indexed"), \
+            "on_pruned 回调应设 ctx.pruned_epoch"
+
+    def test_train_py_logs_pruned_state(self):
+        """pipeline/stages/train.py 应感知 pruned 状态。"""
+        path = _source_path("engine/runner/pipeline/stages/train.py")
+        assert _grep_source(path, "ctx.pruned"), \
+            "stage_train 应引用 ctx.pruned"
+        assert _grep_source(path, "ctx.pruned_epoch"), \
+            "stage_train 应引用 ctx.pruned_epoch"
+        # writes 声明
+        assert _grep_source(path, '"pruned", "pruned_epoch"'), \
+            "stage_train writes 应声明 pruned/pruned_epoch"
+
+    def test_export_py_writes_pruned_to_train_output(self):
+        """pipeline/stages/export.py 应将 pruned/pruned_epoch 写入 TrainOutput.training。"""
+        path = _source_path("engine/runner/pipeline/stages/export.py")
+        assert _grep_source(path, '"pruned": ctx.pruned'), \
+            "stage_export 应将 ctx.pruned 写入 TrainingSummary 构造"
+        assert _grep_source(path, '"pruned_epoch": ctx.pruned_epoch'), \
+            "stage_export 应将 ctx.pruned_epoch 写入 TrainingSummary 构造"
+
+    def test_method_py_uses_realtime_pruning(self):
+        """experiment/method.py 应通过 run_pipeline 的 pruner/trial_id 参数启用实时早停。"""
+        path = _source_path("experiment/method.py")
+        assert _grep_source(path, "pruner=self.pruner"), \
+            "MethodRunner 应传 pruner=self.pruner 给 run_pipeline"
+        assert _grep_source(path, "trial_id=trial.trial_id"), \
+            "MethodRunner 应传 trial_id=trial.trial_id 给 run_pipeline"
+        assert _grep_source(path, "real_time_pruned"), \
+            "MethodRunner 应读取 real_time_pruned 状态"
+        # 兼容旧路径：实时剪枝未触发时回退到事后剪枝
+        assert _grep_source(path, "should_prune = real_time_pruned"), \
+            "MethodRunner 应将 should_prune 初始化为 real_time_pruned"
+
+    def test_schemas_has_pruned_fields(self):
+        """schemas.py TrainingSummary 应有 pruned/pruned_epoch 字段。"""
+        path = _source_path("schemas.py")
+        assert _grep_source(path, "pruned: bool = False"), \
+            "TrainingSummary 应有 pruned: bool = False 字段"
+        assert _grep_source(path, "pruned_epoch: Optional[int] = None"), \
+            "TrainingSummary 应有 pruned_epoch: Optional[int] = None 字段"
+
+    def test_runtime_run_pipeline_accepts_pruner(self):
+        """pipeline/runtime.py run_pipeline 应接受 pruner/trial_id 参数。"""
+        path = _source_path("engine/runner/pipeline/runtime.py")
+        assert _grep_source(path, "pruner: Any = None"), \
+            "run_pipeline 应接受 pruner 参数"
+        assert _grep_source(path, "trial_id: str ="), \
+            "run_pipeline 应接受 trial_id 参数"
+        assert _grep_source(path, "ctx.pruner = pruner"), \
+            "run_pipeline 应将 pruner 写到 ctx.pruner"
+
+
+# ============================================================
+# P1.1: 实时早停 — IntermediateMetricLogger + Pruner 集成
+# ============================================================
+class TestRealTimePruning:
+    """P1.1 实时早停修复：IntermediateMetricLogger 集成 pruner 检查。"""
+
+    def _make_trainer(self, current_epoch=0, sanity_checking=False,
+                      callback_metrics=None, val_accuracy=0.5):
+        """构造 mock Lightning Trainer。"""
+        trainer = MagicMock()
+        trainer.current_epoch = current_epoch
+        trainer.sanity_checking = sanity_checking
+        trainer.should_stop = False
+        trainer.callback_metrics = callback_metrics or {"val_accuracy": val_accuracy}
+        return trainer
+
+    def test_pruner_none_no_realtime_check(self):
+        """pruner=None 时不应触发实时剪枝（向后兼容）。"""
+        iv: Dict[int, float] = {}
+        cb = IntermediateMetricLogger(
+            metric="val_accuracy",
+            intermediate_values=iv,
+            pruner=None,
+        )
+        trainer = self._make_trainer(current_epoch=0, val_accuracy=0.5)
+        cb.on_validation_epoch_end(trainer, None)
+        # intermediate_values 应被写入
+        assert iv == {1: 0.5}
+        # 不应触发剪枝
+        assert trainer.should_stop is False
+        assert cb._pruned_this_session is False
+
+    def test_pruner_returns_false_no_stop(self):
+        """pruner 返回 False 时不应设 trainer.should_stop。"""
+        class _NeverPrune:
+            name = "never"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                return False
+        iv: Dict[int, float] = {}
+        pruned_calls: List[int] = []
+        cb = IntermediateMetricLogger(
+            metric="val_accuracy",
+            intermediate_values=iv,
+            pruner=_NeverPrune(),
+            trial_id="t1",
+            on_pruned=lambda epoch: pruned_calls.append(epoch),
+        )
+        trainer = self._make_trainer(current_epoch=0, val_accuracy=0.7)
+        cb.on_validation_epoch_end(trainer, None)
+        assert trainer.should_stop is False
+        assert cb._pruned_this_session is False
+        assert pruned_calls == []
+        # intermediate_values 仍写入
+        assert iv == {1: 0.7}
+
+    def test_pruner_returns_true_sets_should_stop(self):
+        """pruner 返回 True 时应设 trainer.should_stop=True + 调 on_pruned。"""
+        class _AlwaysPrune:
+            name = "always"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                return True
+        iv: Dict[int, float] = {}
+        pruned_calls: List[int] = []
+        cb = IntermediateMetricLogger(
+            metric="val_accuracy",
+            intermediate_values=iv,
+            pruner=_AlwaysPrune(),
+            trial_id="t1",
+            on_pruned=lambda epoch: pruned_calls.append(epoch),
+        )
+        trainer = self._make_trainer(current_epoch=2, val_accuracy=0.3)
+        cb.on_validation_epoch_end(trainer, None)
+        assert trainer.should_stop is True
+        assert cb._pruned_this_session is True
+        # epoch_1indexed = 2+1 = 3
+        assert pruned_calls == [3]
+        assert iv == {3: 0.3}
+
+    def test_pruner_exception_graceful_degradation(self):
+        """pruner 抛异常时应降级为不剪枝。"""
+        class _CrashPruner:
+            name = "crash"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                raise RuntimeError("pruner crashed")
+        iv: Dict[int, float] = {}
+        cb = IntermediateMetricLogger(
+            metric="val_accuracy",
+            intermediate_values=iv,
+            pruner=_CrashPruner(),
+            trial_id="t1",
+            on_pruned=lambda epoch: None,
+        )
+        trainer = self._make_trainer(current_epoch=0, val_accuracy=0.5)
+        cb.on_validation_epoch_end(trainer, None)
+        assert trainer.should_stop is False
+        assert cb._pruned_this_session is False
+        # intermediate_values 仍应被写入（pruner 异常不影响指标捕获）
+        assert iv == {1: 0.5}
+
+    def test_idempotent_after_prune(self):
+        """一次剪枝后不再重复检查 pruner（幂等）。"""
+        call_count = [0]
+        class _CountingPruner:
+            name = "counting"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                call_count[0] += 1
+                return True
+        iv: Dict[int, float] = {}
+        cb = IntermediateMetricLogger(
+            metric="val_accuracy",
+            intermediate_values=iv,
+            pruner=_CountingPruner(),
+            trial_id="t1",
+            on_pruned=lambda epoch: None,
+        )
+        # 第一次：pruner 调用，剪枝触发
+        trainer1 = self._make_trainer(current_epoch=0, val_accuracy=0.5)
+        cb.on_validation_epoch_end(trainer1, None)
+        assert call_count[0] == 1
+        assert trainer1.should_stop is True
+        # 第二次：pruner 不应再被调用（幂等）
+        trainer2 = self._make_trainer(current_epoch=1, val_accuracy=0.6)
+        cb.on_validation_epoch_end(trainer2, None)
+        assert call_count[0] == 1  # 仍是 1
+        # iv 应仍写入第二次（指标捕获不受幂等影响）
+        assert iv == {1: 0.5, 2: 0.6}
+
+    def test_skips_sanity_check(self):
+        """sanity_check 阶段不应触发 pruner。"""
+        call_count = [0]
+        class _CountingPruner:
+            name = "counting"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                call_count[0] += 1
+                return True
+        iv: Dict[int, float] = {}
+        cb = IntermediateMetricLogger(
+            metric="val_accuracy",
+            intermediate_values=iv,
+            pruner=_CountingPruner(),
+            trial_id="t1",
+        )
+        trainer = self._make_trainer(current_epoch=0, sanity_checking=True,
+                                      val_accuracy=0.5)
+        cb.on_validation_epoch_end(trainer, None)
+        assert call_count[0] == 0
+        assert trainer.should_stop is False
+        assert iv == {}  # sanity_check 也不写 intermediate_values
+
+    def test_on_pruned_exception_does_not_block_prune(self):
+        """on_pruned 回调抛异常不应撤销 trainer.should_stop（已设）。"""
+        class _AlwaysPrune:
+            name = "always"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                return True
+        def _bad_callback(epoch):
+            raise RuntimeError("callback crashed")
+        iv: Dict[int, float] = {}
+        cb = IntermediateMetricLogger(
+            metric="val_accuracy",
+            intermediate_values=iv,
+            pruner=_AlwaysPrune(),
+            trial_id="t1",
+            on_pruned=_bad_callback,
+        )
+        trainer = self._make_trainer(current_epoch=0, val_accuracy=0.5)
+        cb.on_validation_epoch_end(trainer, None)
+        # should_stop 仍应被设为 True（回调异常不影响主流程）
+        assert trainer.should_stop is True
+        assert cb._pruned_this_session is True
+
+    def test_rung_is_current_epoch_1indexed(self):
+        """传给 pruner.should_prune 的 rung 应为当前 epoch（1-indexed）。"""
+        captured_rung = [None]
+        class _CapturingPruner:
+            name = "capturing"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                captured_rung[0] = rung
+                return False
+        iv: Dict[int, float] = {}
+        cb = IntermediateMetricLogger(
+            metric="val_accuracy",
+            intermediate_values=iv,
+            pruner=_CapturingPruner(),
+            trial_id="t1",
+        )
+        # current_epoch=4 → epoch_1indexed=5 → rung 应为 5
+        trainer = self._make_trainer(current_epoch=4, val_accuracy=0.8)
+        cb.on_validation_epoch_end(trainer, None)
+        assert captured_rung[0] == 5
+
+    def test_trial_id_passed_to_pruner(self):
+        """trial_id 应传给 pruner.should_prune 用于跨 trial 比对。"""
+        captured_trial_id = [None]
+        class _CapturingPruner:
+            name = "capturing"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                captured_trial_id[0] = trial_id
+                return False
+        iv: Dict[int, float] = {}
+        cb = IntermediateMetricLogger(
+            metric="val_accuracy",
+            intermediate_values=iv,
+            pruner=_CapturingPruner(),
+            trial_id="trial_abc_123",
+        )
+        trainer = self._make_trainer(current_epoch=0, val_accuracy=0.5)
+        cb.on_validation_epoch_end(trainer, None)
+        assert captured_trial_id[0] == "trial_abc_123"
+
+    def test_intermediate_values_passed_to_pruner(self):
+        """intermediate_values 应传给 pruner（含当前 epoch 的最新值）。"""
+        captured_iv = [None]
+        class _CapturingPruner:
+            name = "capturing"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                captured_iv[0] = dict(intermediate_values)
+                return False
+        iv: Dict[int, float] = {}
+        cb = IntermediateMetricLogger(
+            metric="val_accuracy",
+            intermediate_values=iv,
+            pruner=_CapturingPruner(),
+            trial_id="t1",
+        )
+        # 第一次 epoch 0 → iv={1: 0.5}
+        trainer1 = self._make_trainer(current_epoch=0, val_accuracy=0.5)
+        cb.on_validation_epoch_end(trainer1, None)
+        assert captured_iv[0] == {1: 0.5}
+        # 第二次 epoch 1 → iv={1: 0.5, 2: 0.6}
+        trainer2 = self._make_trainer(current_epoch=1, val_accuracy=0.6)
+        cb.on_validation_epoch_end(trainer2, None)
+        assert captured_iv[0] == {1: 0.5, 2: 0.6}
+
+    def test_pruner_does_not_mutate_external_iv(self):
+        """pruner 不应修改外部 intermediate_values dict（传浅拷贝）。"""
+        class _MutatingPruner:
+            name = "mutating"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                # 尝试修改传入的 dict
+                intermediate_values[999] = 0.0
+                return False
+        iv: Dict[int, float] = {}
+        cb = IntermediateMetricLogger(
+            metric="val_accuracy",
+            intermediate_values=iv,
+            pruner=_MutatingPruner(),
+            trial_id="t1",
+        )
+        trainer = self._make_trainer(current_epoch=0, val_accuracy=0.5)
+        cb.on_validation_epoch_end(trainer, None)
+        # 外部 iv 不应被污染
+        assert 999 not in iv
+        assert iv == {1: 0.5}
+
+
+# ============================================================
+# P1.1: PipelineContext 新增字段验证
+# ============================================================
+class TestPipelineContextPrunerFields:
+    """PipelineContext 新增 pruner/pruned/pruned_epoch 字段验证。"""
+
+    def test_fields_exist_via_reflection(self):
+        """PipelineContext 应有 pruner/pruned/pruned_epoch 字段。"""
+        from senseframe.engine.runner.pipeline import PipelineContext
+        field_names = {f.name for f in fields(PipelineContext)}
+        assert "pruner" in field_names
+        assert "pruned" in field_names
+        assert "pruned_epoch" in field_names
+
+    def test_default_values(self):
+        """新字段默认值应为 None/False/None（向后兼容）。"""
+        from senseframe.engine.config import (
+            ExperimentConfig, InputFeature, OutputFeature, SceneConfig,
+        )
+        from senseframe.engine.runner.pipeline import PipelineContext
+        config = ExperimentConfig(
+            scene=SceneConfig(name="test", dataset="d", model_id="m"),
+            input_features=[InputFeature(name="features", type="tabular", shape=[10])],
+            output_features=[OutputFeature(name="label", type="category", num_classes=3)],
+        )
+        ctx = PipelineContext(config=config)
+        assert ctx.pruner is None
+        assert ctx.pruned is False
+        assert ctx.pruned_epoch is None
+
+    def test_field_fill_stage_mappings(self):
+        """_FIELD_FILL_STAGE 应映射 pruner/pruned/pruned_epoch。"""
+        from senseframe.engine.runner.pipeline import _FIELD_FILL_STAGE
+        assert _FIELD_FILL_STAGE["pruner"] == "agent"
+        assert _FIELD_FILL_STAGE["pruned"] == "stage_train"
+        assert _FIELD_FILL_STAGE["pruned_epoch"] == "stage_train"
+
+
+# ============================================================
+# P1.1: TrainingSummary 新增字段验证
+# ============================================================
+class TestTrainingSummaryPrunedFields:
+    """TrainingSummary 新增 pruned/pruned_epoch 字段验证。"""
+
+    def test_fields_exist_via_reflection(self):
+        """TrainingSummary 应有 pruned/pruned_epoch 字段。"""
+        from senseframe.schemas import TrainingSummary
+        field_names = {f.name for f in fields(TrainingSummary)}
+        assert "pruned" in field_names
+        assert "pruned_epoch" in field_names
+
+    def test_default_values(self):
+        """新字段默认值应为 False/None（向后兼容）。"""
+        from senseframe.schemas import TrainingSummary
+        ts = TrainingSummary(epochs_trained=0, early_stopped=False)
+        assert ts.pruned is False
+        assert ts.pruned_epoch is None
+
+    def test_to_dict_includes_pruned_fields(self):
+        """to_dict 应包含 pruned/pruned_epoch 字段。"""
+        from senseframe.schemas import TrainingSummary
+        ts = TrainingSummary(epochs_trained=5, early_stopped=False,
+                             pruned=True, pruned_epoch=3)
+        d = ts.to_dict()
+        assert d["pruned"] is True
+        assert d["pruned_epoch"] == 3
+
+    def test_validate_training_summary_reads_pruned(self):
+        """validate_training_summary 应读取 pruned/pruned_epoch。"""
+        from senseframe.schemas import validate_training_summary
+        ts = validate_training_summary({
+            "epochs_trained": 5,
+            "early_stopped": False,
+            "pruned": True,
+            "pruned_epoch": 2,
+        })
+        assert ts.pruned is True
+        assert ts.pruned_epoch == 2
+
+    def test_validate_training_summary_defaults_when_missing(self):
+        """validate_training_summary 缺失 pruned 时应默认 False/None。"""
+        from senseframe.schemas import validate_training_summary
+        ts = validate_training_summary({
+            "epochs_trained": 5,
+            "early_stopped": False,
+        })
+        assert ts.pruned is False
+        assert ts.pruned_epoch is None
+
+    def test_invalid_pruned_type_raises(self):
+        """pruned 类型错误应抛 TypeError。"""
+        from senseframe.schemas import TrainingSummary
+        with pytest.raises(TypeError):
+            TrainingSummary(epochs_trained=5, early_stopped=False, pruned="not_bool")
+
+    def test_invalid_pruned_epoch_type_raises(self):
+        """pruned_epoch 类型错误应抛 TypeError。"""
+        from senseframe.schemas import TrainingSummary
+        with pytest.raises(TypeError):
+            TrainingSummary(epochs_trained=5, early_stopped=False, pruned_epoch="not_int")
+
+
+# ============================================================
+# P1.1: MethodRunner 实时早停集成验证
+# ============================================================
+class TestMethodRunnerRealTimePruning:
+    """MethodRunner 实时早停路径验证。
+
+    覆盖：
+    - pruner/trial_id 传给 run_pipeline
+    - real_time_pruned 从 train_output.training.pruned 读取
+    - 实时剪枝触发时标记 PRUNED
+    - 实时剪枝未触发时回退到事后剪枝检查
+    """
+
+    def _make_method_config(self):
+        """构造测试用 MethodConfig。"""
+        from senseframe.engine.config import (
+            ExperimentConfig, InputFeature, OutputFeature, SceneConfig, TrainerConfig,
+        )
+        base_config = ExperimentConfig(
+            scene=SceneConfig(name="test", dataset="synthetic", model_id="MLP"),
+            input_features=[InputFeature(name="features", type="tabular", shape=[10])],
+            output_features=[OutputFeature(name="label", type="category", num_classes=3)],
+            trainer=TrainerConfig(epochs=1, batch_size=4, enable_progress_bar=False, logger="csv"),
+            output_dir="/tmp/test",
+        )
+        return MethodConfig(
+            name="test_method",
+            base_config=base_config,
+            search_space=SearchSpace(parameters=[
+                ParameterSpec(name="lr", type="float", low=0.001, high=0.1),
+            ]),
+            metric="val_accuracy",
+            direction="maximize",
+        )
+
+    def _make_mock_train_output(self, intermediate_values=None, pruned=False, pruned_epoch=None):
+        """构造 mock TrainOutput（含 P1.1 pruned 字段）。"""
+        from senseframe.schemas import TrainingSummary
+        mock = MagicMock()
+        mock.status = "success"
+        mock.model_path = "/tmp/model.pt"
+        mock.output_dir = "/tmp/output"
+        mock.error = None
+        mock.error_code = None
+        mock.final_eval = {"val_accuracy": 0.8, "val_loss": 0.5}
+        mock.training = TrainingSummary(
+            epochs_trained=2,
+            early_stopped=False,
+            duration_s=10.0,
+            intermediate_values=intermediate_values or {},
+            pruned=pruned,
+            pruned_epoch=pruned_epoch,
+        )
+        return mock
+
+    def test_realtime_pruned_marks_trial_pruned(self):
+        """training.pruned=True 时 trial 应标记 PRUNED（无需调 pruner.should_prune）。"""
+        config = self._make_method_config()
+        sm = StudyManager()
+        study_id = sm.create_study(
+            "test", direction="maximize",
+            search_space=config.search_space, sampler="random",
+        )
+        # pruner 不会被调用（real_time_pruned=True 已直接判定）
+        call_count = [0]
+        class _CountingPruner:
+            name = "counting"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                call_count[0] += 1
+                return False  # 即使返回 False，real_time_pruned=True 仍应剪枝
+
+        runner = MethodRunner(
+            config=config, study_id=study_id, study_manager=sm,
+            pruner=_CountingPruner(),
+        )
+
+        with patch("senseframe.experiment.method.run_pipeline") as mock_pipeline:
+            mock_pipeline.return_value = self._make_mock_train_output(
+                intermediate_values={0: 0.5, 1: 0.8},
+                pruned=True, pruned_epoch=2,
+            )
+            result = runner.run("synthetic", "MLP", 0)
+
+        assert result.status == TrialStatus.PRUNED
+        # pruner.should_prune 不应被调用（real_time_pruned 已直接判定）
+        assert call_count[0] == 0
+        # SP trial 状态应为 pruned
+        sp_trials = sm.list_trials(study_id)
+        assert sp_trials[0].state == "pruned"
+
+    def test_realtime_pruned_passes_pruner_to_run_pipeline(self):
+        """MethodRunner 应将 pruner/trial_id 传给 run_pipeline。"""
+        config = self._make_method_config()
+        sm = StudyManager()
+        study_id = sm.create_study(
+            "test", direction="maximize",
+            search_space=config.search_space, sampler="random",
+        )
+        class _DummyPruner:
+            name = "dummy"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                return False
+
+        runner = MethodRunner(
+            config=config, study_id=study_id, study_manager=sm,
+            pruner=_DummyPruner(),
+        )
+
+        with patch("senseframe.experiment.method.run_pipeline") as mock_pipeline:
+            mock_pipeline.return_value = self._make_mock_train_output(
+                intermediate_values={0: 0.5}, pruned=False,
+            )
+            runner.run("synthetic", "MLP", 0)
+
+        # 验证 run_pipeline 被调用时传了 pruner/trial_id
+        assert mock_pipeline.called
+        call_kwargs = mock_pipeline.call_args.kwargs
+        assert call_kwargs.get("pruner") is not None
+        assert "trial_id" in call_kwargs
+        assert call_kwargs["trial_id"]  # 非空
+
+    def test_realtime_not_pruned_falls_back_to_post_hoc(self):
+        """training.pruned=False 时应回退到事后剪枝检查。"""
+        config = self._make_method_config()
+        sm = StudyManager()
+        study_id = sm.create_study(
+            "test", direction="maximize",
+            search_space=config.search_space, sampler="random",
+        )
+        # 事后剪枝返回 True
+        class _PostHocPrune:
+            name = "posthoc"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                return True
+
+        runner = MethodRunner(
+            config=config, study_id=study_id, study_manager=sm,
+            pruner=_PostHocPrune(),
+        )
+
+        with patch("senseframe.experiment.method.run_pipeline") as mock_pipeline:
+            # training.pruned=False，但 pruner.should_prune 返回 True
+            mock_pipeline.return_value = self._make_mock_train_output(
+                intermediate_values={0: 0.5, 1: 0.6},
+                pruned=False, pruned_epoch=None,
+            )
+            result = runner.run("synthetic", "MLP", 0)
+
+        # 应通过事后剪枝路径标记 PRUNED
+        assert result.status == TrialStatus.PRUNED
+
+    def test_realtime_pruned_feedback_includes_epoch(self):
+        """pruned trial 的 feedback 应包含 pruned_epoch + real_time_pruned 元数据。"""
+        config = self._make_method_config()
+        sm = StudyManager()
+        study_id = sm.create_study(
+            "test", direction="maximize",
+            search_space=config.search_space, sampler="random",
+        )
+        class _DummyPruner:
+            name = "dummy"
+            def should_prune(self, trial_id, intermediate_values, rung):
+                return False
+
+        runner = MethodRunner(
+            config=config, study_id=study_id, study_manager=sm,
+            pruner=_DummyPruner(),
+        )
+
+        with patch("senseframe.experiment.method.run_pipeline") as mock_pipeline:
+            mock_pipeline.return_value = self._make_mock_train_output(
+                intermediate_values={0: 0.5, 1: 0.6},
+                pruned=True, pruned_epoch=2,
+            )
+            runner.run("synthetic", "MLP", 0)
+
+        sp_trial = sm.list_trials(study_id)[0]
+        assert sp_trial.feedback["pruned"] is True
+        assert sp_trial.feedback["pruned_epoch"] == 2
+        assert sp_trial.feedback["real_time_pruned"] is True

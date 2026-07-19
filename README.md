@@ -14,9 +14,9 @@ SenseFrame 让 Agent 持有训练流程控制权：框架提供可组合的 Stag
 
 - **开放策略空间** — `task_type` / `loss` / `metric` / `model` / `scene` / `normalization` 均可运行时注册
 - **数据驱动** — `DataProfiler` 探查数据特征并推荐策略（task_type / loss / metric / normalization）
-- **可编程训练流程** — 8 个 Stage 可替换、插入 hook、跳过、断点续跑
+- **可编程训练流程** — 9 个 Stage 可替换、插入 hook、跳过、断点续跑
 - **声明式 + 命令式** — YAML 快速启动，代码注入自定义逻辑
-- **资源感知路由** — 自动探测 CPU/GPU/内存，五级路由选择训练路线
+- **资源感知路由** — 自动探测 CPU/GPU/内存，7 级路由选择训练路线
 - **自愈重试** — OOM 自动降 `batch_size` 重试
 - **结构化异常** — `SenseFrameError` 基类 + 12 个子类，每个携带 `error_code`，消除字符串匹配
 - **产物溯源** — `ArtifactManifest` 记录全部产物 SHA-256，`verify_artifacts()` 校验完整性
@@ -35,10 +35,12 @@ SenseFrame 让 Agent 持有训练流程控制权：框架提供可组合的 Stag
 ```bash
 git clone <repo-url>
 cd SenseFrame
-pip install -r requirements.txt
+pip install -e '.[eeg,radio,dev]'   # 核心依赖 + EEG/Radio/开发工具
 
-# ONNX 导出为可选依赖（按需安装）
-pip install onnx  # 导出 onnx 格式时需要
+# 可选 extras（按需安装）
+pip install -e '.[onnx]'   # ONNX 导出
+pip install -e '.[otel]'   # OpenTelemetry 可观测性
+pip install -e '.[all]'    # 全部可选依赖
 ```
 
 ### 声明式训练
@@ -161,6 +163,13 @@ senseframe/
 | `recommend` | 根据资源推荐模型 | `python -m senseframe.cli recommend --dataset UT_HAR_data` |
 | `experiment` | YAML 配置驱动训练 | `python -m senseframe.cli experiment --config configs/config.yaml` |
 | `export` | 多格式模型导出 | `python -m senseframe.cli export --formats onnx` |
+| `predict` | 批量推理 | `python -m senseframe.cli predict --model model.pth --metadata metadata.json --samples samples.json` |
+| `exploration` | 探索状态管理 | `python -m senseframe.cli exploration list` |
+| `skills` | 技能库管理 | `python -m senseframe.cli skills list` |
+| `catalog` | 技术目录查询 | `python -m senseframe.cli catalog list` |
+| `monitor` | 训练实时监控 | `python -m senseframe.cli monitor output_dir` |
+| `serve` | 启动推理服务 | `python -m senseframe.cli serve output_dir --port 8000` |
+| `create-scene` | 创建场景脚手架 | `python -m senseframe.cli create-scene my_scene` |
 
 ## 配置
 
@@ -284,7 +293,7 @@ class TimeSeriesScene(SceneContainer):
 - [配置 Schema](reference/config_schema.md) — 完整字段与校验规则
 - [配置模板](reference/training_templates.md) — YAML 配置模板
 - [数据集与模型](reference/datasets_and_models.md) — 数据集与模型支持表
-- [资源路由](reference/resource_routing.md) — 五级路由表 + 模型推荐
+- [资源路由](reference/resource_routing.md) — 7 级路由表 + 模型推荐
 - [自监督训练](reference/self_supervised_paradigm.md) — 自监督训练范式
 - [场景开发指南](reference/scene_development.md) — 新增场景容器
 - [错误排查](reference/troubleshooting.md) — error_code 枚举与排查指南

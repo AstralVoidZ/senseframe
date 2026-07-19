@@ -40,11 +40,11 @@ sf.context_schema()  # 顶层便捷入口
 | `stage_load` | `scene_kwargs`, `bundle`, `data_profile`, `output_dir`, `log_writer`, `data_hash` |
 | `stage_build` | `model`, `datamodule`, `module`, `callbacks`, `pl_logger`, `csv_logger`, `monitor` |
 | `stage_probe_vram` | `vram_probe_result`（方案 B：动态显存探测结果，写入 metadata.resource.vram_probe） |
-| `stage_train` | `trainer`, `training_duration_s`, `best_model_path`, `best_model_score`, `best_epoch`, `intermediate_values` |
+| `stage_train` | `trainer`, `training_duration_s`, `best_model_path`, `best_model_score`, `best_epoch`, `intermediate_values`, `pruned`, `pruned_epoch`（P1.1 Multi-fidelity 实时早停：IntermediateMetricLogger 回调内调 pruner.should_prune，True 则写 pruned=True + pruned_epoch=1-indexed epoch 并设 trainer.should_stop） |
 | `stage_export`（metadata） | `best_epoch`, `best_model_path`, `best_model_score`, `epoch_utilization` 持久化到 metadata.json + pipeline_checkpoint.json |
 | `stage_eval` | `final_eval`, `training_log`, `early_stopped`, `feedback` |
 | `stage_export` | `artifact_registry` |
-| `agent`（运行时，伪 stage） | `trial_id`, `parent_trial_id`, `exploration_history`, `extra`, `completed_stages`, `stage_checkpoint_path`, `failed_stage`, `failed_error` |
+| `agent`（运行时，伪 stage） | `trial_id`, `parent_trial_id`, `exploration_history`, `extra`, `completed_stages`, `stage_checkpoint_path`, `failed_stage`, `failed_error`, `pruner`（P1.1：Agent 注入 Pruner Protocol 实例供 Multi-fidelity 实时早停使用） |
 
 **伪 stage 说明**（schema v1.1）：`init` 和 `agent` 不是真实 pipeline stage，
 不由任何 stage 函数产出，分别由 `PipelineContext.__init__()` 构造函数注入和

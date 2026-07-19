@@ -454,8 +454,20 @@ class TestAccessPointsUnchanged:
 
     @pytest.fixture
     def pipeline_source(self):
+        """读取 stage_build + stage_train 源码（工厂字段访问分散于两者）。
+
+        拆分背景：原 pipeline.py 上帝文件拆分为 pipeline/ 包。
+        - module_factory / datamodule_factory / extra_callbacks 访问位于 build.py
+        - trainer_factory 访问位于 train.py（RFC-002 阶段 K 注入点在 stage_train）
+        fixture 聚合两者源码，确保拆分前后访问点契约一致。
+        """
         root = Path(__file__).resolve().parents[1]
-        return (root / "senseframe" / "engine" / "runner" / "pipeline.py").read_text(encoding="utf-8")
+        stages_dir = root / "senseframe" / "engine" / "runner" / "pipeline" / "stages"
+        return (
+            (stages_dir / "build.py").read_text(encoding="utf-8")
+            + "\n"
+            + (stages_dir / "train.py").read_text(encoding="utf-8")
+        )
 
     @pytest.fixture
     def hpo_source(self):

@@ -74,6 +74,32 @@ class TestExplorationTracker:
         t = ExplorationTracker()
         assert t.best_trial() is None
 
+    def test_best_trial_excludes_failed(self):
+        """P1.3 收尾修复：best_trial 只从 completed trial 中选，排除 failed。
+
+        场景：failed trial value=0.0 是默认填充值（不代表真实性能），
+        若纳入候选会在 maximize 方向下被忽略（0.0 < 真实 value），
+        但在 minimize 方向下会被错误选为 best（0.0 < 真实 value）。
+        修复后 failed trial 不进入候选集，彻底消除此风险。
+        """
+        t = ExplorationTracker()
+        # trial 1: completed value=0.5
+        tid1 = t.add_trial(strategy={"loss": "ce"}, result={"val_accuracy": 0.5})
+        # trial 2: failed value=0.0（模拟 SP tell failed trial）
+        tid2 = t.add_trial(strategy={"loss": "ent_loss"}, result=None)
+        t.update_trial(tid2, result={"val_accuracy": 0.0}, status="failed")
+
+        # best 应是 completed trial（value=0.5），不是 failed trial（value=0.0）
+        best = t.best_trial(metric="val_accuracy", mode="max")
+        assert best is not None
+        assert best["trial_id"] == tid1
+        assert best["result"]["val_accuracy"] == 0.5
+
+        # 反向验证：minimize 方向下也不应选 failed trial
+        best_min = t.best_trial(metric="val_accuracy", mode="min")
+        assert best_min is not None
+        assert best_min["trial_id"] == tid1  # 唯一 completed trial
+
     def test_explored_strategies_dedup(self):
         t = ExplorationTracker()
         t.add_trial(strategy={"loss": "focal"}, result={"val_accuracy": 0.7})

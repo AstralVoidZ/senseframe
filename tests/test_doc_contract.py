@@ -445,7 +445,7 @@ def test_stage_io_reads_writes_consistency():
 # 14. data_hash 计算与写入 manifest 契约
 # ============================================================
 def test_data_hash_computed_in_pipeline():
-    """pipeline.py 的 stage_load 应计算 data_hash，_generate_manifest 应写入 manifest。
+    """stage_load 应计算 data_hash，_generate_manifest 应写入 manifest。
 
     旧逻辑：manifest.data_hash 恒为空字符串，未计算数据集内容哈希，
     导致数据集变更/损坏无法被溯源检测。
@@ -454,31 +454,39 @@ def test_data_hash_computed_in_pipeline():
     - PipelineContext 有 data_hash 字段
     - stage_load 中计算 ctx.data_hash（元数据哈希：路径+大小+mtime）
     - _generate_manifest 从 ctx.data_hash 读取（不再恒定空字符串）
+
+    拆分背景：原 pipeline.py 拆分为 pipeline/ 包，
+    stage_load 位于 pipeline/stages/load.py，
+    _generate_manifest 位于 pipeline/stages/export.py。
     """
-    pipeline_path = PROJECT_ROOT / "senseframe" / "engine" / "runner" / "pipeline.py"
-    if not pipeline_path.exists():
-        pytest.skip(f"pipeline.py 不存在: {pipeline_path}")
-    source = pipeline_path.read_text(encoding="utf-8")
+    load_path = PROJECT_ROOT / "senseframe" / "engine" / "runner" / "pipeline" / "stages" / "load.py"
+    export_path = PROJECT_ROOT / "senseframe" / "engine" / "runner" / "pipeline" / "stages" / "export.py"
+    if not load_path.exists():
+        pytest.skip(f"pipeline/stages/load.py 不存在: {load_path}")
+    if not export_path.exists():
+        pytest.skip(f"pipeline/stages/export.py 不存在: {export_path}")
+    load_source = load_path.read_text(encoding="utf-8")
+    export_source = export_path.read_text(encoding="utf-8")
 
     # 1. 验证 data_hash 字段存在于代码中
-    if "data_hash" not in source:
-        pytest.fail("pipeline.py 未包含 data_hash 字段定义")
+    if "data_hash" not in load_source:
+        pytest.fail("pipeline/stages/load.py 未包含 data_hash 字段定义")
 
     # 2. 验证 stage_load 中计算 data_hash（ctx.data_hash 赋值）
-    if "ctx.data_hash" not in source:
+    if "ctx.data_hash" not in load_source:
         pytest.fail(
-            "pipeline.py 未在 stage_load 中计算 ctx.data_hash。"
+            "pipeline/stages/load.py 未在 stage_load 中计算 ctx.data_hash。"
             "stage_load 应在数据加载后计算数据集元数据哈希并赋值给 ctx.data_hash。"
         )
 
     # 3. 验证 _generate_manifest 引用 ctx.data_hash（不再恒定空字符串）
-    manifest_start = source.find("def _generate_manifest")
+    manifest_start = export_source.find("def _generate_manifest")
     if manifest_start == -1:
-        pytest.fail("pipeline.py 未找到 _generate_manifest 函数")
-    manifest_section = source[manifest_start:]
+        pytest.fail("pipeline/stages/export.py 未找到 _generate_manifest 函数")
+    manifest_section = export_source[manifest_start:]
     if "ctx.data_hash" not in manifest_section:
         pytest.fail(
-            "pipeline.py 的 _generate_manifest 未从 ctx.data_hash 读取 data_hash，"
+            "pipeline/stages/export.py 的 _generate_manifest 未从 ctx.data_hash 读取 data_hash，"
             "manifest.data_hash 仍为空字符串，数据集变更/损坏无法被溯源检测。"
         )
 
@@ -496,17 +504,25 @@ def test_best_epoch_persisted_in_metadata():
     修复后契约（Part 2）：
     - stage_export 的 metadata dict 含 best_epoch/best_model_path/best_model_score/epoch_utilization
     - _serialize_stage_outputs 的 simple_fields 含 best_epoch
+
+    拆分背景：原 pipeline.py 拆分为 pipeline/ 包，
+    stage_export 位于 pipeline/stages/export.py，
+    _serialize_stage_outputs 位于 pipeline/runtime.py。
     """
-    pipeline_path = PROJECT_ROOT / "senseframe" / "engine" / "runner" / "pipeline.py"
-    if not pipeline_path.exists():
-        pytest.skip(f"pipeline.py 不存在: {pipeline_path}")
-    source = pipeline_path.read_text(encoding="utf-8")
+    export_path = PROJECT_ROOT / "senseframe" / "engine" / "runner" / "pipeline" / "stages" / "export.py"
+    runtime_path = PROJECT_ROOT / "senseframe" / "engine" / "runner" / "pipeline" / "runtime.py"
+    if not export_path.exists():
+        pytest.skip(f"pipeline/stages/export.py 不存在: {export_path}")
+    if not runtime_path.exists():
+        pytest.skip(f"pipeline/runtime.py 不存在: {runtime_path}")
+    export_source = export_path.read_text(encoding="utf-8")
+    runtime_source = runtime_path.read_text(encoding="utf-8")
 
     # 验证 metadata dict 含 4 个字段
-    export_start = source.find("def stage_export")
+    export_start = export_source.find("def stage_export")
     if export_start == -1:
-        pytest.fail("pipeline.py 未找到 stage_export 函数")
-    export_section = source[export_start:]
+        pytest.fail("pipeline/stages/export.py 未找到 stage_export 函数")
+    export_section = export_source[export_start:]
     for field in ["best_epoch", "best_model_path", "best_model_score", "epoch_utilization"]:
         if field not in export_section:
             pytest.fail(
@@ -515,10 +531,10 @@ def test_best_epoch_persisted_in_metadata():
             )
 
     # 验证 _serialize_stage_outputs 含 best_epoch
-    serialize_start = source.find("def _serialize_stage_outputs")
+    serialize_start = runtime_source.find("def _serialize_stage_outputs")
     if serialize_start == -1:
-        pytest.fail("pipeline.py 未找到 _serialize_stage_outputs 方法")
-    serialize_section = source[serialize_start:]
+        pytest.fail("pipeline/runtime.py 未找到 _serialize_stage_outputs 方法")
+    serialize_section = runtime_source[serialize_start:]
     if "best_epoch" not in serialize_section:
         pytest.fail(
             "_serialize_stage_outputs 的 simple_fields 未包含 best_epoch。"
@@ -535,15 +551,18 @@ def test_analyze_training_result_uses_get():
     Part 3 引入 phase 字段后，epoch 0 的 entry 可能无 val_loss 键（to_dict 省略 None 字段），
     final_eval 的 entry 可能无 train_loss 键。用 [] 访问会 KeyError。
     .get() 是防御性编程契约。
+
+    拆分背景：原 pipeline.py 拆分为 pipeline/ 包，
+    analyze_training_result 位于 pipeline/stages/train.py。
     """
-    pipeline_path = PROJECT_ROOT / "senseframe" / "engine" / "runner" / "pipeline.py"
+    pipeline_path = PROJECT_ROOT / "senseframe" / "engine" / "runner" / "pipeline" / "stages" / "train.py"
     if not pipeline_path.exists():
-        pytest.skip(f"pipeline.py 不存在: {pipeline_path}")
+        pytest.skip(f"pipeline/stages/train.py 不存在: {pipeline_path}")
     source = pipeline_path.read_text(encoding="utf-8")
 
     func_start = source.find("def analyze_training_result")
     if func_start == -1:
-        pytest.fail("pipeline.py 未找到 analyze_training_result 函数")
+        pytest.fail("pipeline/stages/train.py 未找到 analyze_training_result 函数")
     func_section = source[func_start:source.find("\ndef ", func_start + 1)]
 
     # 检查是否有 entry["xxx"] 形式的访问（不允许，注释和 docstring 除外）
@@ -705,7 +724,7 @@ def test_stage_probe_vram_contract():
     )
 
     # 6. stage_export 的 metadata.resource 含 vram_probe 键
-    pipeline_path = PROJECT_ROOT / "senseframe" / "engine" / "runner" / "pipeline.py"
+    pipeline_path = PROJECT_ROOT / "senseframe" / "engine" / "runner" / "pipeline" / "stages" / "export.py"
     source = pipeline_path.read_text(encoding="utf-8")
     export_start = source.find("def stage_export")
     export_section = source[export_start:]
@@ -885,5 +904,163 @@ def test_trainer_config_defaults_match_doc():
             "config_schema.md TrainerConfig 默认值与代码不一致：\n"
             + "\n".join(f"  {n}: 代码={exp}, doc={act}" for n, exp, act in mismatches)
         )
+
+
+# ============================================================
+# 22. 文档与代码一致性自动校验（设计文档 0.7.2 节）
+# ============================================================
+def _extract_cli_commands_via_ast() -> list:
+    """从 senseframe/cli.py 的 cmd_map 字典 AST 解析提取顶层 CLI 子命令列表。
+
+    使用 AST 而非反射，避免调用 main() 触发 argparse。
+    cmd_map 是 main() 函数内的 dict literal，键为字符串（命令名），
+    值为 _cmd_xxx 函数引用。通过 ast.Assign + targets[0].id == "cmd_map" 精确定位。
+    """
+    import ast
+    cli_path = PROJECT_ROOT / "senseframe" / "cli.py"
+    tree = ast.parse(cli_path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "cmd_map"
+                and isinstance(node.value, ast.Dict)):
+            return sorted([
+                k.value for k in node.value.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)
+            ])
+    return []
+
+
+def _extract_cli_table_from_doc(content: str) -> set:
+    r"""从 markdown 表格中提取 CLI 命令名（反引号包裹的 `cmd`）。
+
+    匹配表格行 `| `cmd` | ... |` 格式。
+    仅扫描 "## CLI" 章节，避免误匹配其他表格（如 PipelineContext 字段表）。
+    """
+    # 定位 "## CLI" 章节（直到下一个 ## 标题或文件末尾）
+    section_match = re.search(r'^##\s+CLI\s*$', content, re.MULTILINE)
+    if not section_match:
+        return set()
+    section_start = section_match.end()
+    # 找到下一个 ## 标题
+    next_section = re.search(r'^##\s+', content[section_start:], re.MULTILINE)
+    section_end = (section_start + next_section.start()) if next_section else len(content)
+    section = content[section_start:section_end]
+
+    commands = set()
+    for line in section.splitlines():
+        m = re.match(r"\|\s*`([a-z][a-z0-9-]*)`\s*\|", line)
+        if m:
+            commands.add(m.group(1))
+    return commands
+
+
+class TestDocCodeSync:
+    """文档与代码一致性自动校验（MCP 自省协议契约保障）。
+
+    设计文档 0.7.2 节要求：扩展 test_doc_contract.py 自动校验 stage 数/CLI 数/路由级别。
+    长期机制：MCP senseframe://introspect Resource 暴露的 schema 与文档同源，
+    文档漂移即 MCP 契约漂移，CI 阻断。
+    """
+
+    def test_stage_count_matches_docs(self):
+        """Pipeline.default() 的 stage 数与所有文档声称一致。"""
+        from senseframe.engine.runner.pipeline import Pipeline
+        actual_stages = [name for name, _ in Pipeline.default().stages]
+        actual_count = len(actual_stages)
+
+        # 1. SKILL.md "# N stages: a → b → c" 校验（数量 + 列表）
+        skill_md = (PROJECT_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        m = re.search(r'#\s*(\d+)\s*stages?:\s*([^\n]+)', skill_md)
+        assert m, "SKILL.md 应包含 '# N stages: ...' 格式的 stage 声明"
+        doc_count = int(m.group(1))
+        doc_list_str = m.group(2).strip()
+        doc_stages = [s.strip() for s in re.split(r'→|->', doc_list_str)]
+        assert doc_count == actual_count, (
+            f"SKILL.md 声称 {doc_count} 个 stage，实际 {actual_count} 个。"
+            f"实际列表：{actual_stages}"
+        )
+        assert doc_stages == actual_stages, (
+            f"SKILL.md stage 列表 {doc_stages} 与实际 {actual_stages} 不一致"
+        )
+
+        # 2. README.md "N 个 Stage" 校验
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        m = re.search(r'(\d+)\s*个\s*Stage', readme)
+        assert m, "README.md 应包含 'N 个 Stage' 声明"
+        assert int(m.group(1)) == actual_count, (
+            f"README.md 声称 {m.group(1)} 个 Stage，实际 {actual_count} 个"
+        )
+
+        # 3. runtime.py docstring "默认 pipeline（N 个 stage）" 校验
+        runtime_path = PROJECT_ROOT / "senseframe" / "engine" / "runner" / "pipeline" / "runtime.py"
+        runtime_src = runtime_path.read_text(encoding="utf-8")
+        m = re.search(r'默认 pipeline（(\d+)\s*个\s*stage）', runtime_src)
+        assert m, "runtime.py Pipeline.default() docstring 应包含 '默认 pipeline（N 个 stage）'"
+        assert int(m.group(1)) == actual_count, (
+            f"runtime.py docstring 声称 {m.group(1)} 个 stage，实际 {actual_count} 个"
+        )
+
+        # 4. pipeline/__init__.py docstring "N 个顶层 stage" 校验
+        init_path = PROJECT_ROOT / "senseframe" / "engine" / "runner" / "pipeline" / "__init__.py"
+        init_src = init_path.read_text(encoding="utf-8")
+        m = re.search(r'(\d+)\s*个\s*顶层\s*stage', init_src)
+        assert m, "pipeline/__init__.py docstring 应包含 'N 个顶层 stage'"
+        assert int(m.group(1)) == actual_count, (
+            f"pipeline/__init__.py docstring 声称 {m.group(1)} 个顶层 stage，实际 {actual_count} 个"
+        )
+
+    def test_cli_count_matches_docs(self):
+        """CLI 子命令数与 cli.py 实际注册数一致。"""
+        actual_cli = _extract_cli_commands_via_ast()
+        actual_count = len(actual_cli)
+
+        # 1. cli.py docstring "CLI 接口：N 个子命令" 校验
+        cli_src = (PROJECT_ROOT / "senseframe" / "cli.py").read_text(encoding="utf-8")
+        m = re.search(r'CLI 接口：(\d+)\s*个\s*子命令', cli_src)
+        assert m, "cli.py docstring 应包含 'CLI 接口：N 个子命令'"
+        assert int(m.group(1)) == actual_count, (
+            f"cli.py docstring 声称 {m.group(1)} 个子命令，实际 {actual_count} 个。"
+            f"实际列表：{actual_cli}"
+        )
+
+        # 2. SKILL.md CLI 表格：set equality
+        skill_md = (PROJECT_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        skill_cli = _extract_cli_table_from_doc(skill_md)
+        # 排除可能的非命令表格行（如 | Command | Purpose | 表头）
+        skill_cli -= {"command"}  # 表头小写形式
+        assert skill_cli == set(actual_cli), (
+            f"SKILL.md CLI 表 {sorted(skill_cli)} 与实际 {sorted(actual_cli)} 不一致。"
+            f"缺失：{sorted(set(actual_cli) - skill_cli)}，"
+            f"多余：{sorted(skill_cli - set(actual_cli))}"
+        )
+
+        # 3. README.md CLI 表格：set equality
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        readme_cli = _extract_cli_table_from_doc(readme)
+        readme_cli -= {"command"}
+        assert readme_cli == set(actual_cli), (
+            f"README.md CLI 表 {sorted(readme_cli)} 与实际 {sorted(actual_cli)} 不一致。"
+            f"缺失：{sorted(set(actual_cli) - readme_cli)}，"
+            f"多余：{sorted(readme_cli - set(actual_cli))}"
+        )
+
+    def test_route_levels_match_docs(self):
+        """路由级别数与 routing.RESOURCE_ROUTES 注册数一致。"""
+        from senseframe.routing import RESOURCE_ROUTES
+        actual_levels = set(RESOURCE_ROUTES.keys())
+        actual_count = len(actual_levels)
+
+        # README.md "N 级路由" / "N 级路由表" 校验
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        matches = re.findall(r'(\d+)\s*级\s*路由', readme)
+        assert matches, "README.md 应包含 'N 级路由' 声明"
+        for m_count in matches:
+            doc_count = int(m_count)
+            assert doc_count == actual_count, (
+                f"README.md 声称 {doc_count} 级路由，实际 {actual_count} 级。"
+                f"实际级别：{sorted(actual_levels)}"
+            )
 
 

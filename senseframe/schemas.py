@@ -333,6 +333,10 @@ class TrainingSummary:
 
     P5 P2-7 阶段1：替代 TrainOutput.training 的 Dict[str, Any]，
     log 字段引用已有 TrainingLogEntry dataclass。
+
+    P1.1 Multi-fidelity 实时早停修复：新增 pruned/pruned_epoch 字段，
+    由 stage_export 从 ctx.pruned/pruned_epoch 投影。MethodRunner 读取
+    training.pruned 区分实时剪枝 trial 与正常完成 trial。
     """
     epochs_trained: int
     early_stopped: bool
@@ -341,6 +345,9 @@ class TrainingSummary:
     best_val_loss: Optional[float] = None
     best_checkpoint: Optional[str] = None
     intermediate_values: Dict[int, float] = field(default_factory=dict)
+    # P1.1: 实时早停状态（ctx.pruned/pruned_epoch 投影）
+    pruned: bool = False
+    pruned_epoch: Optional[int] = None
 
     def __post_init__(self):
         if not isinstance(self.epochs_trained, int) or self.epochs_trained < 0:
@@ -354,6 +361,14 @@ class TrainingSummary:
         if not isinstance(self.log, list):
             raise TypeError(
                 f"TrainingSummary.log 必须为 list，实际: {type(self.log).__name__}"
+            )
+        if not isinstance(self.pruned, bool):
+            raise TypeError(
+                f"TrainingSummary.pruned 必须为 bool，实际: {type(self.pruned).__name__}"
+            )
+        if self.pruned_epoch is not None and not isinstance(self.pruned_epoch, int):
+            raise TypeError(
+                f"TrainingSummary.pruned_epoch 必须为 int 或 None，实际: {type(self.pruned_epoch).__name__}"
             )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -373,6 +388,8 @@ class TrainingSummary:
             "best_val_loss": self.best_val_loss,
             "best_checkpoint": self.best_checkpoint,
             "intermediate_values": dict(self.intermediate_values),
+            "pruned": self.pruned,
+            "pruned_epoch": self.pruned_epoch,
         }
 
 
@@ -466,6 +483,9 @@ def validate_training_summary(d: Dict[str, Any]) -> TrainingSummary:
         best_val_loss=d.get("best_val_loss"),
         best_checkpoint=d.get("best_checkpoint"),
         intermediate_values=intermediate,
+        # P1.1: 实时早停状态投影（默认 False/None 向后兼容旧 dict）
+        pruned=bool(d.get("pruned", False)),
+        pruned_epoch=d.get("pruned_epoch"),
     )
 
 

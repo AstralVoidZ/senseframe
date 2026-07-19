@@ -43,7 +43,7 @@ $ARGUMENTS = 原始参数字符串
 - 工作目录: `.`（已部署 SenseFrame 的测试目录）
 - SKILL `senseframe` 已加载，API 文档在 `.opencode/skills/senseframe/SKILL.md`
 - 数据集根: `resource/CSI_DATASETS/`（如未部署，可改 `--data-root` 或软链；命令中所有路径均可替换为实际数据根）
-- Python 环境: 已 `pip install -r requirements.txt`
+- Python 环境: 已 `pip install -e '.[eeg,radio,dev]'`
 - **报告输出目录**: `report/`（不存在时自动创建）
 - **报告命名格式**: `report/train_<dataset>_<model>_<YYYYMMDD_HHMMSS>.md`
   - 例：`report/train_UT_HAR_data_ResNet18_20260706_143025.md`

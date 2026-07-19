@@ -24,6 +24,8 @@ from .losses import (
     get_loss,
     has_loss,
     list_losses,
+    list_supervised_losses,
+    SELF_SUPERVISED_LOSSES,
     LossConfig,
     loss_from_spec,
 )
@@ -47,6 +49,11 @@ from .validators import (
     compose,
     run_validation,
 )
+from .foundation_model import (
+    SensingFoundationModel,
+    PretrainConfig,
+    PEFTConfig,
+)
 
 __all__ = [
     "TaskType",
@@ -62,6 +69,8 @@ __all__ = [
     "get_loss",
     "has_loss",
     "list_losses",
+    "list_supervised_losses",
+    "SELF_SUPERVISED_LOSSES",
     "LossConfig",
     "loss_from_spec",
     "register_metric",
@@ -81,4 +90,8 @@ __all__ = [
     "transform_pipeline_validator",
     "compose",
     "run_validation",
+    # P3 阶段 8: 感知基础模型抽象
+    "SensingFoundationModel",
+    "PretrainConfig",
+    "PEFTConfig",
 ]

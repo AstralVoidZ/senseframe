@@ -154,6 +154,7 @@ class MethodRunner:
         self,
         modified_config,
         trial_params: Dict[str, Any],
+        trial_id: str = "",
     ):
         """通过 OP 编排 run_pipeline（P2.12，OP 迁移路径）。
 
@@ -168,6 +169,7 @@ class MethodRunner:
         Args:
             modified_config: 应用 trial.params 后的 ExperimentConfig
             trial_params: SP Trial 参数（用于 OP create_run.params 持久化）
+            trial_id: SP Trial ID（P1.1: 用于实时早停 pruner.should_prune 跨 trial 比对）
 
         Returns:
             TrainOutput（run_pipeline 的返回值）
@@ -185,7 +187,12 @@ class MethodRunner:
         train_output = None
         error: Optional[Exception] = None
         try:
-            train_output = run_pipeline(modified_config)
+            # P1.1: OP 迁移路径同样注入 pruner/trial_id 启用实时早停
+            train_output = run_pipeline(
+                modified_config,
+                pruner=self.pruner,
+                trial_id=trial_id,
+            )
         except Exception as e:
             error = e
 
@@ -246,13 +253,25 @@ class MethodRunner:
         modified_config.scene.model_id = model_id
 
         # 3. 训练
+        # P1.1 Multi-fidelity 实时早停修复：通过 run_pipeline 的 pruner/trial_id 参数
+        # 注入到 PipelineContext，让 IntermediateMetricLogger 在每个 epoch end 调
+        # should_prune，True 时设 trainer.should_stop=True 提前终止训练。
+        # 替代旧路径（事后剪枝：训练完整跑完才检查 should_prune）。
         try:
             if self.use_op:
                 # P2.12: OP 迁移路径 — create_run + start + complete/fail 包装
-                train_output = self._run_pipeline_via_op(modified_config, trial.params)
+                # P1.1: 传入 trial_id 启用实时早停
+                train_output = self._run_pipeline_via_op(
+                    modified_config, trial.params, trial_id=trial.trial_id,
+                )
             else:
                 # P1 路径：直接调 run_pipeline（向后兼容）
-                train_output = run_pipeline(modified_config)
+                # P1.1: 传入 pruner/trial_id 启用实时早停
+                train_output = run_pipeline(
+                    modified_config,
+                    pruner=self.pruner,
+                    trial_id=trial.trial_id,
+                )
         except Exception as e:
             # 训练异常 → SP tell failed + 返回失败 TrialResult
             self.sm.tell(
@@ -309,9 +328,12 @@ class MethodRunner:
                     agent_decisions=self._agent_decisions,
                 )
 
-            # P2.4: ε5 Multi-fidelity 早停检查
-            # 从 TrainOutput.training 提取 epoch 级中间值
-            # P5 P2-7 阶段2：training 现在是 TrainingSummary dataclass，用属性访问
+            # P1.1 Multi-fidelity 实时早停修复
+            # 旧路径（事后剪枝）：训练完整跑完 → 调 pruner.should_prune → 标记 PRUNED
+            # 新路径（实时早停）：训练中 pruner 已通过 IntermediateMetricLogger 触发
+            #   trainer.should_stop=True 提前终止，stage_export 将 ctx.pruned/pruned_epoch
+            #   投影到 train_output.training.pruned/pruned_epoch。MethodRunner 只需读取。
+            # 兼容性：若 training.pruned 不存在（旧 TrainOutput），回退到事后剪枝检查。
             training = train_output.training
             if training is not None and hasattr(training, "intermediate_values"):
                 intermediate_values: Dict[int, float] = dict(training.intermediate_values)
@@ -320,8 +342,13 @@ class MethodRunner:
             else:
                 intermediate_values = {}
 
-            should_prune = False
-            if self.pruner is not None and intermediate_values:
+            # 读取实时剪枝状态（P1.1 新路径）
+            real_time_pruned = bool(getattr(training, "pruned", False)) if training is not None else False
+
+            # 兼容旧路径：若 pruner 注入但实时剪枝未触发（如 Lightning 版本不支持
+            # trainer.should_stop），回退到事后剪枝检查
+            should_prune = real_time_pruned
+            if not should_prune and self.pruner is not None and intermediate_values:
                 # rung = 最后一个 epoch（已收集到的最高 fidelity）
                 rung = max(intermediate_values.keys())
                 try:
@@ -344,6 +371,9 @@ class MethodRunner:
                         "model_path": train_output.model_path,
                         "final_eval": train_output.final_eval,
                         "pruned": True,
+                        # P1.1: 实时剪枝元数据（供 SP/Agent 区分剪枝来源）
+                        "pruned_epoch": getattr(training, "pruned_epoch", None) if training else None,
+                        "real_time_pruned": real_time_pruned,
                     },
                 )
                 status = TrialStatus.PRUNED
