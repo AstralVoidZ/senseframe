@@ -15,6 +15,7 @@
 7. [长 epoch 训练的日志频率陷阱](#7-长-epoch-训练的日志频率陷阱)
 8. [SP 搜索 vs 固定配置：上限数据集上难显优势](#8-sp-搜索-vs-固定配置上限数据集上难显优势)
 9. [GridSampler 全网格爆炸：n_trials 必须显式限制](#9-gridsampler-全网格爆炸n_trials-必须显式限制)
+10. [B5/B6 跨场景迁移的双层架构对齐缺失](#10-b5b6-跨场景迁移的双层架构对齐缺失)
 
 ---
 
@@ -548,6 +549,142 @@ elif p.type == "categorical" and p.choices:
 | C5 完成时间 | 预估 4 小时（192 trial） | 30 分钟（24 trial） |
 | C5 best_params 类型 | 与 C4 不一致（int） | 仍与 C4 不一致（待修复 2 落地） |
 | C5 val_acc vs C4 | 91.40% < 100% | 同（n_trials=24 限制下未覆盖最优 adapter） |
+
+---
+
+## 10. B5/B6 跨场景迁移的双层架构对齐缺失
+
+### 现象
+
+10.4 跨场景迁移评估 B5/B6 设计意图：
+
+| 实验 | pretrain | target | finetune | 设计意图 |
+|---|---|---|---|---|
+| B4 | none | PhysioNet_MI | scratch | EEG baseline（无预训练） |
+| B5 | csi_4datasets | PhysioNet_MI | lora | CSI MAE 预训练 → EEG LoRA 微调 |
+| B6 | csi_4datasets | PhysioNet_MI | full | CSI MAE 预训练 → EEG 全量微调 |
+
+B4 baseline 已跑通（val_acc=59.09%, 5 epoch, CPU），但 B5/B6 启动后实际行为与设计意图**完全不符**：
+
+- B5 实际行为 = "EEG scratch + LoRA"（用 EEG input_shape 构建 backbone + EEG 数据训练 + LoRA 微调）
+- B6 实际行为 = "EEG scratch + Full"（同上，但 Full 微调）
+- **CSI MAE 预训练完全没发生**，"跨场景迁移"退化为"同场景 scratch"
+
+通过标准 `B5 val_acc > B4 + 3%` 在当前实现下毫无意义：B5 与 B4 用同样的 backbone 结构、同样的数据集，只是微调方法不同（LoRA vs scratch），无法验证 CSI→EEG 的迁移增益。
+
+### 根因
+
+**根因 1：pretrain_source 是字符串标签，未驱动真实跨数据集预训练**
+
+[scripts/p3_eval_common.py:run_single_experiment](../scripts/p3_eval_common.py) 的预训练逻辑（line 773-847）：
+
+```python
+if is_csi:
+    if config.pretrain_source == "csi_4datasets":
+        bundle = _load_csi_dataset(config.target_dataset, data_root, ...)
+        pretrain_ds = train_ds  # ← 用 target_dataset 自己做预训练！
+elif is_eeg:
+    pretrain_ds = None  # ← EEG 分支直接置 None，跳过 MAE 预训练
+    # 注释："EEG 预训练待 RadioML 就绪后扩展"
+
+# 后续：
+if config.pretrain_source != "none" and pretrain_ds is not None:
+    backbone.pretrain(pretrain_loader, pretrain_cfg)
+    # CSI 分支：在 target_dataset 上做 MAE 预训练（同数据集预训练）
+    # EEG 分支：pretrain_ds=None，跳过预训练
+```
+
+`pretrain_source="csi_4datasets"` 在 CSI 分支被解释为"用 target_dataset 自己做预训练"（同数据集预训练，不是跨数据集），在 EEG 分支被解释为"跳过预训练"。两个分支都没实现"在 CSI 数据集上预训练 → 在 EEG 数据集上微调"的真正跨场景迁移。
+
+**根因 2：CSIPatchEmbedder 维度由 input_shape 决定，跨模态不兼容**
+
+[senseframe/scenes/wifi_csi/foundation_model.py:CSIPatchEmbedder](../senseframe/scenes/wifi_csi/foundation_model.py)：
+
+```python
+class CSIPatchEmbedder(nn.Module):
+    def __init__(self, input_shape, patch_len, d_model):
+        C, L = input_shape
+        self.proj = nn.Linear(patch_len * C, d_model)  # ← 维度由 patch_len * C 决定
+```
+
+不同模态的 input_shape 与 patch_len * C：
+
+| 模态 | 数据集 | input_shape (C, L) | patch_len | patch_len * C |
+|---|---|---|---|---|
+| CSI | NTU-Fi_HAR | (342, 2000) | 20 | **6,840** |
+| CSI | Widar | (22, 400) | 20 | 440 |
+| EEG | PhysioNet_MI | (64, 480) | 20 | **1,280** |
+| Radio | RadioML2018 | (2, 1024) | 16 | 32 |
+
+CSI NTU-Fi_HAR 的 patch_embedder.proj 权重形状 `(128, 6840)`，EEG PhysioNet_MI 的 patch_embedder.proj 权重形状 `(128, 1280)`。**直接迁移 backbone 时，patch_embedder.proj 的输入维度不匹配，无法复用预训练权重**。
+
+transformer encoder + pos_embed + decoder 这些模块是 modality-agnostic 的（只依赖 d_model 和 n_patches），可以跨模态迁移。但 patch_embedder 是 modality-specific 的，必须替换或对齐。
+
+### 方案设计
+
+#### 方案 A：替换 patch_embedder + 保留 transformer 主体（推荐）
+
+最小改动、文献标准的跨模态迁移做法：
+
+```python
+# B5/B6 流程：
+# 1. 用 CSI 数据集构建 backbone 并 MAE 预训练
+csi_config = CSI_DATASET_CONFIG["NTU-Fi_HAR"]
+backbone = _build_backbone(csi_config, d_model=128)
+backbone.pretrain(csi_pretrain_loader, pretrain_cfg)
+
+# 2. 替换 patch_embedder 为 EEG 维度（保留 transformer encoder + decoder + pos_embed 主体）
+eeg_config = EEG_DATASET_CONFIG["PhysioNet_MI"]
+backbone.replace_patch_embedder(
+    new_input_shape=eeg_config["input_shape"],
+    new_patch_len=eeg_config["patch_len"],
+)  # 重新初始化 patch_embedder.proj + pos_embed
+
+# 3. 在 EEG 数据上构建 PEFT 模型 + 微调
+peft_model = _build_peft_model(backbone, "lora", ...)
+# LoRA 注入到 transformer encoder 的 query/value（modality-agnostic），
+# 不影响新初始化的 patch_embedder（patch_embedder 跟着 PEFT 冻结策略走）
+```
+
+需要在 [CSIFoundationModel](../senseframe/scenes/wifi_csi/foundation_model.py) 上新增 `replace_patch_embedder(new_input_shape, new_patch_len)` 方法：
+- 重新构建 `self.patch_embedder = CSIPatchEmbedder(new_input_shape, new_patch_len, self.d_model)`
+- 重新初始化 `self.pos_embed = nn.Parameter(torch.empty(1, new_n_patches, d_model))`（n_patches 变了）
+- 保留 `self.encoder` / `self.encoder_norm` / `self.decoder_embed` / `self.decoder` / `self.decoder_norm` / `self.mask_token`（modality-agnostic）
+
+#### 方案 B：modality-specific patch embedder 多分支
+
+在 CSIFoundationModel 中维护 `patch_embedders: Dict[str, CSIPatchEmbedder]`，forward 时按 `modality` 参数选择。
+
+- 优点：单一 backbone 支持多模态推理，迁移时不需要替换模块
+- 缺点：backbone 需要知道所有模态的 input_shape，增加配置复杂度；多模态混合 batch 训练需要额外对齐逻辑
+- 适用：未来 SenseFrame 多模态统一推理场景
+
+#### 方案 C：通用 modality adapter
+
+在 patch_embedder 之前加一个 modality adapter，把不同 C 的输入投影到统一维度（如 64），再走单一 patch_embedder。
+
+- 优点：patch_embedder 维度固定，backbone 完全 modality-agnostic
+- 缺点：modality adapter 引入额外参数 + 训练阶段（adapter 需要先训练）；与 MAE 预训练流程耦合（adapter 也要预训练）
+- 适用：模态差异大、需要可学习对齐的场景
+
+**推荐方案 A**：最小改动 + 文献标准 + 易于验证（B5 vs B4 的增益直接反映 CSI→EEG 迁移价值）。
+
+### 防御性建议
+
+- **`pretrain_source` 应是可执行的预训练数据集名，而非字符串标签**：当前 `pretrain_source="csi_4datasets"` 只是标签，实际预训练数据由 `target_dataset` 决定。建议改为 `pretrain_source="NTU-Fi_HAR"`（具体数据集名）或 `pretrain_source="csi_aggregated"`（聚合数据集名），并在 run_single_experiment 中显式加载 pretrain_dataset（独立于 target_dataset）
+- **跨模态迁移应在 backbone 层暴露 `replace_patch_embedder` API**：当前 `CSIPatchEmbedder` 是 `CSIFoundationModel` 的私有属性，外部无法替换。应在 `CSIFoundationModel` 上暴露 `replace_patch_embedder(new_input_shape, new_patch_len)` 方法，封装 patch_embedder 重建 + pos_embed 重新初始化逻辑
+- **CI 应有 B5/B6 配置一致性检查**：grep `CROSS_DOMAIN_EXPERIMENTS` 中 `pretrain != "none"` 且 `target` 跨模态的实验，CI 检查 run_single_experiment 是否真正加载 pretrain 数据集（而非 target_dataset 自己）。可静态检查：若 `is_eeg and pretrain_source.startswith("csi")`，则 pretrain_ds 必须从 CSI_DATASET_CONFIG 加载，不能是 None
+- **跨场景迁移结果应记录 backbone 迁移细节**：ExperimentResult 应增加 `transferred_modules` 字段（如 `["encoder", "decoder", "pos_embed"]`）和 `reinitialized_modules` 字段（如 `["patch_embedder", "pos_embed"]`），便于分析"哪些模块迁移有效"
+- **B5/B6 验证应避开"上限数据集"陷阱**（教训 8）：PhysioNet_MI 5 受试者 225 样本 / 2 类，B4 baseline val_acc=59.09%（接近随机猜 50%），有充足提升空间，是验证 CSI→EEG 迁移价值的正确场景
+
+### 验证效果
+
+| 检查项 | 当前状态 | 方案 A 落地后预期 |
+|---|---|---|
+| B5 是否真跑 CSI→EEG 迁移 | ✗（EEG scratch + LoRA） | ✓（CSI MAE 预训练 → 替换 patch_embedder → EEG LoRA 微调） |
+| B6 是否真跑 CSI→EEG 迁移 | ✗（EEG scratch + Full） | ✓（CSI MAE 预训练 → 替换 patch_embedder → EEG Full 微调） |
+| B5 vs B4 增益是否反映迁移价值 | ✗（仅反映 LoRA vs scratch 差异） | ✓（反映 CSI 预训练对 EEG 的迁移增益） |
+| backbone 跨模态权重复用 | ✗（每次重新构建） | ✓（transformer encoder + decoder 迁移，patch_embedder 替换） |
 
 ---
 
