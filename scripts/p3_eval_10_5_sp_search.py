@@ -141,12 +141,17 @@ def main():
                 error=str(e),
             ))
 
-    # 汇总
+    # 汇总（dry-run 不覆盖真实结果文件）
     output_path = Path(args.output_dir) / "10_5_sp_search_results.json"
-    aggregated = aggregate_results(results, output_path)
-    print(f"\n=== 汇总 ===")
-    print(f"结果数: {len(aggregated)}")
-    print(f"输出: {output_path}")
+    if args.dry_run:
+        print(f"\n=== 汇总（dry-run，跳过写入 {output_path}）===")
+        print(f"结果数: {len(results)}")
+        aggregated = [r.to_dict() for r in results]
+    else:
+        aggregated = aggregate_results(results, output_path)
+        print(f"\n=== 汇总 ===")
+        print(f"结果数: {len(aggregated)}")
+        print(f"输出: {output_path}")
 
     # 搜索有效性计算
     if not args.dry_run and len(results) >= 4:

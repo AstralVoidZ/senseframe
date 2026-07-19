@@ -295,13 +295,18 @@ def _load_csi_dataset(dataset_name: str, data_root: str, learning_mode: str = "s
 
 
 def _load_eeg_dataset(dataset_name: str, data_root: str):
-    """加载 EEG 数据集（直接用 Dataset 类，不走 scene API）。"""
+    """加载 EEG 数据集（直接用 Dataset 类，不走 scene API）。
+
+    PhysioNet_MI：subjects=None 让 Dataset 自动跳过不存在的受试者目录，
+    支持完整 109 受试者 / 5 受试者子集 / 任意规模下载。
+    """
     from senseframe.scenes.eeg.datasets import (
         PhysioNetEegmmidbDataset,
         BCICompetitionIV2aDataset,
     )
     if dataset_name == "PhysioNet_MI":
-        full_ds = PhysioNetEegmmidbDataset(root=data_root, subjects=list(range(1, 11)))
+        # subjects=None：Dataset 内部默认 1-109，自动跳过不存在的目录
+        full_ds = PhysioNetEegmmidbDataset(root=data_root, subjects=None)
     elif dataset_name == "BCI_Competition_IV_2a":
         full_ds = BCICompetitionIV2aDataset(root=data_root)
     else:
@@ -1041,7 +1046,10 @@ SP_SEARCH_EXPERIMENTS: List[Dict[str, Any]] = [
 ]
 
 # 10.5 评估数据集
-SP_SEARCH_DATASETS: List[str] = ["NTU-Fi_HAR", "RadioML2018", "PhysioNet_MI"]
+# - NTU-Fi_HAR: 上限数据集（A1=100%），SP 搜索价值无法体现（教训 8）
+# - Widar: 非上限数据集（A1=69.73%），SP 搜索有真实提升空间
+# - RadioML2018 / PhysioNet_MI: 待数据集就绪后启用
+SP_SEARCH_DATASETS: List[str] = ["NTU-Fi_HAR", "Widar", "RadioML2018", "PhysioNet_MI"]
 
 
 # ============================================================

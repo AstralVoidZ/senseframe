@@ -104,12 +104,17 @@ def main():
                 error=str(e),
             ))
 
-    # 汇总
+    # 汇总（dry-run 不覆盖真实结果文件）
     output_path = Path(args.output_dir) / "10_4_cross_domain_results.json"
-    aggregated = aggregate_results(results, output_path)
-    print(f"\n=== 汇总 ===")
-    print(f"结果数: {len(aggregated)}")
-    print(f"输出: {output_path}")
+    if args.dry_run:
+        print(f"\n=== 汇总（dry-run，跳过写入 {output_path}）===")
+        print(f"结果数: {len(results)}")
+        aggregated = [r.to_dict() for r in results]
+    else:
+        aggregated = aggregate_results(results, output_path)
+        print(f"\n=== 汇总 ===")
+        print(f"结果数: {len(aggregated)}")
+        print(f"输出: {output_path}")
 
     # 迁移增益计算
     if not args.dry_run and len(results) >= 2:

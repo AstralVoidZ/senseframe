@@ -133,12 +133,17 @@ def main():
                 error=str(e),
             ))
 
-    # 汇总
+    # 汇总（dry-run 不覆盖真实结果文件）
     output_path = Path(args.output_dir) / "10_2_single_scene_results.json"
-    aggregated = aggregate_results(results, output_path)
-    print(f"\n=== 汇总 ===")
-    print(f"结果数: {len(aggregated)}")
-    print(f"输出: {output_path}")
+    if args.dry_run:
+        print(f"\n=== 汇总（dry-run，跳过写入 {output_path}）===")
+        print(f"结果数: {len(results)}")
+        aggregated = [r.to_dict() for r in results]
+    else:
+        aggregated = aggregate_results(results, output_path)
+        print(f"\n=== 汇总 ===")
+        print(f"结果数: {len(aggregated)}")
+        print(f"输出: {output_path}")
 
     # 通过标准检查（仅 dry_run=False 时有意义）
     if not args.dry_run:
