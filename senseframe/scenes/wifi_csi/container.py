@@ -261,8 +261,13 @@ class WiFiCSIContainer(SceneContainer):
         """CSI 场景的 HPO 搜索空间。
 
         Phase 9.2：通过 **kwargs 接收上下文，符合 LSP。
+        v2 差距 1 修复（2026-07-22）：暴露 optimizer/scheduler/epochs/gradient_clip_val/
+        early_stopping，让 HPO 可搜索 ML 关键参数。apply_params 已支持覆盖这些字段
+        （_TRAINER_FIELDS = _get_field_names(_TrainerConfig)），此为"最后一公里"。
         """
+        from ...engine.config import SUPPORTED_OPTIMIZERS, SUPPORTED_SCHEDULERS
         return SearchSpace(params={
+            # 原有参数
             "learning_rate": {
                 "type": "float", "low": 1e-5, "high": 1e-2, "log": True,
             },
@@ -271,6 +276,26 @@ class WiFiCSIContainer(SceneContainer):
             },
             "weight_decay": {
                 "type": "float", "low": 1e-6, "high": 1e-3, "log": True,
+            },
+            # v2 差距 1：ML 关键参数激活
+            "optimizer": {
+                "type": "categorical",
+                "values": list(SUPPORTED_OPTIMIZERS),
+            },
+            "scheduler": {
+                "type": "categorical",
+                "values": list(SUPPORTED_SCHEDULERS),  # 含 None
+            },
+            "epochs": {
+                "type": "int", "low": 10, "high": 200,
+            },
+            "gradient_clip_val": {
+                "type": "categorical",
+                "values": [None, 0.5, 1.0, 5.0],  # None=不裁剪
+            },
+            "early_stopping": {
+                "type": "categorical",
+                "values": [None, 5, 10, 20],  # None=不启用早停
             },
         })
 

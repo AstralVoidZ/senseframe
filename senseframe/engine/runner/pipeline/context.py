@@ -129,6 +129,7 @@ _FIELD_FILL_STAGE: Dict[str, str] = {
     "output_dir": "stage_load",
     "log_writer": "stage_load",
     "data_hash": "stage_load",  # 任务2：数据集元数据哈希（路径+大小+mtime）
+    "pretrain_checkpoint": "stage_load",  # v2 差距 3：预训练 checkpoint 路径（scene.params.pretrain_source 触发）
     # stage_build
     "model": "stage_build",
     "datamodule": "stage_build",
@@ -238,6 +239,8 @@ class PipelineContext:
     log_writer: Optional[IncrementalLogWriter] = None
     # 任务2：数据集元数据哈希（stage_load 计算，_generate_manifest 写入 manifest）
     data_hash: str = ""
+    # v2 差距 3：预训练 checkpoint 路径（stage_load 写入，scene.params.pretrain_source 触发）
+    pretrain_checkpoint: Optional[str] = None
     csv_logger: Optional["LoggerProtocol"] = None  # P2.1: pl.Logger 实例（LoggerProtocol 契约）
     report: Optional["ResourceReport"] = None
     route_level: str = ""

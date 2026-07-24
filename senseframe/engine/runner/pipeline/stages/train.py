@@ -114,6 +114,129 @@ def _fit_with_oom_fallback(
         return trainer
 
 
+# ============================================================
+# v2 差距 2+3：DANN 训练分支（沉淀自 scripts/p3_eval_common.py:858 _train_dann）
+# ============================================================
+def _should_use_dann(scene_params) -> bool:
+    """判断是否启用 DANN 训练分支。
+
+    Args:
+        scene_params: SceneParams 实例或 None
+
+    Returns:
+        True 当 scene.params.use_dann=True 时；False 否则
+    """
+    if scene_params is None:
+        return False
+    return bool(scene_params.get("use_dann", False))
+
+
+def _train_dann_loop(
+    ctx: "PipelineContext",
+    epochs: int,
+    learning_rate: float,
+) -> None:
+    """DANN 训练循环：任务分类 + 模态对抗对齐。
+
+    沉淀自 scripts/p3_eval_common.py:858 _train_dann，适配主 Pipeline context。
+
+    设计：双 loss 训练（task_loss + disc_loss），λ 调度按 Ganin & Lempitsky 2015。
+    与 Lightning Trainer 单 loss fit 不兼容，故走独立循环。
+
+    Args:
+        ctx: PipelineContext（含 model/datamodule/lightning_params/scene_kwargs）
+        epochs: 训练 epoch 数
+        learning_rate: 学习率
+    """
+    import itertools
+    import torch.nn.functional as F
+    from sklearn.metrics import f1_score
+
+    from .....scenes.wifi_csi.dann import dann_lambda_schedule
+
+    device = torch.device(
+        "cuda" if (ctx.lightning_params or {}).get("accelerator") == "cuda" else "cpu"
+    )
+    model = ctx.model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    # 数据加载：EEG 任务集 + CSI 对抗集
+    train_loader = ctx.datamodule.train_dataloader()
+    val_loader = ctx.datamodule.val_dataloader()
+    # CSI 对抗信号：从 scene_kwargs.csi_loader 获取（stage_load 注入），无则跳过对抗
+    csi_loader = ctx.scene_kwargs.get("csi_loader") if ctx.scene_kwargs else None
+    csi_iter = itertools.cycle(csi_loader) if csi_loader is not None else None
+
+    best_val_acc = 0.0
+
+    for epoch in range(epochs):
+        # λ 调度（Ganin & Lempitsky 2015：λ = 2/(1+exp(-10*p))-1）
+        lambda_ = dann_lambda_schedule(epoch, epochs)
+
+        model.train()
+        for batch in train_loader:
+            if isinstance(batch, (list, tuple)):
+                x_eeg, y_eeg = batch[0], batch[1]
+            else:
+                continue
+            x_eeg = x_eeg.to(device).float()
+            y_eeg = y_eeg.to(device).long()
+
+            # CSI 对抗信号
+            x_csi = None
+            if csi_iter is not None:
+                csi_batch = next(csi_iter)
+                if isinstance(csi_batch, (list, tuple)):
+                    x_csi = csi_batch[0].to(device).float()
+
+            # DANN forward：返回 (logits, disc_loss)
+            # disc_loss 在 model 内部已计算（CSI=0, EEG=1 的模态分类 CE）
+            logits, disc_loss = model(x_eeg, x_csi, lambda_)
+            task_loss = F.cross_entropy(logits, y_eeg)
+
+            total_loss = task_loss
+            if disc_loss is not None:
+                total_loss = total_loss + disc_loss
+
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+
+        # 验证（仅 task 分类，无对抗）
+        model.eval()
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                if isinstance(batch, (list, tuple)):
+                    x, y = batch[0], batch[1]
+                else:
+                    continue
+                x = x.to(device).float()
+                y = y.to(device).long()
+                # 验证时 x_csi=None, lambda_=0（不触发对抗路径）
+                logits, _ = model(x, None, 0.0)
+                all_preds.extend(logits.argmax(dim=-1).cpu().numpy().tolist())
+                all_labels.extend(y.cpu().numpy().tolist())
+
+        val_acc = sum(p == l for p, l in zip(all_preds, all_labels)) / max(len(all_labels), 1)
+        macro_f1 = float(f1_score(all_labels, all_preds, average="macro", zero_division=0))
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+
+        _logger.info(
+            "DANN epoch %d/%d: λ=%.4f, val_acc=%.4f, macro_f1=%.4f",
+            epoch + 1, epochs, lambda_, val_acc, macro_f1,
+        )
+
+    # 写回 ctx（与 Lightning 路径对齐）
+    ctx.best_model_score = best_val_acc
+    ctx.best_model_path = None  # DANN 无 Lightning checkpoint
+    ctx.best_epoch = None  # DANN 无 Lightning checkpoint 概念
+    ctx.pruned = False
+    ctx.pruned_epoch = None
+
+
 @stage(
     name="train",
     reads=["config", "model", "datamodule", "module", "callbacks",
@@ -214,6 +337,36 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
         ctx.best_epoch = None  # 任务1：dry-run 无训练，best_epoch 置 None
         _logger.info(
             "stage_train dry-run: skipped trainer.fit(), forward validation done"
+        )
+        return ctx
+
+    # v2 差距 2+3：DANN 训练分支（use_dann=True 时走独立循环，不走 Lightning Trainer）
+    if _should_use_dann(ctx.config.scene.params):
+        _logger.info(
+            "stage_train: DANN branch activated (use_dann=True), "
+            "bypassing Lightning Trainer"
+        )
+        timer = Timer("training_dann")
+        timer.__enter__()
+        try:
+            _train_dann_loop(
+                ctx=ctx,
+                epochs=_epochs,
+                learning_rate=_lr or ctx.config.trainer.learning_rate or 1e-3,
+            )
+        finally:
+            timer.__exit__(None, None, None)
+        ctx.training_duration_s = round(timer.elapsed, 2)
+        # Critical #1：DANN 路径无 Lightning Trainer，ctx.trainer 保持 None。
+        # 写入 final_eval 供 stage_eval 使用（stage_eval 检测 ctx.trainer is None
+        # 时跳过 trainer.validate/test，使用此处的 final_eval 计算 feedback）。
+        ctx.final_eval = {"val_accuracy": float(ctx.best_model_score)} if ctx.best_model_score is not None else {}
+        # Important #2：与 Lightning 路径对齐，冻结 intermediate_values 防止
+        # stage_eval 的 trainer.validate() 触发 IntermediateMetricLogger 写入。
+        ctx.intermediate_values = FrozenDict(ctx.intermediate_values)
+        _logger.info(
+            "intermediate_values frozen with %d entries after DANN stage_train",
+            len(ctx.intermediate_values),
         )
         return ctx
 

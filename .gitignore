@@ -2,8 +2,9 @@
 CSI_DATASETS/
 data/
 
-# 开发文档暂时屏蔽
+# 开发文档（阶段 3 迁移后纳入版本控制）
 docs/
+openspec/
 
 # 训练输出与测试结果
 runs/
@@ -18,7 +19,7 @@ benchmarks/report_*.json
 # 推理产物
 models/
 result/
-eval.py
+/eval.py
 
 # HPO 持久化数据库
 *.db
@@ -78,6 +79,7 @@ coverage.xml
 .project
 .classpath
 .settings/
+AGENTS.md
 
 # 日志与临时文件
 *.log

@@ -1,6 +1,7 @@
 """Stage 3: 加载数据 + 数据画像。"""
 from __future__ import annotations
 
+import glob
 import os
 from datetime import datetime
 from pathlib import Path
@@ -46,12 +47,105 @@ def _compute_data_hash(data_root: str) -> str:
     return sha256_str("\n".join(entries))
 
 
+# ============================================================
+# v2 差距 3：pretrain_checkpoint 加载（沉淀自 scripts/p3_eval_common.py:454）
+# ============================================================
+# CSI/EEG/Radio 数据集配置（用于跨模态预训练数据集解析）
+_CSI_DATASETS = {"UT_HAR_data", "NTU-Fi_HAR", "NTU-Fi-HumanID", "Widar"}
+_EEG_DATASETS = {"PhysioNet_MI", "BCI_Competition_IV_2a"}
+_RADIO_DATASETS = {"RadioML2018"}
+
+
+def _resolve_pretrain_source(pretrain_source: str, target_dataset: str) -> str | None:
+    """解析 pretrain_source 到具体预训练数据集名。
+
+    沉淀自 scripts/p3_eval_common.py:454 _resolve_pretrain_dataset。
+
+    映射规则：
+    - "none" → None（无预训练）
+    - "csi_4datasets" + target 是 EEG/Radio → "NTU-Fi_HAR"（跨模态默认）
+    - "csi_4datasets" + target 是 CSI → target_dataset（同模态）
+    - "radioml" → "RadioML2018"
+    - "eegmmidb" → "PhysioNet_MI"
+    - 显式数据集名 → 直接返回
+    - 未知 → None（fallback）
+    """
+    if pretrain_source == "none" or not pretrain_source:
+        return None
+
+    if pretrain_source == "csi_4datasets":
+        if target_dataset in _EEG_DATASETS or target_dataset in _RADIO_DATASETS:
+            return "NTU-Fi_HAR"
+        return target_dataset
+
+    if pretrain_source == "radioml":
+        return "RadioML2018"
+
+    if pretrain_source == "eegmmidb":
+        return "PhysioNet_MI"
+
+    # 显式数据集名
+    if (pretrain_source in _CSI_DATASETS
+            or pretrain_source in _EEG_DATASETS
+            or pretrain_source in _RADIO_DATASETS):
+        return pretrain_source
+
+    _logger.warning(
+        "Unknown pretrain_source=%s, treating as 'none'. "
+        "Valid: none/csi_4datasets/radioml/eegmmidb/<dataset_name>",
+        pretrain_source,
+    )
+    return None
+
+
+def _load_pretrain_checkpoint(
+    pretrain_dataset_name: str,
+    output_dir,
+) -> str | None:
+    """加载预训练数据集的 checkpoint 路径。
+
+    沉淀自 scripts/p3_eval_common.py:507 _load_pretrain_dataset（简化版）。
+
+    Args:
+        pretrain_dataset_name: 预训练数据集名
+        output_dir: 输出目录（用于查找已有 checkpoint）
+
+    Returns:
+        checkpoint 路径，或 None（无可用 checkpoint）
+    """
+    # 在 output_dir/runs/ 下查找已训练的 pretrain checkpoint
+    checkpoint_dir = Path(output_dir) / "runs" if output_dir else Path("runs")
+    if not checkpoint_dir.exists():
+        _logger.info(
+            "pretrain checkpoint dir not found: %s, skipping pretrain load",
+            checkpoint_dir,
+        )
+        return None
+
+    # 查找匹配数据集名的 checkpoint（glob.escape 防御数据集名中的特殊字符）
+    candidates = list(checkpoint_dir.glob(f"*{glob.escape(pretrain_dataset_name)}*.ckpt"))
+    if not candidates:
+        _logger.info(
+            "no pretrain checkpoint found for dataset=%s in %s",
+            pretrain_dataset_name, checkpoint_dir,
+        )
+        return None
+
+    # 取最新的
+    checkpoint_path = max(candidates, key=lambda p: p.stat().st_mtime)
+    _logger.info(
+        "pretrain checkpoint loaded: %s (dataset=%s)",
+        checkpoint_path, pretrain_dataset_name,
+    )
+    return str(checkpoint_path)
+
+
 @stage(
     name="load",
     reads=["config", "scene", "dataset", "learning_mode", "output"],
     writes=["scene_kwargs", "bundle", "data_profile", "output_dir", "log_writer",
-            "data_hash"],  # 任务2：新增 data_hash 写入声明
-    description="Stage 3: 加载数据 + 数据画像",
+            "data_hash", "pretrain_checkpoint"],  # v2 差距 3：新增 pretrain_checkpoint
+    description="Stage 3: 加载数据 + 数据画像 + 预训练 checkpoint",
 )
 def stage_load(ctx: PipelineContext) -> PipelineContext:
     """Stage 3: 加载数据 + 数据画像。"""
@@ -77,6 +171,25 @@ def stage_load(ctx: PipelineContext) -> PipelineContext:
         ctx.dataset, data_root, learning_mode=ctx.learning_mode,
         **ctx.scene_kwargs,
     )
+
+    # v2 差距 3：pretrain_checkpoint 加载（scene.params.pretrain_source 触发）
+    pretrain_source = None
+    if ctx.config.scene.params:
+        pretrain_source = ctx.config.scene.params.get("pretrain_source")
+    if pretrain_source and pretrain_source != "none":
+        pretrain_dataset = _resolve_pretrain_source(pretrain_source, ctx.dataset)
+        if pretrain_dataset:
+            ctx.pretrain_checkpoint = _load_pretrain_checkpoint(
+                pretrain_dataset, ctx.config.output_dir,
+            )
+            _logger.info(
+                "stage_load: pretrain_source=%s → dataset=%s, checkpoint=%s",
+                pretrain_source, pretrain_dataset, ctx.pretrain_checkpoint,
+            )
+        else:
+            ctx.pretrain_checkpoint = None
+    else:
+        ctx.pretrain_checkpoint = None
 
     # 任务2：计算 data_hash（数据集元数据哈希）。
     # 不读取文件内容做全量 hash，只 hash 元数据（路径+大小+mtime），
