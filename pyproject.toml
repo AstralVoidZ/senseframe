@@ -88,12 +88,19 @@ otel = [
 # 开发工具：测试 + 类型检查 + 文档
 dev = [
     "pytest>=7.0.0",
+    'tomli>=2.0.0; python_version < "3.11"',
 ]
 
 # 全部可选依赖一键安装
 all = [
     "senseframe[eeg,radio,onnx,otel,dev]",
 ]
+
+# ============================================================
+# console_scripts：注册 senseframe 命令（v2 次要差距修复）
+# ============================================================
+[project.scripts]
+senseframe = "senseframe.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/senseframe/senseframe"

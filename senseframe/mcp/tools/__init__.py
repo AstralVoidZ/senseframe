@@ -9,7 +9,7 @@
 - skill.py：senseframe_skill_* 工具组（4 个 tool，阶段 4.3）
 """
 
-from senseframe.mcp.tools import _errors, artifact, pipeline, skill
+from senseframe.mcp.tools import _errors, artifact, config, pipeline, skill
 from senseframe.mcp.tools.skill import (
     senseframe_skill_get,
     senseframe_skill_remove,
@@ -20,6 +20,7 @@ from senseframe.mcp.tools.skill import (
 __all__ = [
     "_errors",
     "artifact",
+    "config",
     "pipeline",
     "skill",
     "senseframe_skill_save",

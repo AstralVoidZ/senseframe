@@ -11,6 +11,8 @@ hpo_setup + exploration_recommend + automl_* 4 个 + apply_params_extended），
 senseframe_artifact_list / senseframe_artifact_export。
 阶段 4.3：senseframe_skill_save / senseframe_skill_remove 升级为真实 handler，
 新增 senseframe_skill_get / senseframe_skill_search。
+阶段 6（v2 次要差距修复）：senseframe_config_parse stub 升级为真实 handler，
+全部 29 个 tool 已实装。
 
 设计文档 0.3 节定义 29 个 tool（按 ToolAnnotations 矩阵 0.4 节）：
 - 声明类（2）：senseframe_config_parse, senseframe_pipeline_create
@@ -45,6 +47,7 @@ from senseframe.mcp.tools.automl import (
     senseframe_automl_get,
     senseframe_automl_list,
 )
+from senseframe.mcp.tools.config import senseframe_config_parse
 from senseframe.mcp.tools.exploration import senseframe_exploration_recommend
 from senseframe.mcp.tools.hpo import senseframe_hpo_setup
 from senseframe.mcp.tools.param_bridge import senseframe_apply_params_extended
@@ -121,25 +124,13 @@ EXPECTED_TOOLS: tuple[str, ...] = (
 )
 
 
-async def _not_implemented(*args: Any, **kwargs: Any) -> None:
-    """Tool 占位 handler：后续阶段实现具体业务逻辑。
-
-    当前阶段未实现的 tool：
-    - senseframe_config_parse（将在 config_parse 阶段实现）
-    """
-    raise NotImplementedError(
-        "senseframe_mcp tool implementation pending in phase 4+"
-    )
-
-
 # Tool 注册表：(name, description, handler_function)。
-# 本阶段（4.3）已实现 28 个 tool 的真实 handler，剩余 1 个仍为 stub
-# （config_parse）。
+# 全部 29 个 tool 已实装（v2 次要差距修复：config_parse stub 升级为真实 handler）。
 _TOOL_REGISTRY: list[tuple[str, str, Callable[..., Any]]] = [
     (
         "senseframe_config_parse",
         "Parse YAML config string into ExperimentConfig (with extra='forbid' validation).",
-        _not_implemented,
+        senseframe_config_parse,  # v2 次要差距修复：实装，替换 _not_implemented
     ),
     (
         "senseframe_pipeline_create",
