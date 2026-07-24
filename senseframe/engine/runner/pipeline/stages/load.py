@@ -5,6 +5,10 @@ import glob
 import os
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch.utils.data import DataLoader
 
 from ..context import PipelineContext, _logger
 from ..stage_spec import stage
@@ -140,6 +144,52 @@ def _load_pretrain_checkpoint(
     return str(checkpoint_path)
 
 
+def _build_csi_adversarial_loader(
+    csi_dataset_name: str,
+    data_root: str,
+    batch_size: int,
+) -> "DataLoader | None":
+    """构造 CSI val 集 DataLoader（DANN 对抗信号）。
+
+    沉淀自 scripts/p3_eval_common.py:551-588 _load_csi_dataset_val。
+
+    设计原则（脚本 line 558-560）：DANN 对抗信号必须用"未参与预训练"的数据
+    （val/test 集），否则判别器对预训练分布过拟合。
+
+    Args:
+        csi_dataset_name: CSI 数据集名（如 "NTU-Fi_HAR"）
+        data_root: 数据根目录
+        batch_size: batch 大小（从 config.trainer.batch_size 读取）
+
+    Returns:
+        DataLoader 实例，或 None（加载失败时降级，不中断 pipeline）
+    """
+    from torch.utils.data import DataLoader
+
+    # 用 WiFiCSIContainer 加载 CSI 数据集（框架级 scene 抽象）
+    try:
+        from .....scenes.wifi_csi.container import WiFiCSIContainer
+        csi_scene = WiFiCSIContainer()
+        csi_bundle = csi_scene.load_dataset(
+            csi_dataset_name, data_root, learning_mode="supervised",
+        )
+        # 优先用 val，fallback test
+        adv_dataset = csi_bundle.val if csi_bundle.val is not None else csi_bundle.test
+        if adv_dataset is None:
+            _logger.warning(
+                "csi_adversarial_loader: dataset=%s has no val/test split, "
+                "DANN adversarial branch will be skipped", csi_dataset_name,
+            )
+            return None
+        return DataLoader(adv_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    except Exception as e:
+        _logger.warning(
+            "csi_adversarial_loader: failed to load CSI dataset=%s: %s, "
+            "DANN adversarial branch will be skipped", csi_dataset_name, e,
+        )
+        return None
+
+
 @stage(
     name="load",
     reads=["config", "scene", "dataset", "learning_mode", "output"],
@@ -174,6 +224,7 @@ def stage_load(ctx: PipelineContext) -> PipelineContext:
 
     # v2 差距 3：pretrain_checkpoint 加载（scene.params.pretrain_source 触发）
     pretrain_source = None
+    pretrain_dataset = None  # 复用，避免下游重复 _resolve_pretrain_source
     if ctx.config.scene.params:
         pretrain_source = ctx.config.scene.params.get("pretrain_source")
     if pretrain_source and pretrain_source != "none":
@@ -190,6 +241,27 @@ def stage_load(ctx: PipelineContext) -> PipelineContext:
             ctx.pretrain_checkpoint = None
     else:
         ctx.pretrain_checkpoint = None
+
+    # HIGH 2 修复：DANN 对抗信号注入（use_dann=True + pretrain_source 解析为 CSI 时）
+    # _train_dann_loop 读 ctx.scene_kwargs.get("csi_loader") 获取对抗信号；
+    # 无注入则 DANN 退化为纯任务分类。仅当解析结果落入 _CSI_DATASETS 时构造 loader。
+    # Important 1 修复：复用 pretrain_dataset（pretrain_dataset 非 None 已隐含
+    # pretrain_source 非空且非 "none"，无需重复 _resolve_pretrain_source）。
+    use_dann = False
+    if ctx.config.scene.params is not None:
+        use_dann = bool(ctx.config.scene.params.get("use_dann", False))
+    if use_dann and pretrain_dataset and pretrain_dataset in _CSI_DATASETS:
+        csi_loader = _build_csi_adversarial_loader(
+            pretrain_dataset,
+            data_root,
+            ctx.config.trainer.batch_size,
+        )
+        if csi_loader is not None:
+            ctx.scene_kwargs["csi_loader"] = csi_loader
+            _logger.info(
+                "stage_load: csi_adversarial_loader injected for DANN "
+                "(dataset=%s)", pretrain_dataset,
+            )
 
     # 任务2：计算 data_hash（数据集元数据哈希）。
     # 不读取文件内容做全量 hash，只 hash 元数据（路径+大小+mtime），

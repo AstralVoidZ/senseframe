@@ -162,6 +162,15 @@ class TestStageTrainDannBranch:
         ctx.model = model
         ctx.datamodule = datamodule
         ctx.scene_kwargs = {}  # csi_loader=None
+        # MEDIUM 5 回归适配：_train_dann_loop 现从 ctx.resolved 读取
+        # optimizer/scheduler/gradient_clip_val/early_stopping，需提供真实 dict
+        ctx.resolved = {
+            "optimizer": "adamw",
+            "weight_decay": 0.0,
+            "scheduler": None,
+            "gradient_clip_val": None,
+            "early_stopping": None,
+        }
 
         _train_dann_loop(ctx=ctx, epochs=2, learning_rate=1e-3)
 

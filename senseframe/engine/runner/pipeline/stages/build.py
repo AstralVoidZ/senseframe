@@ -17,7 +17,7 @@ from ...callbacks import FrozenDict  # noqa: F401 (re-exported for stage_train)
     name="build",
     reads=["config", "scene", "model_id", "dataset", "num_classes", "feature_spec",
            "bundle", "task_spec", "resolved", "output_dir", "scene_info",
-           "route_config", "log_writer", "learning_mode"],
+           "route_config", "log_writer", "learning_mode", "pretrain_checkpoint"],
     writes=["model", "datamodule", "module", "callbacks", "pl_logger", "csv_logger", "monitor"],
     description="Stage 5: 构建模型 / DataModule / LightningModule",
 )
@@ -66,6 +66,32 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
         )
     except Exception as e:
         _logger.debug(f"stage_build: failed to log model info: {e}")
+
+    # HIGH 1 修复：消费 ctx.pretrain_checkpoint（stage_load 产出）
+    # 加载预训练权重到 ctx.model（跨模态迁移用 strict=False）
+    if ctx.pretrain_checkpoint:
+        from .....common.checkpoint import load_checkpoint_flexible
+        try:
+            ckpt_info = load_checkpoint_flexible(
+                ctx.pretrain_checkpoint, ctx.model, strict=False,
+            )
+            _logger.info(
+                "stage_build: pretrain checkpoint loaded from %s "
+                "(format=%s, keys=%d)",
+                ctx.pretrain_checkpoint,
+                ckpt_info.get("source_format", "unknown"),
+                ckpt_info.get("num_keys_loaded", 0),
+            )
+        except FileNotFoundError:
+            _logger.warning(
+                "stage_build: pretrain checkpoint not found: %s, "
+                "training from scratch", ctx.pretrain_checkpoint,
+            )
+        except Exception as e:
+            _logger.warning(
+                "stage_build: failed to load pretrain checkpoint: %s, "
+                "training from scratch. Error: %s", ctx.pretrain_checkpoint, e,
+            )
 
     # metrics
     if ctx.config.scene.task_spec is not None:

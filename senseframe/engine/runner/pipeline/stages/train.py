@@ -143,8 +143,11 @@ def _train_dann_loop(
     设计：双 loss 训练（task_loss + disc_loss），λ 调度按 Ganin & Lempitsky 2015。
     与 Lightning Trainer 单 loss fit 不兼容，故走独立循环。
 
+    MEDIUM 5 修复（2026-07-22）：从 ctx.resolved 读取 optimizer/scheduler/
+    gradient_clip_val/early_stopping，与 Lightning 路径对齐，让 HPO 搜索生效。
+
     Args:
-        ctx: PipelineContext（含 model/datamodule/lightning_params/scene_kwargs）
+        ctx: PipelineContext（含 model/datamodule/resolved/scene_kwargs）
         epochs: 训练 epoch 数
         learning_rate: 学习率
     """
@@ -154,20 +157,44 @@ def _train_dann_loop(
 
     from .....scenes.wifi_csi.dann import dann_lambda_schedule
 
-    device = torch.device(
-        "cuda" if (ctx.lightning_params or {}).get("accelerator") == "cuda" else "cpu"
-    )
+    accelerator = (ctx.lightning_params or {}).get("accelerator")
+    device = torch.device("cuda" if accelerator in ("gpu", "cuda") else "cpu")
     model = ctx.model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    # MEDIUM 5：从 ctx.resolved 读取 optimizer/scheduler/grad_clip/early_stopping
+    resolved = ctx.resolved or {}
+    optimizer_type = resolved.get("optimizer", "adamw")
+    weight_decay = resolved.get("weight_decay", 0.0)
+    scheduler_type = resolved.get("scheduler")
+    gradient_clip_val = resolved.get("gradient_clip_val")
+    early_stopping_patience = resolved.get("early_stopping")
+
+    # 构造 optimizer（dispatch 同 GenericLightningModule.configure_optimizers）
+    if optimizer_type == "adam":
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_type == "sgd":
+        optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9)
+    elif optimizer_type == "rmsprop":
+        optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9)
+    else:  # adamw（默认）
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+    # 构造 scheduler（同 GenericLightningModule.configure_optimizers）
+    scheduler = None
+    if scheduler_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    elif scheduler_type == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(epochs // 3, 1))
 
     # 数据加载：EEG 任务集 + CSI 对抗集
     train_loader = ctx.datamodule.train_dataloader()
     val_loader = ctx.datamodule.val_dataloader()
     # CSI 对抗信号：从 scene_kwargs.csi_loader 获取（stage_load 注入），无则跳过对抗
     csi_loader = ctx.scene_kwargs.get("csi_loader") if ctx.scene_kwargs else None
-    csi_iter = itertools.cycle(csi_loader) if csi_loader is not None else None
+    csi_iter = itertools.cycle(csi_loader) if csi_loader else None
 
     best_val_acc = 0.0
+    no_improve_count = 0  # early stopping 计数
 
     for epoch in range(epochs):
         # λ 调度（Ganin & Lempitsky 2015：λ = 2/(1+exp(-10*p))-1）
@@ -200,6 +227,9 @@ def _train_dann_loop(
 
             optimizer.zero_grad()
             total_loss.backward()
+            # MEDIUM 5：梯度裁剪（与 Lightning Trainer gradient_clip_val 对齐）
+            if gradient_clip_val is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_val)
             optimizer.step()
 
         # 验证（仅 task 分类，无对抗）
@@ -219,15 +249,34 @@ def _train_dann_loop(
                 all_labels.extend(y.cpu().numpy().tolist())
 
         val_acc = sum(p == l for p, l in zip(all_preds, all_labels)) / max(len(all_labels), 1)
-        macro_f1 = float(f1_score(all_labels, all_preds, average="macro", zero_division=0))
+        # 空 val_loader 兜底：sklearn f1_score 不接受空数组，置 0.0
+        if all_labels:
+            macro_f1 = float(f1_score(all_labels, all_preds, average="macro", zero_division=0))
+        else:
+            macro_f1 = 0.0
+
+        # MEDIUM 5：scheduler step（每 epoch 后）
+        if scheduler is not None:
+            scheduler.step()
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
 
         _logger.info(
             "DANN epoch %d/%d: λ=%.4f, val_acc=%.4f, macro_f1=%.4f",
             epoch + 1, epochs, lambda_, val_acc, macro_f1,
         )
+
+        # MEDIUM 5：early stopping（手动实现，监控 val_acc）
+        if early_stopping_patience is not None and no_improve_count >= early_stopping_patience:
+            _logger.info(
+                "DANN early stopping at epoch %d (patience=%d, no improve=%d)",
+                epoch + 1, early_stopping_patience, no_improve_count,
+            )
+            break
 
     # 写回 ctx（与 Lightning 路径对齐）
     ctx.best_model_score = best_val_acc
