@@ -24,6 +24,7 @@ from senseframe.mcp.views.artifact import (
     ArtifactListView,
     ArtifactVerifyResponse,
 )
+from senseframe.mcp.views.config import ConfigParseResponse
 from senseframe.mcp.views.automl import (
     AutoMLAdvanceResponse,
     AutoMLCreateResponse,
@@ -65,6 +66,7 @@ __all__ = [
     "FrozenModel",
     "ViewError",
     "ToolErrorResponse",
+    "ConfigParseResponse",
     "TransitionView",
     "StageView",
     "PipelineRunView",

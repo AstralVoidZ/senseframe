@@ -1,10 +1,11 @@
 """senseframe_config_parse MCP tool 测试。
 
-验证 YAML 配置可解析为 ExperimentConfig（v2 次要差距修复）。
+LOW 8 修复：适配 FrozenModel 响应 + ToolError 错误。
 """
 from __future__ import annotations
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 
 class TestConfigParse:
@@ -58,62 +59,55 @@ unknown_field: should_fail
 
     @pytest.mark.asyncio
     async def test_parse_valid_yaml(self, valid_yaml):
-        """合法 YAML 应返回解析后的 ExperimentConfig dict。"""
+        """合法 YAML 应返回 ConfigParseResponse。"""
         from senseframe.mcp.tools.config import senseframe_config_parse
+        from senseframe.mcp.views.config import ConfigParseResponse
 
         result = await senseframe_config_parse(config_yaml=valid_yaml)
 
-        assert result["status"] == "ok"
-        assert result["config"]["scene"]["name"] == "wifi_csi"
-        assert result["config"]["trainer"]["epochs"] == 50
-        assert "error" not in result
+        assert isinstance(result, ConfigParseResponse)
+        assert result.config["scene"]["name"] == "wifi_csi"
+        assert result.config["trainer"]["epochs"] == 50
 
     @pytest.mark.asyncio
     async def test_parse_invalid_yaml_rejected(self, invalid_yaml_unknown_field):
-        """含未知字段的 YAML 应被 extra='forbid' 拒绝。"""
+        """含未知字段的 YAML 应抛 ToolError。"""
         from senseframe.mcp.tools.config import senseframe_config_parse
 
-        result = await senseframe_config_parse(config_yaml=invalid_yaml_unknown_field)
+        with pytest.raises(ToolError) as exc_info:
+            await senseframe_config_parse(config_yaml=invalid_yaml_unknown_field)
 
-        assert result["status"] == "error"
-        assert result["error_code"] == "CONFIG_VALIDATION_ERROR"
-        assert "unknown_field" in result["error"] or "未知字段" in result["error"]
+        error_msg = str(exc_info.value)
+        assert "unknown_field" in error_msg or "未知字段" in error_msg
 
     @pytest.mark.asyncio
     async def test_parse_malformed_yaml(self):
-        """YAML 语法错误应返回 error。"""
+        """YAML 语法错误应抛 ToolError。"""
         from senseframe.mcp.tools.config import senseframe_config_parse
 
-        result = await senseframe_config_parse(config_yaml=": : : invalid yaml")
-
-        assert result["status"] == "error"
-        assert result["error_code"] == "CONFIG_YAML_PARSE_ERROR"
+        with pytest.raises(ToolError):
+            await senseframe_config_parse(config_yaml=": : : invalid yaml")
 
     @pytest.mark.asyncio
     async def test_parse_missing_required_field(self):
-        """缺必需字段应返回 error。"""
+        """缺必需字段应抛 ToolError。"""
         from senseframe.mcp.tools.config import senseframe_config_parse
 
-        result = await senseframe_config_parse(config_yaml="scene: {name: wifi_csi}")
+        with pytest.raises(ToolError) as exc_info:
+            await senseframe_config_parse(config_yaml="scene: {name: wifi_csi}")
 
-        assert result["status"] == "error"
-        assert result["error_code"] == "CONFIG_VALIDATION_ERROR"
-        assert "input_features" in result["error"] or "output_features" in result["error"]
+        error_msg = str(exc_info.value)
+        assert "input_features" in error_msg or "output_features" in error_msg
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "config_yaml",
-        [
-            "42",          # 标量
-            "- a\n- b",    # list
-        ],
+        "yaml_input",
+        ["42", "- a\n- b"],
         ids=["scalar", "list"],
     )
-    async def test_parse_non_dict_top_level_rejected(self, config_yaml):
-        """YAML 顶层非 dict（标量 / list）应返回 error。"""
+    async def test_parse_non_dict_top_level_rejected(self, yaml_input):
+        """非 dict 顶层应抛 ToolError。"""
         from senseframe.mcp.tools.config import senseframe_config_parse
 
-        result = await senseframe_config_parse(config_yaml=config_yaml)
-
-        assert result["status"] == "error"
-        assert result["error_code"] == "CONFIG_VALIDATION_ERROR"
+        with pytest.raises(ToolError):
+            await senseframe_config_parse(config_yaml=yaml_input)

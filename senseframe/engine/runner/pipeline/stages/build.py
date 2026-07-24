@@ -129,16 +129,31 @@ def stage_build(ctx: PipelineContext) -> PipelineContext:
         early_stopping_min_delta = getattr(
             ctx.config.trainer, "early_stopping_min_delta", 0.0
         )
-        ctx.callbacks.append(EarlyStopping(
-            monitor=monitor_metric,
-            patience=early_stopping_patience,
-            min_delta=early_stopping_min_delta,
-            mode="min",
-            # pytorch_lightning 2.6.5: check_on_train_epoch_end=None 默认推断为 True，
-            # 导致 on_train_epoch_end 时 val_loss 不可用而抛 RuntimeError。
-            # 显式设为 False，只在 on_validation_epoch_end 检查（val_loss 在 validation 后才可用）。
-            check_on_train_epoch_end=False,
-        ))
+        # MEDIUM 3 修复：自监督 + pretrain_early_stop_metric=psnr 时用 PSNREarlyStoppingCallback
+        psnr_metric = None
+        if ctx.config.scene.params is not None:
+            psnr_metric = ctx.config.scene.params.get("pretrain_early_stop_metric")
+        if is_self_supervised and psnr_metric == "psnr":
+            from ....callbacks.psnr_early_stopping import PSNREarlyStoppingCallback
+            ctx.callbacks.append(PSNREarlyStoppingCallback(
+                patience=early_stopping_patience,
+                min_delta=early_stopping_min_delta,
+            ))
+            _logger.info(
+                "stage_build: PSNREarlyStoppingCallback wired "
+                "(patience=%d, min_delta=%s)", early_stopping_patience, early_stopping_min_delta,
+            )
+        else:
+            ctx.callbacks.append(EarlyStopping(
+                monitor=monitor_metric,
+                patience=early_stopping_patience,
+                min_delta=early_stopping_min_delta,
+                mode="min",
+                # pytorch_lightning 2.6.5: check_on_train_epoch_end=None 默认推断为 True，
+                # 导致 on_train_epoch_end 时 val_loss 不可用而抛 RuntimeError。
+                # 显式设为 False，只在 on_validation_epoch_end 检查（val_loss 在 validation 后才可用）。
+                check_on_train_epoch_end=False,
+            ))
 
     # P2: 创建 TrainingMonitor，供 EpochLogCallback 写入实时指标
     from .....observability import TrainingMonitor

@@ -176,8 +176,13 @@ def _train_dann_loop(
         optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9)
     elif optimizer_type == "rmsprop":
         optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9)
-    else:  # adamw（默认）
+    elif optimizer_type == "adamw":
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    else:
+        raise ValueError(
+            f"Unknown optimizer type: {optimizer_type!r}. "
+            f"Supported: adam, sgd, rmsprop, adamw"
+        )
 
     # 构造 scheduler（同 GenericLightningModule.configure_optimizers）
     scheduler = None
@@ -195,10 +200,18 @@ def _train_dann_loop(
 
     best_val_acc = 0.0
     no_improve_count = 0  # early stopping 计数
+    # LOW 7：追踪 best epoch 的 val_loss/val_macro_f1（供 wrapper 写 final_eval）
+    best_val_loss = None
+    best_val_macro_f1 = None
+    best_epoch = None
 
     for epoch in range(epochs):
         # λ 调度（Ganin & Lempitsky 2015：λ = 2/(1+exp(-10*p))-1）
         lambda_ = dann_lambda_schedule(epoch, epochs)
+
+        # MEDIUM 6：累积 train loss（与 GenericLightningModule 对齐）
+        epoch_train_loss_sum = 0.0
+        epoch_train_steps = 0
 
         model.train()
         for batch in train_loader:
@@ -231,10 +244,16 @@ def _train_dann_loop(
             if gradient_clip_val is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_val)
             optimizer.step()
+            # MEDIUM 6：累积 train loss
+            epoch_train_loss_sum += float(total_loss.item())
+            epoch_train_steps += 1
 
         # 验证（仅 task 分类，无对抗）
         model.eval()
         all_preds, all_labels = [], []
+        # MEDIUM 6：累积 val loss（与 GenericLightningModule 对齐）
+        epoch_val_loss_sum = 0.0
+        epoch_val_steps = 0
         with torch.no_grad():
             for batch in val_loader:
                 if isinstance(batch, (list, tuple)):
@@ -247,6 +266,10 @@ def _train_dann_loop(
                 logits, _ = model(x, None, 0.0)
                 all_preds.extend(logits.argmax(dim=-1).cpu().numpy().tolist())
                 all_labels.extend(y.cpu().numpy().tolist())
+                # MEDIUM 6：累积 val loss
+                val_loss = F.cross_entropy(logits, y)
+                epoch_val_loss_sum += float(val_loss.item())
+                epoch_val_steps += 1
 
         val_acc = sum(p == l for p, l in zip(all_preds, all_labels)) / max(len(all_labels), 1)
         # 空 val_loader 兜底：sklearn f1_score 不接受空数组，置 0.0
@@ -261,6 +284,10 @@ def _train_dann_loop(
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            # LOW 7：追踪 best epoch 的 val_loss/val_macro_f1（供 wrapper 写 final_eval）
+            best_val_loss = epoch_val_loss_sum / max(epoch_val_steps, 1)
+            best_val_macro_f1 = macro_f1
+            best_epoch = epoch + 1
             no_improve_count = 0
         else:
             no_improve_count += 1
@@ -269,6 +296,20 @@ def _train_dann_loop(
             "DANN epoch %d/%d: λ=%.4f, val_acc=%.4f, macro_f1=%.4f",
             epoch + 1, epochs, lambda_, val_acc, macro_f1,
         )
+
+        # MEDIUM 6 修复：写入 training_log（与 GenericLightningModule.on_validation_epoch_end 对齐）
+        if not hasattr(ctx, "training_log") or ctx.training_log is None:
+            ctx.training_log = []
+        ctx.training_log.append({
+            "epoch": epoch + 1,
+            "lr": learning_rate,
+            "train_loss": round(epoch_train_loss_sum / max(epoch_train_steps, 1), 6),
+            "train_accuracy": None,  # DANN 路径暂不计算 train_accuracy
+            "val_loss": round(epoch_val_loss_sum / max(epoch_val_steps, 1), 6),
+            "val_accuracy": round(float(val_acc), 6),
+            "val_macro_f1": round(float(macro_f1), 6),
+            "phase": "train_val",
+        })
 
         # MEDIUM 5：early stopping（手动实现，监控 val_acc）
         if early_stopping_patience is not None and no_improve_count >= early_stopping_patience:
@@ -281,9 +322,12 @@ def _train_dann_loop(
     # 写回 ctx（与 Lightning 路径对齐）
     ctx.best_model_score = best_val_acc
     ctx.best_model_path = None  # DANN 无 Lightning checkpoint
-    ctx.best_epoch = None  # DANN 无 Lightning checkpoint 概念
+    ctx.best_epoch = best_epoch  # DANN 路径：best_val_acc 对应的 epoch（1-based，与 training_log 对齐）
     ctx.pruned = False
     ctx.pruned_epoch = None
+    # LOW 7 修复：保存 best epoch 的完整 metrics（供 wrapper 写 final_eval）
+    ctx._dann_best_val_loss = best_val_loss
+    ctx._dann_best_val_macro_f1 = best_val_macro_f1
 
 
 @stage(
@@ -409,7 +453,15 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
         # Critical #1：DANN 路径无 Lightning Trainer，ctx.trainer 保持 None。
         # 写入 final_eval 供 stage_eval 使用（stage_eval 检测 ctx.trainer is None
         # 时跳过 trainer.validate/test，使用此处的 final_eval 计算 feedback）。
-        ctx.final_eval = {"val_accuracy": float(ctx.best_model_score)} if ctx.best_model_score is not None else {}
+        # LOW 7 修复：final_eval 完整化（含 val_loss + val_macro_f1）
+        final_eval = {"val_accuracy": round(float(ctx.best_model_score), 6)} if ctx.best_model_score is not None else {}
+        best_val_loss = getattr(ctx, "_dann_best_val_loss", None)
+        best_val_macro_f1 = getattr(ctx, "_dann_best_val_macro_f1", None)
+        if best_val_loss is not None:
+            final_eval["val_loss"] = round(float(best_val_loss), 6)
+        if best_val_macro_f1 is not None:
+            final_eval["val_macro_f1"] = round(float(best_val_macro_f1), 6)
+        ctx.final_eval = final_eval
         # Important #2：与 Lightning 路径对齐，冻结 intermediate_values 防止
         # stage_eval 的 trainer.validate() 触发 IntermediateMetricLogger 写入。
         ctx.intermediate_values = FrozenDict(ctx.intermediate_values)

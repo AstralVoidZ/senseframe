@@ -135,6 +135,11 @@ class SelfSupervisedModule(pl.LightningModule):
         self._is_final_validation: bool = False
         # A3: 增量日志写入器
         self._log_writer = incremental_log_writer
+        # MEDIUM 4 修复：PSNR 重建缓存（供 PSNREarlyStoppingCallback 消费）
+        # validation_step 在 MAE model 上缓存重建/目标张量，
+        # PSNREarlyStoppingCallback.on_validation_epoch_end 读取计算 PSNR。
+        self._psnr_reconstruction = None
+        self._psnr_target = None
 
     def forward(self, x):
         return self.model(x)
@@ -178,9 +183,36 @@ class SelfSupervisedModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """验证阶段：使用监督模式评估。"""
+        """验证阶段：使用监督模式评估。
+
+        MEDIUM 4 修复：当 model 支持 MAE 重建（duck-typed _mae_forward_loss）时，
+        缓存 _psnr_reconstruction/_psnr_target 供 PSNREarlyStoppingCallback 消费。
+        """
         x, y = batch
         y = y.long()
+
+        # MEDIUM 4：MAE 重建缓存（供 PSNREarlyStoppingCallback）
+        # Tradeoff：每个 batch 覆盖缓存，仅保留最后一个 batch 的重建。
+        # 这避免 cat 累积所有 batch 导致显存膨胀，PSNR 用单 batch 作代表已足够指示趋势。
+        # 若需更精确的 epoch 级 PSNR，应改为 accumulate + on_validation_epoch_end 聚合。
+        if hasattr(self.model, "_mae_forward_loss") and hasattr(self.model, "patch_embedder"):
+            try:
+                target = self.model.patch_embedder.to_patches(x)
+                # 用 model 的 masking + encoder + decoder 生成重建
+                patches = self.model.patch_embedder.proj(target) + getattr(self.model, "pos_embed", 0)
+                mask_ratio = getattr(self.model, "_mask_ratio", 0.75)
+                x_visible, mask, ids_restore = self.model.random_masking(patches, mask_ratio=mask_ratio)
+                enc_out = self.model._forward_encoder(x_visible)
+                recon = self.model._forward_decoder(enc_out, ids_restore)
+                # 仅取 masked patches（与 scripts/p0_pretrain_with_psnr.py 对齐）
+                mask_bool = mask.bool() if hasattr(mask, 'bool') else mask > 0
+                self._psnr_reconstruction = recon[mask_bool].detach()
+                self._psnr_target = target[mask_bool].detach()
+            except Exception as e:
+                # 重建失败不中断验证，PSNR callback 会 no-op
+                _logger.debug("PSNR reconstruction cache failed: %s", e)
+                self._psnr_reconstruction = None
+                self._psnr_target = None
 
         y1, y2 = self.model(x, x, flag="supervised")
         loss = self.ce_criterion(y1, y) + self.ce_criterion(y2, y)

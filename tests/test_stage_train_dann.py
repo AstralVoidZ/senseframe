@@ -181,7 +181,12 @@ class TestStageTrainDannBranch:
             f"best_model_score 应在 [0, 1] 范围内，实际为 {ctx.best_model_score}"
         assert ctx.pruned is False
         assert ctx.pruned_epoch is None
-        assert ctx.best_epoch is None
+        # Minor 4.3：DANN 路径回写 best_epoch（best_val_acc 对应的 epoch，1-based）
+        # _FakeDannModel 权重取决于测试运行时的 RNG 状态（_FakeDataModule 的
+        # manual_seed(42) 仅作用于数据生成，模型 init 在其之前），val_acc 可能
+        # epoch1>epoch2 或相等，故仅断言 best_epoch 在合法区间内。
+        assert isinstance(ctx.best_epoch, int)
+        assert 1 <= ctx.best_epoch <= 2
 
     def test_stage_train_dann_branch_writes_final_eval_and_freezes_intermediate_values(self, tmp_path):
         """DANN 分支 wrapper 代码覆盖：final_eval 写入 + intermediate_values 冻结 + training_duration_s。
@@ -230,6 +235,10 @@ class TestStageTrainDannBranch:
         # sleep 确保 timer.elapsed > 0.01，round(elapsed, 2) 严格正
         def _fake_train_dann_loop(ctx, epochs, learning_rate):
             ctx.best_model_score = 0.5
+            # LOW 7 回归适配：_train_dann_loop 现写回 _dann_best_val_loss/
+            # _dann_best_val_macro_f1，fake_loop 需对齐（None 表示无 best 更新）
+            ctx._dann_best_val_loss = None
+            ctx._dann_best_val_macro_f1 = None
             time.sleep(0.02)
 
         with patch.object(train_module, "_train_dann_loop", side_effect=_fake_train_dann_loop), \
