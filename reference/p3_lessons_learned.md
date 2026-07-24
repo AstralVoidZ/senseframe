@@ -688,6 +688,90 @@ peft_model = _build_peft_model(backbone, "lora", ...)
 
 ---
 
+## 11. 非上限数据集 SP 搜索价值有限 + GridSampler 遍历顺序缺陷
+
+### 现象
+
+Widar C 系列（非上限数据集，22 类，A1 baseline val_acc=69.73%）完成 5 个实验后，发现两个反直觉结果：
+
+| 实验 | 配置 | val_acc | macro_f1 | trainable_params | best_params | cost |
+|------|------|---------|----------|------------------|-------------|------|
+| C1_Widar | LoRA r=8 (固定) | 0.4127 | 0.2254 | 23,318 | - | 528s |
+| C2_Widar | Adapter bn=128 (固定) | 0.6357 | 0.5400 | 1,639,190 | - | 621s |
+| C3_Widar | PromptTuning len=10 (固定) | 0.2405 | 0.1044 | 4,118 | - | 565s |
+| C4_Widar | RandomSampler × 20 | **0.6495** | 0.5632 | 3,275,542 | adapter, r=4, bn=256, pl=5 | 12,029s |
+| C5_Widar | GridSampler × 24 | 0.4241 | 0.2492 | 23,318 | lora, r=8, bn=32, pl=10 | 14,203s |
+
+**反直觉 1**：SP 搜索（C4 random）相对固定配置 max(C1,C2,C3) 仅提升 **+0.01%**（0.6495 vs 0.6357），与预期"非上限数据集应有 ~30% 提升空间"严重不符。
+
+**反直觉 2**：GridSampler（C5）比 RandomSampler（C4）**差 0.23%**（0.4241 vs 0.6495），且 C5 全程 24 个 trial 没采样到任何 adapter 组合（adapter 是 Widar 上最优方法）。
+
+### 根因
+
+#### 根因 1：SP 搜索价值与"数据集上限"强相关，非上限数据集提升空间仍有限
+
+教训 8 在 NTU-Fi_HAR 上限数据集上发现"C2=100%, C4=100%，SP 无提升空间"。本次在 Widar（非上限数据集）上验证，原假设是"非上限数据集有 ~30% 提升空间，SP 搜索应能找到显著更优组合"。
+
+实际结果：C4 random 找到的最优组合（adapter bn=256, val_acc=0.6495）仅比 C2 固定配置（adapter bn=128, val_acc=0.6357）提升 +1.38%。
+
+**深层原因**：
+- Widar 上 adapter 方法本身已接近其性能上限（不同 bn 的 adapter 全在 0.61-0.65 区间）
+- SP 搜索的 20 个 trial 中，6 个 adapter trial 全部在 0.61-0.65，差异仅来自 bn 参数微调
+- 真正的瓶颈不在 PEFT 超参，而在 backbone 容量 / 数据质量 / 特征表达
+
+#### 根因 2：GridSampler 固定遍历顺序 + n_trials 截断 = 错过最优区域
+
+C5 grid 24 个 trial 的实际采样顺序（从日志提取）：
+- trial 1: prompt_tuning, params=13078
+- trial 2-16: **lora rank=4** × (adapter_bottleneck ∈ {32,64,128,256}) × (prompt_length ∈ {5,10,20,50}) = 15 个组合
+- trial 17-24: **lora rank=8** × 部分 adapter_bottleneck/prompt_length 组合 = 8 个组合
+
+**GridSampler 按 `peft_method → peft_rank → adapter_bottleneck → prompt_length` 字典序嵌套遍历**，导致：
+- 前 1 个 trial 是 prompt_tuning（仅 1 种 peft_rank 有效）
+- 接下来 16 个 trial 全是 lora rank=4（4 × 4 = 16 组合）
+- 再接下来至少 16 个 trial 才是 lora rank=8
+- **adapter 方法排在字典序最后**（'adapter' > 'lora' > 'prompt_tuning'），n_trials=24 根本跑不到
+
+这是教训 9（GridSampler 全网格爆炸）的延伸：即使 n_trials 限制为 24，固定遍历顺序仍会导致采样集中在字典序靠前的 peft_method 上，错过最优区域。
+
+#### 根因 3：PEFT 方法选择高度依赖数据集特性
+
+| 数据集 | LoRA r=8 | Adapter bn=128 | PromptTuning len=10 | 最优方法 |
+|--------|----------|----------------|---------------------|----------|
+| NTU-Fi_HAR（上限） | 88.17% | 100% | 63.44% | adapter（已达 100%） |
+| Widar（非上限） | 41.27% | 63.57% | 24.05% | adapter（但仅 63.57%） |
+
+Widar 22 类 / 936 训练样本，adapter 参数量大（1.6M-3.3M）能充分拟合；lora 参数量小（23K）欠拟合；prompt_tuning 参数量极小（4K）严重欠拟合。这与 NTU-Fi_HAR 上的方法排序一致，但 Widar 上 adapter 仍未达上限（63.57% vs NTU-Fi_HAR 100%）。
+
+### 防御性建议
+
+- **SP 搜索价值评估必须区分"上限数据集"与"非上限数据集"**：上限数据集（A1 ≥ 95%）上 SP 搜索无提升空间（教训 8）；非上限数据集上 SP 搜索提升也有限（本次 +1.38%），不应预期"非上限 = 大提升空间"。真正的提升空间取决于"当前配置距数据集真实上限有多远"，而非"A1 baseline 高低"
+- **GridSampler 不应使用默认字典序遍历**：当 search_space 包含 peft_method（3 种）× peft_rank（3 种）× adapter_bottleneck（3-4 种）× prompt_length（3-4 种）时，字典序导致 adapter 排在最后。建议：
+  - 方案 A：GridSampler 使用 `shuffle=True`（若 Optuna 支持）打乱遍历顺序
+  - 方案 B：按"经验优先级"排序 search_space（adapter > lora > prompt_tuning）
+  - 方案 C：GridSampler 仅用于"已收敛到某 peft_method 后的细粒度超参搜索"，不用于跨方法比较
+- **SP 搜索应优先用 RandomSampler**：C4 random 在 20 trial 内采样到 6 个 adapter + 6 个 lora + 8 个其他，覆盖均衡；C5 grid 在 24 trial 内全是 prompt_tuning + lora，完全错过 adapter。RandomSampler 的无偏性在小 n_trials 下优势显著
+- **ExperimentResult 应记录 SP 搜索的"方法覆盖统计"**：当前 best_params 只记录最优 trial，无法看出"SP 搜索是否覆盖了所有 peft_method"。建议增加 `method_coverage: {"lora": 8, "adapter": 6, "prompt_tuning": 6}` 字段，便于诊断 GridSampler 遍历顺序问题
+- **Widar 上 PEFT 方法选择已有明确结论**：adapter 主导（+22% vs lora），后续 Widar 相关实验应默认 adapter，不再探索 lora/prompt_tuning
+
+### 验证效果
+
+| 检查项 | NTU-Fi_HAR（上限，教训 8） | Widar（非上限，本次） |
+|--------|---------------------------|----------------------|
+| C2 固定 adapter baseline | 100% | 63.57% |
+| C4 random SP 搜索最优 | 100%（无提升） | 64.95%（+1.38%） |
+| C5 grid SP 搜索最优 | 91.40%（-8.60%） | 42.41%（-21.16%） |
+| SP 搜索相对固定配置提升 | 0% | +1.38% |
+| GridSampler 是否覆盖 adapter | 部分 | ✗（24 trial 全是 prompt_tuning + lora） |
+| 结论 | 上限数据集 SP 无价值 | 非上限数据集 SP 价值有限 + GridSampler 遍历顺序缺陷 |
+
+**核心结论**：
+1. SP 搜索价值不能简单按"上限/非上限"二分，真正决定因素是"当前配置距数据集真实上限的距离"
+2. GridSampler 在多方法 search_space + 小 n_trials 下会因字典序遍历错过最优区域，应优先用 RandomSampler
+3. PEFT 方法选择应基于数据集特性（样本数 / 类别数 / 特征维度），而非"一刀切"默认 lora
+
+---
+
 ## 附：10.2 单场景验证最终结果（20 个实验）
 
 ### 实验配置

@@ -975,12 +975,19 @@ def run_single_experiment(
             # 替换 patch_embedder 到目标模态（保留 transformer encoder + decoder 主体）
             # 核心跨模态迁移：modality-specific 的 patch_embedder/pos_embed/decoder_proj 重新初始化，
             # modality-agnostic 的 encoder/decoder 保留预训练权重
+            # pretrain 数据集的 input_shape：CSI 用 reshape_to，EEG/Radio 用 input_shape
+            # 注意：dict.get(key, default) 的 default 是预先求值的，不能用
+            # pretrain_dataset_config["input_shape"]（CSI 配置无此字段会 KeyError）。
+            # 用嵌套 .get() 避免 KeyError。
+            pretrain_input_shape = (
+                pretrain_dataset_config.get("reshape_to")
+                or pretrain_dataset_config.get("input_shape")
+            )
             logger.info(
                 "experiment %s: replace_patch_embedder %s%s -> %s%s (transferred=encoder+decoder, "
                 "reinit=patch_embedder+pos_embed+decoder_proj)",
                 config.experiment_id,
-                pretrain_dataset_name, pretrain_dataset_config.get(
-                    "reshape_to", pretrain_dataset_config["input_shape"]),
+                pretrain_dataset_name, pretrain_input_shape,
                 config.target_dataset, target_shape,
             )
             backbone.replace_patch_embedder(
