@@ -8,6 +8,7 @@ from __future__ import annotations
 import yaml
 
 from ...engine.config import ExperimentConfig
+from ...engine.runner.errors import ConfigValidationError
 from ..views.config import ConfigParseResponse
 from ._errors import to_tool_error
 
@@ -31,10 +32,10 @@ async def senseframe_config_parse(
         try:
             config_dict = yaml.safe_load(config_yaml)
         except yaml.YAMLError as e:
-            raise ValueError(f"YAML 语法错误: {e}") from e
+            raise ConfigValidationError(f"YAML 语法错误: {e}") from e
 
         if not isinstance(config_dict, dict):
-            raise ValueError(
+            raise ConfigValidationError(
                 f"YAML 顶层应为 dict，实际: {type(config_dict).__name__}"
             )
 

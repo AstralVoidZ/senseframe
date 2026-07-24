@@ -151,18 +151,40 @@ class TestDANNCrossModalModel:
         assert disc_loss.dim() == 0  # 标量
 
     def test_dann_gradients_flow_to_backbone(self):
-        """disc_loss 梯度经 GRL 反转后回传到 backbone。"""
+        """DANN 训练时 encoder 参数应有梯度，decoder 参数应被 freeze。
+
+        I4 + decoder freeze 修复：
+        - encoder 相关参数（非 decoder）requires_grad=True 且 disc_loss.backward() 后有梯度
+        - decoder 相关参数 requires_grad=False（DANN fine-tune 不用 decoder，避免 optimizer
+          维护无用 Adam momentum/variance 显存浪费）
+        """
         model = self._make_small_dann()
         model.train()
         x_eeg = torch.randn(4, 3, 64)
         x_csi = torch.randn(4, 3, 64)
         logits, disc_loss = model(x_eeg, x_csi, lambda_=1.0)
         disc_loss.backward()
-        # backbone 参数应有梯度
-        for name, param in model.backbone.named_parameters():
-            if param.requires_grad:
-                assert param.grad is not None, f"backbone param {name} has no grad"
-                break
+
+        # decoder 相关参数应被 freeze（requires_grad=False）
+        # 覆盖：decoder.* / decoder_embed / decoder_norm / decoder_proj / decoder_pos_embed / mask_token
+        decoder_not_frozen = [
+            name for name, param in model.backbone.named_parameters()
+            if (name.startswith("decoder") or name == "mask_token")
+            and param.requires_grad
+        ]
+        assert not decoder_not_frozen, (
+            f"decoder params should be frozen (requires_grad=False) but got "
+            f"requires_grad=True: {decoder_not_frozen}"
+        )
+
+        # encoder 相关参数应有梯度（requires_grad=True 且 grad is not None）
+        encoder_missing = [
+            name for name, param in model.backbone.named_parameters()
+            if param.requires_grad and param.grad is None
+            and not name.startswith("decoder")
+            and name != "mask_token"
+        ]
+        assert not encoder_missing, f"encoder params without grad: {encoder_missing}"
 
     def test_dann_task_loss_gradients_not_reversed(self):
         """task_loss 梯度不经过 GRL，正常回传。"""

@@ -169,6 +169,16 @@ class DANNCrossModalModel(nn.Module):
         self.task_head = task_head
         self.discriminator = ModalityDiscriminator(d_model, hidden_dim, dropout)
 
+        # DANN fine-tune 只用 encoder 特征（encode_features），decoder 是 MAE pretrain
+        # 专用组件，不参与 fine-tune。freeze backbone decoder 相关参数，避免 optimizer
+        # 为无梯度参数维护无用 Adam momentum/variance 显存浪费。
+        # 覆盖：decoder.* / decoder_embed / decoder_norm / decoder_proj / decoder_pos_embed / mask_token
+        # 穿透 PEFTModel 取内部 CSIFoundationModel，确保无论是否 PEFT 包装都能匹配裸参数名
+        inner_backbone = self._get_inner_backbone()
+        for name, param in inner_backbone.named_parameters():
+            if name.startswith("decoder") or name == "mask_token":
+                param.requires_grad = False
+
         # CSI 模态特定层（跨模态对齐用，始终 freeze）
         if csi_patch_embedder is not None:
             self.csi_patch_embedder = csi_patch_embedder

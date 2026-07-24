@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -131,11 +132,21 @@ def _should_use_dann(scene_params) -> bool:
     return bool(scene_params.get("use_dann", False))
 
 
+@dataclass
+class DannTrainResult:
+    """_train_dann_loop 的返回值，替代 ctx 私有属性跨函数传递（I3 修复）。"""
+    best_score: float
+    best_epoch: Optional[int]
+    best_val_loss: Optional[float]
+    best_val_macro_f1: Optional[float]
+    best_state: Optional[dict]  # model.state_dict() 副本，None 表示无 best epoch
+
+
 def _train_dann_loop(
     ctx: "PipelineContext",
     epochs: int,
     learning_rate: float,
-) -> None:
+) -> "DannTrainResult":
     """DANN 训练循环：任务分类 + 模态对抗对齐。
 
     沉淀自 scripts/p3_eval_common.py:858 _train_dann，适配主 Pipeline context。
@@ -198,12 +209,13 @@ def _train_dann_loop(
     csi_loader = ctx.scene_kwargs.get("csi_loader") if ctx.scene_kwargs else None
     csi_iter = itertools.cycle(csi_loader) if csi_loader else None
 
-    best_val_acc = 0.0
+    best_val_acc = -1.0  # I1 修复：避免与合法值 0.0 冲突，确保首个 epoch 被记录
     no_improve_count = 0  # early stopping 计数
     # LOW 7：追踪 best epoch 的 val_loss/val_macro_f1（供 wrapper 写 final_eval）
     best_val_loss = None
     best_val_macro_f1 = None
     best_epoch = None
+    best_state = None  # I2 修复：保存 best epoch 的 model.state_dict() 副本
 
     for epoch in range(epochs):
         # λ 调度（Ganin & Lempitsky 2015：λ = 2/(1+exp(-10*p))-1）
@@ -288,6 +300,8 @@ def _train_dann_loop(
             best_val_loss = epoch_val_loss_sum / max(epoch_val_steps, 1)
             best_val_macro_f1 = macro_f1
             best_epoch = epoch + 1
+            # I2 修复：保存 best epoch 的 model 权重副本（clone 避免引用共享）
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
             no_improve_count = 0
         else:
             no_improve_count += 1
@@ -319,15 +333,24 @@ def _train_dann_loop(
             )
             break
 
+    # I2 修复：加载 best epoch 权重回 model（消除末轮权重与 best 指标不匹配）
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
     # 写回 ctx（与 Lightning 路径对齐）
     ctx.best_model_score = best_val_acc
     ctx.best_model_path = None  # DANN 无 Lightning checkpoint
     ctx.best_epoch = best_epoch  # DANN 路径：best_val_acc 对应的 epoch（1-based，与 training_log 对齐）
     ctx.pruned = False
     ctx.pruned_epoch = None
-    # LOW 7 修复：保存 best epoch 的完整 metrics（供 wrapper 写 final_eval）
-    ctx._dann_best_val_loss = best_val_loss
-    ctx._dann_best_val_macro_f1 = best_val_macro_f1
+    # I3 修复：返回 dataclass 替代 ctx 私有属性跨函数传递
+    return DannTrainResult(
+        best_score=best_val_acc,
+        best_epoch=best_epoch,
+        best_val_loss=best_val_loss,
+        best_val_macro_f1=best_val_macro_f1,
+        best_state=best_state,
+    )
 
 
 @stage(
@@ -442,7 +465,7 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
         timer = Timer("training_dann")
         timer.__enter__()
         try:
-            _train_dann_loop(
+            result = _train_dann_loop(
                 ctx=ctx,
                 epochs=_epochs,
                 learning_rate=_lr or ctx.config.trainer.learning_rate or 1e-3,
@@ -453,15 +476,18 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
         # Critical #1：DANN 路径无 Lightning Trainer，ctx.trainer 保持 None。
         # 写入 final_eval 供 stage_eval 使用（stage_eval 检测 ctx.trainer is None
         # 时跳过 trainer.validate/test，使用此处的 final_eval 计算 feedback）。
-        # LOW 7 修复：final_eval 完整化（含 val_loss + val_macro_f1）
-        final_eval = {"val_accuracy": round(float(ctx.best_model_score), 6)} if ctx.best_model_score is not None else {}
-        best_val_loss = getattr(ctx, "_dann_best_val_loss", None)
-        best_val_macro_f1 = getattr(ctx, "_dann_best_val_macro_f1", None)
-        if best_val_loss is not None:
-            final_eval["val_loss"] = round(float(best_val_loss), 6)
-        if best_val_macro_f1 is not None:
-            final_eval["val_macro_f1"] = round(float(best_val_macro_f1), 6)
+        # I3 修复：从 DannTrainResult 读取 metrics（替代 getattr ctx 私有属性）
+        # I2 修复：score > 0 才写入 val_accuracy（与 best_model_score 语义对齐）
+        final_eval = {}
+        if result.best_score > 0:
+            final_eval["val_accuracy"] = round(float(result.best_score), 6)
+        if result.best_val_loss is not None:
+            final_eval["val_loss"] = round(float(result.best_val_loss), 6)
+        if result.best_val_macro_f1 is not None:
+            final_eval["val_macro_f1"] = round(float(result.best_val_macro_f1), 6)
         ctx.final_eval = final_eval
+        ctx.best_model_score = result.best_score if result.best_score > 0 else None
+        ctx.best_epoch = result.best_epoch
         # Important #2：与 Lightning 路径对齐，冻结 intermediate_values 防止
         # stage_eval 的 trainer.validate() 触发 IntermediateMetricLogger 写入。
         ctx.intermediate_values = FrozenDict(ctx.intermediate_values)

@@ -64,6 +64,12 @@ class TestStageTrainDannBranch:
 
         with patch.object(train_module, "_train_dann_loop") as mock_dann, \
              patch("pytorch_lightning.Trainer") as mock_trainer_cls:
+            from senseframe.engine.runner.pipeline.stages.train import DannTrainResult
+            mock_dann.return_value = DannTrainResult(
+                best_score=0.0, best_epoch=None,
+                best_val_loss=None, best_val_macro_f1=None,
+                best_state=None,
+            )
             train_module.stage_train(ctx)
 
             # DANN 路径应被调用
@@ -154,6 +160,7 @@ class TestStageTrainDannBranch:
             def val_dataloader(self):
                 return list(self._batches)
 
+        torch.manual_seed(0)  # C1 修复：消除 RNG flaky
         model = _FakeDannModel()
         datamodule = _FakeDataModule()
 
@@ -234,12 +241,13 @@ class TestStageTrainDannBranch:
         # mock _train_dann_loop 为最小 no-op：仅设 best_model_score，
         # sleep 确保 timer.elapsed > 0.01，round(elapsed, 2) 严格正
         def _fake_train_dann_loop(ctx, epochs, learning_rate):
-            ctx.best_model_score = 0.5
-            # LOW 7 回归适配：_train_dann_loop 现写回 _dann_best_val_loss/
-            # _dann_best_val_macro_f1，fake_loop 需对齐（None 表示无 best 更新）
-            ctx._dann_best_val_loss = None
-            ctx._dann_best_val_macro_f1 = None
+            from senseframe.engine.runner.pipeline.stages.train import DannTrainResult
             time.sleep(0.02)
+            return DannTrainResult(
+                best_score=0.5, best_epoch=1,
+                best_val_loss=None, best_val_macro_f1=None,
+                best_state=None,
+            )
 
         with patch.object(train_module, "_train_dann_loop", side_effect=_fake_train_dann_loop), \
              patch("pytorch_lightning.Trainer") as mock_trainer_cls:

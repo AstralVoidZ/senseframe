@@ -136,7 +136,7 @@ class TestSelfSupervisedPsnrCache:
         """model 有 _mae_forward_loss 方法时，validation 缓存 _psnr_reconstruction/_psnr_target。"""
         from senseframe.engine.self_supervised import SelfSupervisedModule
 
-        # 构造 mock MAE model（duck-typed _mae_forward_loss + patch_embedder）
+        # 构造 mock MAE model（duck-typed mae_reconstruct）
         class MockMaeModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -144,7 +144,14 @@ class TestSelfSupervisedPsnrCache:
                 self.patch_embedder.to_patches.return_value = torch.randn(2, 10, 4)
                 self.patch_embedder.proj = MagicMock(return_value=torch.randn(2, 10, 8))
                 self.pos_embed = torch.zeros(1, 10, 8)
-                self._mae_forward_loss = MagicMock(return_value=torch.tensor(0.5))
+
+            def mae_reconstruct(self, x, mask_ratio):
+                target = self.patch_embedder.to_patches(x)
+                patches = self.patch_embedder.proj(target) + self.pos_embed
+                x_visible, mask, ids_restore = self.random_masking(patches, mask_ratio)
+                enc_out = self._forward_encoder(x_visible)
+                recon = self._forward_decoder(enc_out, ids_restore)
+                return recon, target, mask
 
             def random_masking(self, patches, mask_ratio):
                 return patches, torch.ones(2, 10), MagicMock()
@@ -177,17 +184,13 @@ class TestSelfSupervisedPsnrCache:
 class TestPSNRCacheMinor:
     """Task 5 残留 Minor：PSNR cache 日志 + mask_ratio 读取。"""
 
-    def test_except_logs_debug(self):
-        """MAE 重建失败时应记录 debug 日志（不静默吞异常）。"""
-        import logging
+    def test_except_logs_warning(self):
+        """I12 修复：MAE 重建失败时应记录 warning 日志（非 debug）。"""
         from unittest.mock import patch, MagicMock
         from senseframe.engine.self_supervised import SelfSupervisedModule
 
-        # 构造一个 model：有 _mae_forward_loss + patch_embedder，但 to_patches 抛异常
         model = MagicMock()
-        model._mae_forward_loss = lambda x, r: x
-        # patch_embedder.to_patches 抛异常触发 except 分支
-        model.patch_embedder.to_patches.side_effect = RuntimeError("fake error")
+        model.mae_reconstruct.side_effect = RuntimeError("fake error")
         # forward 返回二元组张量，供 ce_criterion 消费（避免 unpack 失败）
         model.return_value = (torch.randn(2, 7), torch.randn(2, 7))
 
@@ -198,32 +201,23 @@ class TestPSNRCacheMinor:
             with patch("senseframe.engine.self_supervised._logger") as mock_logger:
                 module.validation_step(batch, 0)
 
-        # 验证 debug 日志被调用
-        mock_logger.debug.assert_called_once()
-        # 日志消息应含 "PSNR" 或 "cache" 或 "failed"
-        log_msg = str(mock_logger.debug.call_args)
+        # 验证 warning 日志被调用
+        mock_logger.warning.assert_called_once()
+        log_msg = str(mock_logger.warning.call_args)
         assert "PSNR" in log_msg or "cache" in log_msg or "failed" in log_msg
 
     def test_mask_ratio_from_model_attribute(self):
-        """model 有 _mask_ratio 属性时，validation_step 应使用该值而非硬编码 0.75。"""
+        """I11 修复：model 有 _mask_ratio 时应传给 mae_reconstruct。"""
         from unittest.mock import patch, MagicMock
         from senseframe.engine.self_supervised import SelfSupervisedModule
 
         model = MagicMock()
-        model._mae_forward_loss = lambda x, r: x
-        model._mask_ratio = 0.5  # 自定义 mask_ratio
-        # patch_embedder.to_patches 返回有效张量
-        model.patch_embedder.to_patches.return_value = torch.randn(2, 4, 16)
-        model.patch_embedder.proj.return_value = torch.randn(2, 4, 16)
-        model.pos_embed = torch.zeros(1, 4, 16)
-        model.random_masking.return_value = (
-            torch.randn(2, 2, 16),  # x_visible
-            torch.ones(2, 4),        # mask
-            torch.randint(0, 4, (2, 4)),  # ids_restore
+        model._mask_ratio = 0.5
+        model.mae_reconstruct.return_value = (
+            torch.randn(2, 4, 16),  # recon
+            torch.randn(2, 4, 16),  # target
+            torch.ones(2, 4),       # mask
         )
-        model._forward_encoder.return_value = torch.randn(2, 2, 16)
-        model._forward_decoder.return_value = torch.randn(2, 4, 16)
-        # forward 返回二元组张量，供 ce_criterion 消费（避免 unpack 失败）
         model.return_value = (torch.randn(2, 7), torch.randn(2, 7))
 
         module = SelfSupervisedModule(model=model, num_classes=7)
@@ -232,8 +226,6 @@ class TestPSNRCacheMinor:
         with patch.object(module, "log"):
             module.validation_step(batch, 0)
 
-        # 验证 random_masking 被调用时 mask_ratio=0.5（而非 0.75）
-        call_args = model.random_masking.call_args
-        # random_masking(patches, mask_ratio=...) 第二个参数
-        assert call_args.kwargs.get("mask_ratio") == 0.5 or \
-               (len(call_args.args) >= 2 and call_args.args[1] == 0.5)
+        # 验证 mae_reconstruct 被调用时 mask_ratio=0.5
+        call_args = model.mae_reconstruct.call_args
+        assert call_args.args[1] == 0.5 or call_args.kwargs.get("mask_ratio") == 0.5

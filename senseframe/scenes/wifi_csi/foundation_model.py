@@ -229,6 +229,10 @@ class CSIFoundationModel(nn.Module):
         pl = self.patch_embedder.patch_len
         self.decoder_proj = nn.Linear(decoder_dim, pl * C)
 
+        # I10 修复：暴露 _mask_ratio 供 SelfSupervisedModule.validation_step 读取
+        # 默认 0.75，pretrain 方法会覆盖为 config.mask_ratio
+        self._mask_ratio = 0.75
+
     # ---------- Protocol 属性 ----------
     @property
     def model_id(self) -> str:
@@ -290,6 +294,31 @@ class CSIFoundationModel(nn.Module):
         x = self.decoder_norm(x)
         return self.decoder_proj(x)
 
+    def mae_reconstruct(
+        self, x: torch.Tensor, mask_ratio: float
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """MAE 重建前向，返回 (recon, target, mask)。
+
+        消除 self_supervised.py / _mae_forward_loss / p0_pretrain_with_psnr.py 三处重复。
+        self_supervised.py 从类外调用 _forward_encoder/_forward_decoder 私有方法破坏封装，
+        现统一通过此 public 方法暴露 MAE 重建流程。
+
+        Args:
+            x: (B, C, L) 输入信号
+            mask_ratio: mask 比例
+
+        Returns:
+            recon: (B, n_patches, patch_len * C) 重建张量
+            target: (B, n_patches, patch_len * C) 原始 patches（不含投影 + pos_embed）
+            mask: (B, n_patches) float，1 = masked / 0 = visible
+        """
+        target = self.patch_embedder.to_patches(x)
+        patches = self.patch_embedder.proj(target) + self.pos_embed
+        x_visible, mask, ids_restore = self.random_masking(patches, mask_ratio)
+        enc_out = self._forward_encoder(x_visible)
+        recon = self._forward_decoder(enc_out, ids_restore)
+        return recon, target, mask
+
     def _mae_forward_loss(
         self, x: torch.Tensor, mask_ratio: float
     ) -> torch.Tensor:
@@ -320,6 +349,8 @@ class CSIFoundationModel(nn.Module):
         P3-P2-8 修复：原实现无任何 epoch/batch loss 日志，训练过程不可观测。
         现按 epoch 打印 mean loss，便于调试与早停判断。
         """
+        # I10 修复：写入 _mask_ratio 供 validation_step 对齐训练口径
+        self._mask_ratio = config.mask_ratio
         optimizer = torch.optim.AdamW(
             self.parameters(), lr=config.learning_rate
         )

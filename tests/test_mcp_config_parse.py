@@ -4,6 +4,8 @@ LOW 8 修复：适配 FrozenModel 响应 + ToolError 错误。
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -77,16 +79,19 @@ unknown_field: should_fail
         with pytest.raises(ToolError) as exc_info:
             await senseframe_config_parse(config_yaml=invalid_yaml_unknown_field)
 
-        error_msg = str(exc_info.value)
-        assert "unknown_field" in error_msg or "未知字段" in error_msg
+        envelope = json.loads(str(exc_info.value))
+        assert envelope["category"] == "config"
 
     @pytest.mark.asyncio
     async def test_parse_malformed_yaml(self):
-        """YAML 语法错误应抛 ToolError。"""
+        """YAML 语法错误应抛 ToolError（category=config）。"""
         from senseframe.mcp.tools.config import senseframe_config_parse
 
-        with pytest.raises(ToolError):
+        with pytest.raises(ToolError) as exc_info:
             await senseframe_config_parse(config_yaml=": : : invalid yaml")
+
+        envelope = json.loads(str(exc_info.value))
+        assert envelope["category"] == "config"
 
     @pytest.mark.asyncio
     async def test_parse_missing_required_field(self):
@@ -96,8 +101,8 @@ unknown_field: should_fail
         with pytest.raises(ToolError) as exc_info:
             await senseframe_config_parse(config_yaml="scene: {name: wifi_csi}")
 
-        error_msg = str(exc_info.value)
-        assert "input_features" in error_msg or "output_features" in error_msg
+        envelope = json.loads(str(exc_info.value))
+        assert envelope["category"] == "config"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -106,8 +111,11 @@ unknown_field: should_fail
         ids=["scalar", "list"],
     )
     async def test_parse_non_dict_top_level_rejected(self, yaml_input):
-        """非 dict 顶层应抛 ToolError。"""
+        """非 dict 顶层应抛 ToolError（category=config）。"""
         from senseframe.mcp.tools.config import senseframe_config_parse
 
-        with pytest.raises(ToolError):
+        with pytest.raises(ToolError) as exc_info:
             await senseframe_config_parse(config_yaml=yaml_input)
+
+        envelope = json.loads(str(exc_info.value))
+        assert envelope["category"] == "config"

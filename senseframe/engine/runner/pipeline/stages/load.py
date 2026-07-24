@@ -110,6 +110,11 @@ def _load_pretrain_checkpoint(
 
     沉淀自 scripts/p3_eval_common.py:507 _load_pretrain_dataset（简化版）。
 
+    I5 修复：同时支持 .pt 和 .ckpt 扩展名，同时搜索 output_dir（producer
+    scripts/p0_pretrain_with_psnr.py:273 直接产出 .pt 到 output_dir）和
+    output_dir/runs/（旧契约）。旧 loader 仅搜索 output_dir/runs/*.ckpt，
+    与 producer 产出的 .pt 不一致，导致 pretrain 静默失效。
+
     Args:
         pretrain_dataset_name: 预训练数据集名
         output_dir: 输出目录（用于查找已有 checkpoint）
@@ -117,21 +122,24 @@ def _load_pretrain_checkpoint(
     Returns:
         checkpoint 路径，或 None（无可用 checkpoint）
     """
-    # 在 output_dir/runs/ 下查找已训练的 pretrain checkpoint
-    checkpoint_dir = Path(output_dir) / "runs" if output_dir else Path("runs")
-    if not checkpoint_dir.exists():
-        _logger.info(
-            "pretrain checkpoint dir not found: %s, skipping pretrain load",
-            checkpoint_dir,
-        )
-        return None
+    # I5 修复：搜索 output_dir（producer 直接产出）和 output_dir/runs/（旧契约）
+    base_dir = Path(output_dir) if output_dir else Path(".")
+    search_dirs = [base_dir, base_dir / "runs"]
 
-    # 查找匹配数据集名的 checkpoint（glob.escape 防御数据集名中的特殊字符）
-    candidates = list(checkpoint_dir.glob(f"*{glob.escape(pretrain_dataset_name)}*.ckpt"))
+    # 同时匹配 .pt 和 .ckpt 扩展名（glob.escape 防御数据集名中的特殊字符）
+    candidates = []
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
+        for ext in (".pt", ".ckpt"):
+            candidates.extend(
+                search_dir.glob(f"*{glob.escape(pretrain_dataset_name)}*{ext}")
+            )
+
     if not candidates:
         _logger.info(
             "no pretrain checkpoint found for dataset=%s in %s",
-            pretrain_dataset_name, checkpoint_dir,
+            pretrain_dataset_name, search_dirs,
         )
         return None
 
@@ -146,7 +154,7 @@ def _load_pretrain_checkpoint(
 
 def _build_csi_adversarial_loader(
     csi_dataset_name: str,
-    data_root: str,
+    csi_data_root: str,
     batch_size: int,
 ) -> "DataLoader | None":
     """构造 CSI val 集 DataLoader（DANN 对抗信号）。
@@ -156,22 +164,35 @@ def _build_csi_adversarial_loader(
     设计原则（脚本 line 558-560）：DANN 对抗信号必须用"未参与预训练"的数据
     （val/test 集），否则判别器对预训练分布过拟合。
 
+    I6 修复：参数名从 data_root 改为 csi_data_root，明确这是 CSI 数据集
+    独立的数据根目录（跨模态场景下与 target data_root 不同）。
+
+    I7 修复：WiFiCSIContainer import 移到 try 块外（模块级 import 会循环依赖：
+    scenes.wifi_csi.__init__ → foundation_model → automl → loss_search →
+    engine.runner.pipeline），import 失败时 ImportError 不被 except 吞掉。
+    except 收窄为 (FileNotFoundError, ValueError)，其他异常向上抛出暴露错误。
+
     Args:
         csi_dataset_name: CSI 数据集名（如 "NTU-Fi_HAR"）
-        data_root: 数据根目录
+        csi_data_root: CSI 数据集根目录（独立于 target data_root）
         batch_size: batch 大小（从 config.trainer.batch_size 读取）
 
     Returns:
         DataLoader 实例，或 None（加载失败时降级，不中断 pipeline）
     """
     from torch.utils.data import DataLoader
+    # I7 修复：import 移到 try 块外——模块级 import 会循环依赖（见 docstring），
+    # 函数内运行时 import 不会循环（此时 engine.runner.pipeline 已加载完成）。
+    # import 失败时 ImportError 不被 except 吞掉，向上抛出暴露环境/依赖问题。
+    from .....scenes.wifi_csi.container import WiFiCSIContainer
 
     # 用 WiFiCSIContainer 加载 CSI 数据集（框架级 scene 抽象）
+    # I7 修复：except 收窄为 (FileNotFoundError, ValueError)，
+    # ImportError 等环境问题不被吞掉（WiFiCSIContainer import 已移到 try 块外）。
     try:
-        from .....scenes.wifi_csi.container import WiFiCSIContainer
         csi_scene = WiFiCSIContainer()
         csi_bundle = csi_scene.load_dataset(
-            csi_dataset_name, data_root, learning_mode="supervised",
+            csi_dataset_name, csi_data_root, learning_mode="supervised",
         )
         # 优先用 val，fallback test
         adv_dataset = csi_bundle.val if csi_bundle.val is not None else csi_bundle.test
@@ -182,10 +203,11 @@ def _build_csi_adversarial_loader(
             )
             return None
         return DataLoader(adv_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    except Exception as e:
+    except (FileNotFoundError, ValueError) as e:
         _logger.warning(
-            "csi_adversarial_loader: failed to load CSI dataset=%s: %s, "
-            "DANN adversarial branch will be skipped", csi_dataset_name, e,
+            "csi_adversarial_loader: failed to load CSI dataset=%s (%s: %s), "
+            "DANN adversarial branch will be skipped",
+            csi_dataset_name, type(e).__name__, e,
         )
         return None
 
@@ -251,17 +273,33 @@ def stage_load(ctx: PipelineContext) -> PipelineContext:
     if ctx.config.scene.params is not None:
         use_dann = bool(ctx.config.scene.params.get("use_dann", False))
     if use_dann and pretrain_dataset and pretrain_dataset in _CSI_DATASETS:
+        # I6 修复：CSI 数据集独立 data_root。跨模态场景下 EEG 的 data_root
+        # 传给 WiFiCSIContainer 会加载失败（被 except 吞掉静默降级），
+        # csi_data_root 让 CSI 对抗信号从正确目录加载。
+        # 未配置时 fallback 到 target data_root（向后兼容）。
+        csi_data_root = None
+        if ctx.config.scene.params is not None:
+            csi_data_root = ctx.config.scene.params.get("csi_data_root")
+        if csi_data_root is None:
+            csi_data_root = data_root
         csi_loader = _build_csi_adversarial_loader(
             pretrain_dataset,
-            data_root,
+            csi_data_root,
             ctx.config.trainer.batch_size,
         )
         if csi_loader is not None:
             ctx.scene_kwargs["csi_loader"] = csi_loader
             _logger.info(
                 "stage_load: csi_adversarial_loader injected for DANN "
-                "(dataset=%s)", pretrain_dataset,
+                "(dataset=%s, csi_data_root=%s)", pretrain_dataset, csi_data_root,
             )
+    elif use_dann:
+        # I8 修复：use_dann=True 但 pretrain_source 未配置或解析结果非 CSI 数据集时，
+        # DANN 对抗分支未启用。显式 warning 提示用户（避免期望对抗训练生效却静默关闭）。
+        _logger.warning(
+            "stage_load: use_dann=True 但 pretrain_source 未配置或非 CSI 数据集，"
+            "DANN 对抗分支未启用（需配置 pretrain_source 为 CSI 数据集以启用对抗训练）"
+        )
 
     # 任务2：计算 data_hash（数据集元数据哈希）。
     # 不读取文件内容做全量 hash，只 hash 元数据（路径+大小+mtime），

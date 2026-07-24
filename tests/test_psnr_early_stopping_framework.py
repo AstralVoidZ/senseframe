@@ -78,7 +78,7 @@ class TestPSNREarlyStoppingCallback:
     def test_on_validation_epoch_end_noop_without_cache(self):
         """pl_module 无缓存张量时，on_validation_epoch_end 应为 no-op。"""
         cb = PSNREarlyStoppingCallback(patience=1, min_delta=0.1)
-        trainer = types.SimpleNamespace(should_stop=False)
+        trainer = types.SimpleNamespace(should_stop=False, sanity_checking=False)
         pl_module = types.SimpleNamespace(log=lambda *args, **kwargs: None)
         cb.on_validation_epoch_end(trainer, pl_module)
         assert cb.should_stop is False
@@ -88,7 +88,7 @@ class TestPSNREarlyStoppingCallback:
     def test_on_validation_epoch_end_triggers_stop_with_cache(self):
         """pl_module 有缓存张量 + patience=1 + min_delta=0.1：第二次无提升应触发停止。"""
         cb = PSNREarlyStoppingCallback(patience=1, min_delta=0.1)
-        trainer = types.SimpleNamespace(should_stop=False)
+        trainer = types.SimpleNamespace(should_stop=False, sanity_checking=False)
         log_calls = []
         pl_module = types.SimpleNamespace(
             _psnr_reconstruction=torch.zeros(2, 3, 4),
@@ -110,3 +110,33 @@ class TestPSNREarlyStoppingCallback:
         assert len(log_calls) == 2
         assert log_calls[0][0][0] == "val_psnr"
         assert log_calls[1][0][0] == "val_psnr"
+
+    def test_sanity_check_does_not_pollute_best_psnr(self):
+        """I9 修复：sanity_check 阶段不应污染 best_psnr 状态机。
+
+        背景：Lightning fit 开始跑 sanity check，未训练模型的 PSNR 会写入 best_psnr，
+        导致后续早停判断错乱。项目其他 on_validation_epoch_end 均有此守卫。
+        """
+        from unittest.mock import MagicMock
+
+        callback = PSNREarlyStoppingCallback(patience=3, min_delta=0.0)
+
+        # 模拟 sanity_check 阶段
+        trainer = MagicMock()
+        trainer.sanity_checking = True
+        pl_module = MagicMock()
+        # pl_module 有缓存（模拟 validation_step 已写入）
+        pl_module._psnr_reconstruction = torch.randn(10)
+        pl_module._psnr_target = torch.randn(10)
+
+        # 记录初始状态
+        initial_best_psnr = callback.best_psnr
+
+        callback.on_validation_epoch_end(trainer, pl_module)
+
+        # 验证 best_psnr 未被修改
+        assert callback.best_psnr == initial_best_psnr, "sanity_check 阶段不应更新 best_psnr"
+        # 验证 counter 未被修改
+        assert callback.counter == 0, "sanity_check 阶段不应更新 counter"
+        # 验证 should_stop 未被触发
+        assert callback.should_stop is False, "sanity_check 阶段不应触发 should_stop"

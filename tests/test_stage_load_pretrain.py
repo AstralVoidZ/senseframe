@@ -80,6 +80,62 @@ class TestLoadPretrainCheckpoint:
         assert result is not None
         assert os.path.basename(result) == "ckpt_new_NTU-Fi_HAR.ckpt"
 
+    def test_load_pretrain_supports_pt_extension(self, tmp_path):
+        """I5 修复：loader 应同时支持 .pt 和 .ckpt 扩展名。
+
+        producer（scripts/p0_pretrain_with_psnr.py）产出 .pt 文件，
+        loader 旧实现仅搜索 *.ckpt 导致 pretrain 静默失效。
+        """
+        import torch
+        from senseframe.engine.runner.pipeline.stages.load import _load_pretrain_checkpoint
+
+        runs_dir = tmp_path / "runs"
+        runs_dir.mkdir()
+        # 构造 producer 实际产出的 .pt 文件（backbone_state_dict 格式）
+        pt_file = runs_dir / "ntu_pretrain_test_psnr30p0.pt"
+        model = torch.nn.Linear(10, 5)
+        torch.save({"backbone_state_dict": model.state_dict()}, pt_file)
+
+        result = _load_pretrain_checkpoint("test", str(tmp_path))
+        assert result is not None
+        assert str(result).endswith(".pt")
+
+    def test_load_pretrain_searches_output_dir_directly(self, tmp_path):
+        """I5 修复：producer 直接产出在 output_dir（非 runs/）也应被找到。
+
+        scripts/p0_pretrain_with_psnr.py:273 把 .pt 保存到 output_dir 直接，
+        旧 loader 仅搜索 output_dir/runs/，导致 producer 产出无法被发现。
+        """
+        import torch
+        from senseframe.engine.runner.pipeline.stages.load import _load_pretrain_checkpoint
+
+        # 直接在 output_dir 下放 .pt 文件（模拟 producer 真实产出位置）
+        pt_file = tmp_path / "ntu_pretrain_NTU-Fi_HAR_psnr35p0.pt"
+        model = torch.nn.Linear(10, 5)
+        torch.save({"backbone_state_dict": model.state_dict()}, pt_file)
+
+        result = _load_pretrain_checkpoint("NTU-Fi_HAR", str(tmp_path))
+        assert result is not None
+        assert str(result).endswith(".pt")
+
+    def test_load_pretrain_pt_and_ckpt_returns_latest(self, tmp_path):
+        """I5 修复：.pt 和 .ckpt 共存时返回 mtime 最新的。"""
+        import torch
+        from senseframe.engine.runner.pipeline.stages.load import _load_pretrain_checkpoint
+
+        runs_dir = tmp_path / "runs"
+        runs_dir.mkdir()
+        ckpt_file = runs_dir / "ntu_pretrain_test_old.ckpt"
+        pt_file = runs_dir / "ntu_pretrain_test_new.pt"
+        ckpt_file.write_text("old")
+        torch.save({"backbone_state_dict": torch.nn.Linear(2, 2).state_dict()}, pt_file)
+        os.utime(ckpt_file, (1000, 1000))
+        os.utime(pt_file, (2000, 2000))
+
+        result = _load_pretrain_checkpoint("test", str(tmp_path))
+        assert result is not None
+        assert str(result).endswith(".pt")
+
 
 class TestStageLoadPretrainIntegration:
     """验证 stage_load 集成 pretrain_source。"""

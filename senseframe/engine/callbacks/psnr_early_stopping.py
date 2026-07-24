@@ -81,6 +81,9 @@ class PSNREarlyStoppingCallback(Callback):
         从 pl_module 缓存的 reconstruction_batch / target_batch 取数据。
         若模块未缓存，跳过（no-op）。
         """
+        # I9 修复：sanity_check 阶段不污染状态机（与其他 on_validation_epoch_end 对齐）
+        if trainer.sanity_checking:
+            return
         recon = getattr(pl_module, "_psnr_reconstruction", None)
         target = getattr(pl_module, "_psnr_target", None)
         if recon is None or target is None:

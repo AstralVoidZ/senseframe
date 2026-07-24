@@ -195,22 +195,18 @@ class SelfSupervisedModule(pl.LightningModule):
         # Tradeoff：每个 batch 覆盖缓存，仅保留最后一个 batch 的重建。
         # 这避免 cat 累积所有 batch 导致显存膨胀，PSNR 用单 batch 作代表已足够指示趋势。
         # 若需更精确的 epoch 级 PSNR，应改为 accumulate + on_validation_epoch_end 聚合。
-        if hasattr(self.model, "_mae_forward_loss") and hasattr(self.model, "patch_embedder"):
+        # I11 修复：改用 mae_reconstruct 公共方法，消除 _forward_encoder/_forward_decoder 私有方法外调
+        # I12 修复：except Exception as e + _logger.warning，避免静默吞异常
+        # I13 修复：缓存张量 .detach().cpu()，避免 GPU 显存泄漏
+        if hasattr(self.model, "mae_reconstruct"):
             try:
-                target = self.model.patch_embedder.to_patches(x)
-                # 用 model 的 masking + encoder + decoder 生成重建
-                patches = self.model.patch_embedder.proj(target) + getattr(self.model, "pos_embed", 0)
                 mask_ratio = getattr(self.model, "_mask_ratio", 0.75)
-                x_visible, mask, ids_restore = self.model.random_masking(patches, mask_ratio=mask_ratio)
-                enc_out = self.model._forward_encoder(x_visible)
-                recon = self.model._forward_decoder(enc_out, ids_restore)
-                # 仅取 masked patches（与 scripts/p0_pretrain_with_psnr.py 对齐）
-                mask_bool = mask.bool() if hasattr(mask, 'bool') else mask > 0
-                self._psnr_reconstruction = recon[mask_bool].detach()
-                self._psnr_target = target[mask_bool].detach()
+                recon, target, mask = self.model.mae_reconstruct(x, mask_ratio)
+                mask_bool = mask.bool()  # M13 修复：简化死分支
+                self._psnr_reconstruction = recon[mask_bool].detach().cpu()  # I13: 加 .cpu()
+                self._psnr_target = target[mask_bool].detach().cpu()
             except Exception as e:
-                # 重建失败不中断验证，PSNR callback 会 no-op
-                _logger.debug("PSNR reconstruction cache failed: %s", e)
+                _logger.warning("PSNR reconstruction cache failed: %s", e, exc_info=True)  # I12: debug→warning
                 self._psnr_reconstruction = None
                 self._psnr_target = None
 
