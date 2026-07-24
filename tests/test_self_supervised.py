@@ -1,12 +1,14 @@
-"""SelfSupervisedModule training_log schema 对齐测试（批次 3 Group B / I18+I19）。
+"""SelfSupervisedModule training_log schema 细节测试。
 
-验证 on_validation_epoch_end 的 epoch_entry：
-- epoch 字段不带 +1（与 GenericLightningModule 对齐，I18）
-- 含 lr + train_accuracy 字段（与 DANN 路径 + schemas.TrainingLogEntry 对齐，I19）
+I18/I19 的修复锁定已迁移至 L4 回归测试：
+- tests/unit/l4_regression/test_v019_training_log_epoch_offbyone.py（I18 epoch 无 +1）
+- tests/unit/l4_regression/test_v020_training_log_schema_fields.py（I19 字段存在）
+
+本文件保留 I19 的细节行为测试（lr 具体值、train_accuracy 为 None、缺键回退），
+这些用例 L4 未完全覆盖（L4 只验证字段存在，不验证具体值）。
 
 参考：
 - senseframe/engine/self_supervised.py:on_validation_epoch_end
-- senseframe/engine/module.py:on_validation_epoch_end（GenericLightningModule 参照）
 - senseframe/schemas.py:TrainingLogEntry（字段契约）
 """
 from __future__ import annotations
@@ -44,38 +46,6 @@ class TestSelfSupervisedTrainingLogSchema:
         trainer.callback_metrics = callback_metrics or {}
         module._trainer = trainer
         return trainer
-
-    def test_epoch_field_not_plus_one(self):
-        """I18：epoch 字段应等于 current_epoch，不带 +1。
-
-        对照 GenericLightningModule（module.py L623）已去掉 +1，
-        SelfSupervisedModule 应保持一致以便跨阶段对比。
-        """
-        module = self._build_module(phase="supervised")
-        self._attach_mock_trainer(module, current_epoch=5)
-        module._current_epoch_loss = 0.5
-        module._current_epoch_steps = 2
-
-        module.on_validation_epoch_end()
-
-        assert len(module.training_log) == 1
-        entry = module.training_log[0]
-        # I18 关键断言：epoch == current_epoch（无 +1）
-        assert entry["epoch"] == 5, f"epoch 应为 5（不带 +1），实际 {entry['epoch']}"
-
-    def test_training_log_entry_contains_lr_and_train_accuracy(self):
-        """I19：entry 必含 lr + train_accuracy 字段（schemas.TrainingLogEntry 契约）。"""
-        module = self._build_module(phase="supervised")
-        self._attach_mock_trainer(module, current_epoch=2)
-        module._current_epoch_loss = 0.5
-        module._current_epoch_steps = 2
-
-        module.on_validation_epoch_end()
-
-        entry = module.training_log[0]
-        # I19 关键断言：必含 lr + train_accuracy 字段
-        assert "lr" in entry, "training_log entry 缺 lr 字段（I19）"
-        assert "train_accuracy" in entry, "training_log entry 缺 train_accuracy 字段（I19）"
 
     def test_lr_read_from_callback_metrics_learning_rate(self):
         """I19：lr 应从 callback_metrics['learning_rate'] 读取。

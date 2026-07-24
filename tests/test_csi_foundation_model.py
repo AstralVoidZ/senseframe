@@ -377,25 +377,8 @@ class TestPretrainMAE:
             loss = model._mae_forward_loss(x, mask_ratio=0.5)
         assert torch.isfinite(loss)
 
-    def test_pretrain_sets_mask_ratio_attribute(self):
-        """I10 修复：pretrain 方法应设置 _mask_ratio 属性供 validation_step 读取。
-
-        背景：原实现 _mask_ratio 是幻影属性，CSIFoundationModel 从未设置，
-        getattr 永远返回 0.75。若训练用非 0.75 的 mask_ratio，PSNR 验证口径不一致。
-        """
-        model = _make_small_model()
-
-        # 初始 _mask_ratio 应为默认值 0.75
-        assert model._mask_ratio == 0.75, "初始 _mask_ratio 应为默认值 0.75"
-
-        # pretrain 时应写入 config.mask_ratio
-        config = PretrainConfig(epochs=1, learning_rate=0.001, mask_ratio=0.5)
-        # 构造一个空 DataLoader（pretrain 会遍历，空则跳过）
-        model.pretrain([], config)
-
-        assert model._mask_ratio == 0.5, (
-            "pretrain 后 _mask_ratio 应为 config.mask_ratio (0.5)"
-        )
+    # I10 修复验证已迁移至 L4 回归测试：
+    # tests/unit/l4_regression/test_v004_mask_ratio_attribute.py
 
 
 # ============================================================
@@ -750,24 +733,7 @@ class TestReplacePatchEmbedder:
         assert torch.isfinite(out).all()
 
 
-# ============================================================
-# TestMAEReconstruct
-# ============================================================
-def test_mae_reconstruct_returns_valid_tensors():
-    """I11 修复：mae_reconstruct 应返回 (recon, target, mask) 三个张量。"""
-    from senseframe.scenes.wifi_csi.foundation_model import CSIFoundationModel
-
-    model = CSIFoundationModel(input_shape=(3, 32), d_model=16, n_heads=2, patch_len=16, decoder_dim=8)
-    x = torch.randn(2, 3, 32)
-
-    recon, target, mask = model.mae_reconstruct(x, mask_ratio=0.75)
-
-    # 验证 shape
-    n_patches = model.n_patches  # 32 // 16 = 2
-    patch_len_C = 16 * 3  # 48
-    assert recon.shape == (2, n_patches, patch_len_C)
-    assert target.shape == (2, n_patches, patch_len_C)
-    assert mask.shape == (2, n_patches)
-    # mask 应含 0 和 1
-    assert mask.min() >= 0
-    assert mask.max() <= 1
+# I11 修复验证已迁移至 L4 回归测试：
+# tests/unit/l4_regression/test_v011_mae_reconstruct_public.py
+# MAE 前向行为（论文锚点 He 2022）已迁移至 L3 算法行为测试：
+# tests/unit/l3_algorithm/test_mae_forward_behavior.py

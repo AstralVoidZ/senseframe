@@ -140,51 +140,18 @@ class TestPrunerRegistry:
 # P2.2: ASHASampler
 # ============================================================
 class TestASHASampler:
-    """ASHASampler 行为验证（双契约 Sampler+Pruner）。"""
+    """ASHASampler 行为验证（双契约 Sampler+Pruner）。
 
-    def test_satisfies_sampler_protocol(self):
-        """ASHASampler 应满足 Sampler Protocol。"""
-        asha = ASHASampler()
-        assert isinstance(asha, Sampler)
+    注：Sampler 协议、name、sample()、maximize 剪枝、数据不足、rung 缺失等
+    ASHA 核心行为已由 tests/unit/l3_algorithm/test_asha_sampler_behavior.py
+    从论文锚点（Li et al., 2018）重新设计覆盖。本类保留 L3 未覆盖的细节：
+    Pruner 协议、minimize 方向、重复记录防护、多 rung 独立跟踪。
+    """
 
     def test_satisfies_pruner_protocol(self):
         """ASHASampler 应满足 Pruner Protocol。"""
         asha = ASHASampler()
         assert isinstance(asha, Pruner)
-
-    def test_name(self):
-        """ASHASampler.name 应为 'asha'。"""
-        assert ASHASampler.name == "asha"
-
-    def test_sample_returns_valid_params(self):
-        """sample() 应返回搜索空间内的有效参数。"""
-        asha = ASHASampler()
-        ss = _make_search_space()
-        params = asha.sample(ss, [])
-        assert "lr" in params
-        assert "hidden" in params
-        assert "opt" in params
-        assert params["opt"] in ["adam", "sgd"]
-        assert 0.001 <= params["lr"] <= 0.1
-        assert 16 <= params["hidden"] <= 128
-
-    def test_should_prune_data_insufficient(self):
-        """数据点不足 eta 时不剪枝。"""
-        asha = ASHASampler(eta=3)
-        # 1 个 trial，不足 eta=3
-        assert asha.should_prune("t1", {0: 0.5}, 0) is False
-        # 2 个 trial，仍不足
-        assert asha.should_prune("t2", {0: 0.6}, 0) is False
-
-    def test_should_prune_maximize_keeps_high(self):
-        """maximize 方向：保留高值，剪枝低值。"""
-        asha = ASHASampler(eta=3, direction="maximize")
-        asha.should_prune("t1", {0: 0.5}, 0)  # False (不足)
-        asha.should_prune("t2", {0: 0.6}, 0)  # False (不足)
-        # 3 个 trial, eta=3, n_keep=1, top 1 = 0.7 (t3)
-        assert asha.should_prune("t3", {0: 0.7}, 0) is False  # t3 保留（最高）
-        # 4 个 trial, n_keep=4//3=1, top 1 = 0.7 (t3)
-        assert asha.should_prune("t4", {0: 0.4}, 0) is True   # t4 剪枝（最低）
 
     def test_should_prune_minimize_keeps_low(self):
         """minimize 方向：保留低值，剪枝高值。"""
@@ -195,11 +162,6 @@ class TestASHASampler:
         assert asha.should_prune("t3", {0: 0.4}, 0) is False
         # t4=0.7 剪枝（最高值）
         assert asha.should_prune("t4", {0: 0.7}, 0) is True
-
-    def test_should_prune_rung_not_in_values(self):
-        """rung 不在 intermediate_values 中时不剪枝。"""
-        asha = ASHASampler(eta=3)
-        assert asha.should_prune("t1", {1: 0.5}, 0) is False
 
     def test_should_prune_no_duplicate_recording(self):
         """同一 trial_id 多次调用不应重复记录。"""

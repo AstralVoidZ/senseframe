@@ -57,6 +57,7 @@ dependencies = [
     "scikit-learn>=1.0.0",
     "einops>=0.6.0",        # SenseFi 基准模型隐式依赖
     "optuna>=3.5.0",        # HPO 超参搜索（Stage 4）
+    "mcp>=1.0.0",           # MCP server（senseframe.mcp 核心模块依赖）
 ]
 
 [project.optional-dependencies]
@@ -143,6 +144,11 @@ markers = [
     "slow: 标记跑得慢的测试",
     "integration: 集成测试（需要真实数据集/模型）",
     "gpu: 需要 GPU 的测试",
+    # 测试分层重构（plan_test_refactor_v1.md）：4 层 marker
+    "l1_contract: L1 外部协议契约测试（锚点：外部协议/库 API）",
+    "l2_orchestration: L2 编排 spec 契约测试（锚点：项目内 RFC/设计文档）",
+    "l3_algorithm: L3 算法行为测试（锚点：论文/官方实现）",
+    "l4_regression: L4 回归测试（锚点：bug 编号 + 修复 commit）",
 ]
 
 # ============================================================

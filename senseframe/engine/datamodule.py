@@ -46,7 +46,10 @@ if hasattr(_dl_mod, "_MultiProcessingDataLoaderIter") and not getattr(
     _dl_mod, "_sf_pipe_leak_patch_applied", False
 ):
     _orig_shutdown_workers = _dl_mod._MultiProcessingDataLoaderIter._shutdown_workers
-    _orig_clean_up_worker = _dl_mod._MultiProcessingDataLoaderIter._clean_up_worker
+    # torch 2.13+ 移除了 _clean_up_worker，仅存在时才 patch
+    _orig_clean_up_worker = getattr(
+        _dl_mod._MultiProcessingDataLoaderIter, "_clean_up_worker", None
+    )
 
     def _patched_shutdown_workers(self) -> None:
         _orig_shutdown_workers(self)
@@ -59,19 +62,21 @@ if hasattr(_dl_mod, "_MultiProcessingDataLoaderIter") and not getattr(
             except Exception:
                 pass
 
-    @staticmethod
-    def _patched_clean_up_worker(w) -> None:
-        # w.close() 后 Process._closed=True，原 _clean_up_worker 调 w.is_alive() 会
-        # 抛 ValueError("process object is closed")。此处对 closed process 安全跳过。
-        if getattr(w, "_closed", False):
-            return
-        try:
-            _orig_clean_up_worker(w)
-        except (ValueError, OSError):
-            pass
+    if _orig_clean_up_worker is not None:
+        @staticmethod
+        def _patched_clean_up_worker(w) -> None:
+            # w.close() 后 Process._closed=True，原 _clean_up_worker 调 w.is_alive() 会
+            # 抛 ValueError("process object is closed")。此处对 closed process 安全跳过。
+            if getattr(w, "_closed", False):
+                return
+            try:
+                _orig_clean_up_worker(w)
+            except (ValueError, OSError):
+                pass
+
+        _dl_mod._MultiProcessingDataLoaderIter._clean_up_worker = _patched_clean_up_worker
 
     _dl_mod._MultiProcessingDataLoaderIter._shutdown_workers = _patched_shutdown_workers
-    _dl_mod._MultiProcessingDataLoaderIter._clean_up_worker = _patched_clean_up_worker
     _dl_mod._sf_pipe_leak_patch_applied = True
 
 

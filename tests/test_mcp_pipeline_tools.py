@@ -222,38 +222,18 @@ class TestPipelineRunStoreCRUD:
 
 
 class TestStateMachine:
-    """5 状态 + 7 转换 + 3 幂等短路的 FSM 测试。"""
+    """5 状态 + 7 转换 + 3 幂等短路的 FSM 测试。
 
-    def test_valid_transitions_count(self):
-        """VALID_TRANSITIONS 必须含 7 个合法转换。"""
-        assert len(VALID_TRANSITIONS) == 7
+    注意：合法转换的完整验证已迁移至 L1 契约测试
+    tests/unit/l1_contract/test_k8s_crd_state_machine.py（硬编码 7 转换期望值，
+    锚点为设计文档 0.6 节）。此处保留反向用例（非法转换抛异常）。
+    """
 
     def test_all_states_have_constant_strings(self):
         """5 状态必须是字符串常量。"""
         for state in (STATE_PENDING, STATE_RUNNING, STATE_PAUSED, STATE_SUCCEEDED, STATE_FAILED):
             assert isinstance(state, str)
             assert state in {"Pending", "Running", "Paused", "Succeeded", "Failed"}
-
-    def test_trigger_pending_to_running(self):
-        assert trigger(STATE_PENDING, "start") == STATE_RUNNING
-
-    def test_trigger_pending_to_failed_skip(self):
-        assert trigger(STATE_PENDING, "skip") == STATE_FAILED
-
-    def test_trigger_running_to_succeeded(self):
-        assert trigger(STATE_RUNNING, "complete") == STATE_SUCCEEDED
-
-    def test_trigger_running_to_failed(self):
-        assert trigger(STATE_RUNNING, "fail") == STATE_FAILED
-
-    def test_trigger_running_to_paused(self):
-        assert trigger(STATE_RUNNING, "pause") == STATE_PAUSED
-
-    def test_trigger_paused_to_running_resume(self):
-        assert trigger(STATE_PAUSED, "resume") == STATE_RUNNING
-
-    def test_trigger_failed_to_running_retry(self):
-        assert trigger(STATE_FAILED, "retry") == STATE_RUNNING
 
     def test_trigger_illegal_transition_raises(self):
         """非法转换必须抛 IllegalTransition。"""
@@ -670,11 +650,6 @@ class TestHateoasTransitions:
         # 无 prerequisites
         for t in transitions:
             assert t.prerequisites == []
-
-    def test_transitions_total_count_across_states(self):
-        """所有状态下的 transitions 总数 = 7（与 VALID_TRANSITIONS 一致）。"""
-        total = sum(len(defs) for defs in _TRANSITIONS_BY_STATE.values())
-        assert total == 7
 
     def test_transitions_def_frozen(self):
         """TransitionDef 是 frozen dataclass。"""

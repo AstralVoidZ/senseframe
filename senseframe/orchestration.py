@@ -295,6 +295,7 @@ class CloudEvent:
     type: str = ""
     time: str = ""
     datacontenttype: str = "application/json"
+    subject: str = ""
     data: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -308,6 +309,7 @@ class CloudEvent:
             "specversion": self.specversion, "id": self.id,
             "source": self.source, "type": self.type,
             "time": self.time, "datacontenttype": self.datacontenttype,
+            "subject": self.subject,
             "data": self.data,
         }
 

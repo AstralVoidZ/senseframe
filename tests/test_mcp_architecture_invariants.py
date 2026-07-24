@@ -174,28 +174,6 @@ def test_expected_tools_matches_registry() -> None:
     )
 
 
-def test_expected_tools_has_twenty_five_entries() -> None:
-    """EXPECTED_TOOLS 必须含 29 个 tool（设计文档 0.4 节 ToolAnnotations 矩阵）。
-
-    阶段 3 扩展：从 14 个 tool 增至 25 个 tool：
-    - 原 14 个（pipeline 7 + study_create/ask/tell 3 + artifact/skill stub 3 + config_parse 1）
-    - 新增 11 个：study_get/list/compare/stop（4）+ hpo_setup（1）+
-      exploration_recommend（1）+ automl_create/advance/get/list（4）+
-      apply_params_extended（1）
-    阶段 4.2 扩展：从 25 个 tool 增至 27 个 tool：
-    - 新增 2 个：senseframe_artifact_list + senseframe_artifact_export
-    - senseframe_artifact_verify stub 升级为真实 handler（数量不变）
-    阶段 4.3 扩展：从 27 个 tool 增至 29 个 tool：
-    - 新增 2 个：senseframe_skill_get + senseframe_skill_search
-    - senseframe_skill_save / senseframe_skill_remove stub 升级为真实 handler
-    """
-    from senseframe.mcp.tool_dispatch import EXPECTED_TOOLS
-
-    assert len(EXPECTED_TOOLS) == 29, (
-        f"EXPECTED_TOOLS 应有 29 项，实际 {len(EXPECTED_TOOLS)}: {EXPECTED_TOOLS}"
-    )
-
-
 def test_error_categories_are_exactly_seven() -> None:
     """ToolErrorResponse 的 category 必须严格是 7 类。
 

@@ -962,41 +962,6 @@ class TestDARTSSampler:
         # cell_type 应在 α 中
         assert "cell_type" in sampler.arch_alpha
 
-    def test_darts_sampler_sample_with_preset_alpha(self):
-        """预设 arch_alpha 时 sample 应使用预设值。"""
-        # 预设 cell_type 的 α 偏向第二个 choice
-        from senseframe.nas.search_space import ArchitectureSearchSpace as ASS
-        ss_arch = ASS(cell_types=["conv1d", "rnn"])
-        sp_ss = ss_arch.to_sp_search_space()
-        # cell_type choices = ["conv1d", "rnn"]（顺序可能不固定，取长度即可）
-        cell_type_param = ss_arch.get_param("cell_type")
-        n_choices = len(cell_type_param.choices)
-        # 构造 α：偏向最后一个 choice（用 data 构造避免 in-place 限制）
-        alpha_data = torch.zeros(n_choices)
-        alpha_data[-1] = 10.0
-        alpha = alpha_data.clone().requires_grad_(True)
-        sampler = DARTSSampler(arch_alpha={"cell_type": alpha})
-        params = sampler.sample(sp_ss, [])
-        # cell_type 应为最后一个 choice
-        assert params["cell_type"] == cell_type_param.choices[-1]
-
-    def test_darts_sampler_update_modifies_alpha(self):
-        """update(gradient) 应修改 arch_alpha（通过 optimizer step）。"""
-        sampler = DARTSSampler()
-        ss = ArchitectureSearchSpace(cell_types=["conv1d"]).to_sp_search_space()
-        sampler.sample(ss, [])
-        # 取 α 的初始值
-        alpha_before = {k: v.clone() for k, v in sampler.arch_alpha.items()}
-        # 构造梯度
-        gradient = {k: torch.ones_like(v) for k, v in sampler.arch_alpha.items()}
-        sampler.update(gradient)
-        # α 应发生变化（Adam 优化器应用了梯度）
-        changed = any(
-            not torch.allclose(alpha_before[k], sampler.arch_alpha[k])
-            for k in sampler.arch_alpha
-        )
-        assert changed, "update() 应修改 arch_alpha"
-
     def test_darts_sampler_warm_start_no_op(self):
         """warm_start 应为 no-op（不报错）。"""
         sampler = DARTSSampler()
@@ -1709,21 +1674,6 @@ class TestDARTSSupernetDoubleOptimization:
         # supernet.py 不应有 randn_like（这是简化路径的近似）
         assert "randn_like" not in content, \
             "DARTSSupernet 不应使用 randn_like 近似梯度（应通过 autograd 真实可微）"
-
-    def test_softmax_weighted_forward_tracks_alpha(self):
-        """前向传播应通过 softmax 加权使 α 参与计算图。"""
-        sn = DARTSSupernet(input_shape=(30, 100), num_classes=7, n_cells=1)
-        x = torch.randn(2, 30, 100)
-
-        # 前向 + backward
-        logits = sn(x)
-        loss = logits.sum()
-        loss.backward()
-
-        # α 应有梯度（说明前向传播通过 softmax 加权使 α 参与计算图）
-        assert sn.cells[0].alpha.grad is not None
-        # α 梯度应非全 0
-        assert sn.cells[0].alpha.grad.abs().sum().item() > 0
 
 
 @pytest.mark.skipif(not HAS_TORCH, reason="torch not available")

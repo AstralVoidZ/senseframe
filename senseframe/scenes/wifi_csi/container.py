@@ -9,7 +9,7 @@ WiFi CSI 场景容器：封装 4 数据集 + 11 模型 + 归一化。
 Phase 3.1：NORMALIZATION_CONSTANTS 单一来源在 data.py，此处仅做 re-export
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn

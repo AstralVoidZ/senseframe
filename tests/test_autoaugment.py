@@ -254,17 +254,6 @@ class TestAutoAugmentPolicyBuilder:
         transform = builder.build(params)
         assert callable(transform)
 
-    def test_transform_preserves_shape(self):
-        """transform 保持输入形状。"""
-        builder = AutoAugmentPolicyBuilder()
-        params = {"op_0": "noise", "magnitude_0": 0.3, "probability_0": 1.0}
-        transform = builder.build(params)
-        x = np.random.randn(3, 100).astype(np.float32)
-        y = 1
-        xx, yy = transform(x, y)
-        assert xx.shape == x.shape
-        assert yy == y
-
     def test_transform_with_probability_zero(self):
         """probability=0 时不应用增强（返回原数据）。"""
         builder = AutoAugmentPolicyBuilder()

@@ -25,7 +25,7 @@ P3 演进（2026-07-18）：引入 schema_version 字段到 metadata.json，支�
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .runner.errors import MetadataVersionError
 

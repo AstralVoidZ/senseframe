@@ -33,6 +33,15 @@ _BOOTSTRAP_ROOT = Path(__file__).resolve().parents[1]
 if str(_BOOTSTRAP_ROOT) not in sys.path:
     sys.path.insert(0, str(_BOOTSTRAP_ROOT))
 
+# 测试分层重构（plan_test_refactor_v1.md）：
+# 让 tests/ 自身可作为包导入，使 tests/fakes/ 与 tests/unit/l*/conftest.py
+# 中的 `from tests.fakes.xxx import` 生效。不创建 tests/__init__.py 以避免
+# 影响 pytest rootdir 收集语义；改为在 sys.path 中加入 tests/ 父目录并确保
+# tests 包可被 import。
+_TESTS_ROOT = Path(__file__).resolve().parent
+if str(_TESTS_ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(_TESTS_ROOT.parent))
+
 # 单一数据源：bootstrap 后从 senseframe.common.paths 导入 PROJECT_ROOT
 from senseframe.common.paths import PROJECT_ROOT  # noqa: E402
 
@@ -47,6 +56,11 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "e2e: 端到端测试（需数据集，默认跳过）")
     config.addinivalue_line("markers", "slow: 耗时测试（默认跳过，-m slow 启用）")
     config.addinivalue_line("markers", "requires_data: 依赖真实数据目录")
+    # 测试分层重构（plan_test_refactor_v1.md）：4 层 marker
+    config.addinivalue_line("markers", "l1_contract: L1 外部协议契约测试（锚点：外部协议/库 API）")
+    config.addinivalue_line("markers", "l2_orchestration: L2 编排 spec 契约测试（锚点：项目内 RFC/设计文档）")
+    config.addinivalue_line("markers", "l3_algorithm: L3 算法行为测试（锚点：论文/官方实现）")
+    config.addinivalue_line("markers", "l4_regression: L4 回归测试（锚点：bug 编号 + 修复 commit）")
 
 
 def pytest_collection_modifyitems(config, items):
