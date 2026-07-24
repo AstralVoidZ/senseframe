@@ -16,11 +16,16 @@
 
 ## 文件清单
 
-| 文件 | 难度 | 场景 | 耗时 | 覆盖特性 |
-|------|------|------|------|----------|
-| [01_simple_training_prompt.md](./01_simple_training_prompt.md) | 简单 | 单模型监督训练 | 5-15 min | 声明式路径、配置校验、预检、基础训练、错误码 |
-| [02_medium_hpo_prompt.md](./02_medium_hpo_prompt.md) | 中等 | HPO 超参搜索 + 多模型对比 | 15-40 min | HPO、Ask-Tell、ExplorationTracker、资源路由、技能库 |
-| [03_hard_full_loop_prompt.md](./03_hard_full_loop_prompt.md) | 困难 | 完整闭环 + 自监督 + 断点续跑 | 30-90 min | 自监督两阶段、Pipeline 编排、断点续跑、自省协议全量、导出 |
+| 文件 | 难度 | 描述 | 预计时长 |
+|------|------|------|----------|
+| `closed_loop_demo.py` | 中等 | 探索闭环演示：ExplorationTracker + recommend_next + SearchSpaceMap + 技能库 | 2-5 min |
+
+## 即将推出
+
+以下 prompt 模板正在规划中，暂未实现：
+- `01_simple_training_prompt.md`（简单）：单次训练 + 产物校验
+- `02_medium_hpo_prompt.md`（中等）：HPO 超参搜索 + 技能库
+- `03_hard_full_loop_prompt.md`（困难）：完整闭环（数据画像 → 训练 → 探索反馈 → 迭代）
 
 ## 自省协议规范
 

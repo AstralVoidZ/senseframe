@@ -16,9 +16,9 @@ SenseFrame 让 Agent 持有训练流程控制权：框架提供可组合的 Stag
 - **数据驱动** — `DataProfiler` 探查数据特征并推荐策略（task_type / loss / metric / normalization）
 - **可编程训练流程** — 9 个 Stage 可替换、插入 hook、跳过、断点续跑
 - **声明式 + 命令式** — YAML 快速启动，代码注入自定义逻辑
-- **资源感知路由** — 自动探测 CPU/GPU/内存，7 级路由选择训练路线
+- **资源感知路由** — 自动探测 CPU/GPU/内存，5 级路由选择训练路线
 - **自愈重试** — OOM 自动降 `batch_size` 重试
-- **结构化异常** — `SenseFrameError` 基类 + 12 个子类，每个携带 `error_code`，消除字符串匹配
+- **结构化异常** — `SenseFrameError` 基类 + 20 个错误码，每个携带 `error_code`，消除字符串匹配
 - **产物溯源** — `ArtifactManifest` 记录全部产物 SHA-256，`verify_artifacts()` 校验完整性
 - **资源安全** — `release_resources()` 主动清理 Trainer / DataLoader / Logger / GPU 显存
 - **自省协议** — `context_schema()` / `stage_io()` / `pipeline_graph()` 查询字段契约，无需读源码
@@ -27,6 +27,11 @@ SenseFrame 让 Agent 持有训练流程控制权：框架提供可组合的 Stag
 - **自监督学习** — 两阶段训练（AutoFi 风格 EntLoss 预训练 + 监督微调）
 - **多格式导出** — ONNX / TorchScript / state_dict / 量化 ONNX
 - **推理服务** — KServe v2 兼容 HTTP API + OTel 指标
+- **MCP 服务器** — 通过 Model Context Protocol 与 Agent 交互，提供 10+ 工具和 12 个自省资源
+- **NAS** — 内置 DARTS/ENAS/Evolutionary 架构搜索 + 真实可微超网
+- **AutoAugment** — 进化搜索数据增强策略，5种增强原语
+- **AutoML/PEFT** — LoRA/Adapter/PrefixTuning/PromptTuning 参数高效微调 + SP 驱动搜索
+- **Orchestration** — CloudEvents 1.0 事件流 + K8s Operator CR 适配
 
 ## 快速开始
 
@@ -113,40 +118,24 @@ SenseFrame 采用 **通用训练框架 + 场景包** 分层架构：
 
 ```
 senseframe/
-├── core/                # 核心抽象：TaskType / losses / metrics / features / profiler / params
-├── data/                # 数据加载与归一化
-│   ├── loaders/         # CSI / CSV / HDF5 / Parquet / Tensor 加载器
-│   ├── manifest.py      # DatasetManifest 动态数据集
-│   └── normalization.py # 归一化策略
-├── engine/              # 训练引擎
-│   ├── config.py        # ExperimentConfig
-│   ├── datamodule.py    # GenericDataModule
-│   ├── module.py        # GenericLightningModule
-│   ├── self_supervised.py
-│   ├── hpo.py           # 超参搜索
-│   └── runner/
-│       ├── orchestrator.py  # run_experiment（薄适配器，委托 run_pipeline）
-│       ├── pipeline.py      # Stage Pipeline + release_resources
-│       ├── artifacts.py     # 产物溯源（ArtifactManifest）
-│       ├── preflight.py     # 预检
-│       ├── resolver.py      # 配置解析
-│       └── errors.py        # SenseFrameError 异常层级
-├── scenes/              # 场景容器
-│   ├── base.py          # SceneContainer 抽象基类
-│   ├── wifi_csi/        # WiFi CSI 场景
-│   └── ...
-├── search_protocol.py   # SP 搜索协议（Ask-Tell + Study/Trial/Sampler）
-├── orchestration.py     # OP 编排协议（PipelineRun 状态机 + CloudEvent）
-├── nas/                 # 神经架构搜索（DARTS / ENAS / Evolutionary）
 ├── autoaugment/         # AutoAugment 数据增强搜索
-├── automl/              # 损失搜索 + 元学习 warm-start
-├── experiment/          # ε6 对比实验（Method / Baseline / ExperimentRunner）
-├── registry.py          # 模型 / 数据集 / 归一化注册表
-├── routing.py           # 资源路由
+├── automl/              # AutoML（loss_search/meta_learner/peft_builder/peft_search）
+├── common/              # 通用工具（checkpoint/path_safe/paths/runtime_state/transforms）
+├── core/                # 核心抽象（foundation_model/losses/metrics/task/validators）
+├── engine/              # 训练引擎（config/datamodule/module/self_supervised/metadata/hpo）
+│   ├── callbacks/       # Lightning Callbacks（psnr_early_stopping）
+│   └── runner/          # Pipeline 运行器（orchestrator/pipeline stages/artifacts）
+├── experiment/          # ε6 对比实验（baseline/method/report/runner）
+├── mcp/                 # MCP 服务器（tools/views/resources/orchestration/pagination）
+├── nas/                 # 神经架构搜索（darts/sampler/supernet/builder）
+├── scenes/              # 场景容器（wifi_csi/eeg/radio/detection/generic/custom）
+├── cli.py               # 命令行入口
+├── exploration.py       # 探索闭环（ExplorationTracker）
 ├── introspect.py        # 自省协议
-├── exploration.py       # 探索状态管理
-├── skills.py            # 技能库
-└── serving.py           # 推理服务（KServe v2）
+├── orchestration.py     # 编排协议（CloudEvent/K8s Operator）
+├── routing.py           # 资源路由
+├── schemas.py           # 错误码 schema
+└── skills.py            # 技能库
 ```
 
 ## CLI
@@ -203,7 +192,7 @@ output_dir: runs
 save_model: true
 ```
 
-参考：[配置 Schema](reference/config_schema.md) | [配置模板](reference/training_templates.md)
+参考：[配置 Schema](reference/reference_config_schema.md) | [配置模板](reference/reference_training_templates.md)
 
 ## 错误处理
 
@@ -239,12 +228,12 @@ except SenseFrameError as e:
 
 ## 产物溯源
 
-每次训练自动生成 `artifact_manifest.json`，记录全部产物的 SHA-256：
+每次训练自动生成 `manifest.json`，记录全部产物的 SHA-256：
 
 ```python
 from senseframe import load_manifest, verify_artifacts
 
-manifest = load_manifest("runs/<exp>/artifact_manifest.json")
+manifest = load_manifest("runs/<exp>/manifest.json")
 # manifest.artifacts: {name: ArtifactDescriptor(path, sha256, size)}
 
 # 校验产物完整性（未被篡改 / 丢失）— 返回 {产物名: hash 是否匹配}
@@ -268,7 +257,7 @@ HPO 路径自动调用；命令式路径需手动调用。
 
 ## 数据集与模型
 
-参考：[数据集与模型支持表](reference/datasets_and_models.md)
+参考：[数据集与模型支持表](reference/reference_datasets_models.md)
 
 ## 场景扩展
 
@@ -284,20 +273,19 @@ class TimeSeriesScene(SceneContainer):
     def get_dataset_info(self, dataset_name, **kw) -> dict: ...
 ```
 
-参考：[场景开发指南](reference/scene_development.md)
+参考：场景开发模板见 `senseframe/scenes/_template/` 目录
 
 ## 参考资源
 
-- [SKILL.md](SKILL.md) — Agent 技能说明与工作流
-- [自省协议](reference/introspect.md) — 字段契约 / 探索状态 / 技能库 / 断点续跑
-- [配置 Schema](reference/config_schema.md) — 完整字段与校验规则
-- [配置模板](reference/training_templates.md) — YAML 配置模板
-- [数据集与模型](reference/datasets_and_models.md) — 数据集与模型支持表
-- [资源路由](reference/resource_routing.md) — 7 级路由表 + 模型推荐
-- [自监督训练](reference/self_supervised_paradigm.md) — 自监督训练范式
-- [场景开发指南](reference/scene_development.md) — 新增场景容器
-- [错误排查](reference/troubleshooting.md) — error_code 枚举与排查指南
-- [SenseFi](https://github.com/Marsrocky/Awesome-WiFi-CSI-Sensing) — Yang et al., Patterns, Cell Press, 2023
+- [配置 Schema](reference/reference_config_schema.md) — 完整字段与校验规则
+- [数据集与模型](reference/reference_datasets_models.md) — 数据集与模型支持表
+- [自省协议](reference/reference_introspect.md) — 字段契约 / 探索状态 / 技能库 / 断点续跑
+- [资源路由](reference/reference_resource_routing.md) — 5 级路由表 + 模型推荐
+- [配置模板](reference/reference_training_templates.md) — YAML 配置模板
+- [MCP 子系统](reference/reference_mcp.md) — MCP 服务器工具与自省资源
+- [NAS + AutoAugment](reference/reference_nas_autoaugment.md) — 神经架构搜索与数据增强搜索
+- [AutoML/PEFT](reference/reference_automl_peft.md) — 参数高效微调与 SP 驱动搜索
+- [Orchestration](reference/reference_orchestration.md) — CloudEvents 1.0 事件流与 K8s Operator
 
 ## License
 

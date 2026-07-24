@@ -31,7 +31,7 @@ $ARGUMENTS = 原始参数字符串
 
 ## Objective
 
-用 SenseFrame 声明式路径完成一次 WiFi CSI 监督训练，验证 8-stage pipeline 基础功能，
+用 SenseFrame 声明式路径完成一次 WiFi CSI 监督训练，验证 9-stage pipeline 基础功能，
 产出结构化测试报告。
 
 **参数**:
@@ -292,7 +292,7 @@ python scripts/postprocess.py --output-dir runs/<实验目录>
 - 校验结果: <通过/警告列表/错误列表>
 
 ## 预检详情（Step 3 产物）
-- 资源路由级别: <L0-L4>
+- 资源路由级别: <5级路由（cpu_minimal/cpu_standard/gpu_entry/gpu_standard/gpu_high）>
 - 路由配置: <device/batch_size/num_workers/precision 等实际生效值>
 - 模型选择: <model_id + 选择理由（如注册表命中）>
 - 显存评估: <预估/实际>
@@ -441,7 +441,7 @@ python scripts/postprocess.py --output-dir runs/<实验目录>
 ### F3: preflight 检查项不全
 - **症状**: `checks` 数组仅 7 项，缺模型契约/训练契约/数据契约
 - **根因**: preflight 仅做存在性检查，缺语义校验
-- **修复**: 实施 Preflight 增强方案（见 `docs/issues/preflight_enhancement_plan.md`）
+- **修复**: 实施 Preflight 增强方案（内部预检增强计划）
 - **严重度**: [中等]
 
 ### F4: config_semantics 有 error 级失败

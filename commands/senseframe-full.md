@@ -135,7 +135,7 @@ print(f"class_distribution: {profile.class_distribution}")
 ```python
 from senseframe.engine.config import ExperimentConfig
 
-# AutoFi 范式契约（reference/self_supervised_paradigm.md）：
+# AutoFi 范式契约（详见 reference/reference_training_templates.md 中的自监督模板）：
 # - 单次 run_experiment 内完成两阶段（Stage 1 自监督预训练 + Stage 2 监督微调）
 # - 框架通过 ctx.module 对象引用传递权重，无需显式 save/load
 # - 跨运行加载（两次独立 run_experiment + trainer.resume）不支持：

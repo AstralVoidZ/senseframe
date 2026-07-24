@@ -185,10 +185,12 @@ Serialize via `output.to_dict()`; type validation runs at construction points vi
 ## Error Handling
 
 All training errors raise a `SenseFrameError` subclass carrying an `error_code` class
-attribute. Branch on `error_code`, never on string matching.
+attribute. Branch on `error_code`, never on string matching. Error codes 共 21 项
+（`OK` + 19 错误码 + `UNKNOWN_ERROR` 兜底）。
 
 | error_code | Exception | Action |
 |------------|-----------|--------|
+| `OK` | — (success sentinel) | No error; `TrainOutput.status == "success"` |
 | `CONFIG_VALIDATION_ERROR` | `ConfigValidationError` | Fix config; do not retry |
 | `CONFIG_PARSE_ERROR` | `ConfigValidationError` (from_dict stage) | Fix YAML structure / field types |
 | `CONFIG_NOT_FOUND` | — (CLI/validate_config) | Check `--config` path |
@@ -200,12 +202,12 @@ attribute. Branch on `error_code`, never on string matching.
 | `MODEL_NOT_SUPPORTED` | `ModelNotSupportedError` | Check `model_id` |
 | `DATA_NOT_FOUND` | `DataNotFoundError` | Check `data_root`; do not retry |
 | `DATA_LOAD_ERROR` | `DataCorruptedError` | Check data integrity / format / permissions |
+| `MODEL_BUILD_ERROR` | `ModelBuildError` | Check `model_id` |
+| `TRAINING_ERROR` | `TrainingError` | Inspect traceback |
 | `OOM_ERROR` | `OOMError` | Halve `batch_size` and retry |
 | `CHECKPOINT_ERROR` | `CheckpointError` | Check checkpoint path / version / integrity |
-| `PREFLIGHT_ERROR` | `PreflightError` | Upgrade hardware or pick a smaller model |
-| `TRAINING_ERROR` | `TrainingError` | Inspect traceback |
-| `MODEL_BUILD_ERROR` | `ModelBuildError` | Check `model_id` |
 | `SAVE_ERROR` | `SaveError` | Check disk space / permissions |
+| `PREFLIGHT_ERROR` | `PreflightError` | Upgrade hardware or pick a smaller model |
 | `METADATA_NOT_FOUND` | — (CLI predict) | Check `--metadata` path; produced by training |
 | `METADATA_VERSION_ERROR` | `MetadataVersionError` | metadata.json schema_version incompatible; upgrade SenseFrame or use legacy metadata |
 | `UNKNOWN_ERROR` | `SenseFrameError` (base) | Fallback classification; inspect traceback |
@@ -252,6 +254,34 @@ Built-in samplers: `random` / `grid` / `tpe` / `asha` / `hyperband`. NAS sampler
 (`darts` / `enas` / `evolutionary`) and `autoaugment` require explicit module import.
 Built-in pruners: `asha` / `hyperband` (each also implements the Sampler protocol).
 
+## NAS 与 AutoAugment
+
+SenseFrame 内置 Neural Architecture Search 与 AutoAugment 数据增强搜索能力，二者均
+通过 Search Protocol (SP) 的 `ask`/`tell` 接口驱动。
+
+- **NAS 采样器**：`darts` / `enas` / `evolutionary`，背后挂载真实超网
+  （`senseframe.nas.supernet`），搜索完成后导出最优子网络权重。
+- **AutoAugment**：基于进化策略搜索增强策略，覆盖 5 种增强原语：
+  `time_jitter` / `freq_masking` / `noise` / `cutout` / `none`，每条策略为
+  原语 + 幅度 + 概率的组合。
+- NAS / AutoAugment 资源管理遵循 Gotchas 中的约定：`try/finally` 释放超网与优化器，
+  `DARTSSampler.update()` 使用 `.detach().clone()` 切断计算图。
+
+详见 `reference/reference_nas_autoaugment.md`。
+
+## AutoML 与 PEFT
+
+SenseFrame 内置 AutoML 能力，覆盖损失函数搜索、跨实验元学习与参数高效微调：
+
+- **`loss_search`**：在候选损失函数集合上做 SP 搜索，按验证指标挑选最优损失。
+- **`meta_learner`**：跨实验元学习器，为新实验提供 warm-start 超参建议。
+- **`peft_builder`**：构造 PEFT 模块，支持 `LoRA` / `Adapter` / `PrefixTuning` /
+  `PromptTuning` 四种范式。
+- **`peft_search`**：以 SP `ask`/`tell` 驱动 PEFT 配置（rank / alpha / dropout /
+  target modules）搜索，复用同一 StudyManager 基础设施。
+
+详见 `reference/reference_automl_peft.md`。
+
 ## Introspection
 
 Query pipeline / context / data contracts before composing a pipeline; do not read source.
@@ -284,7 +314,7 @@ Inherit `SceneContainer` and implement four abstract methods:
 `get_task_spec` / `get_feature_spec` / `get_scene_params` / `get_transforms` /
 `get_search_space` / `get_default_config` / `get_model_info` / `normalize` / `postprocess`.
 
-See `reference/scene_development.md` for the full guide and a minimal scene example.
+See `senseframe/scenes/_template/` for the full guide and a minimal scene example.
 
 ## CLI
 
@@ -335,17 +365,41 @@ All commands emit structured JSON.
 - **`verify_artifacts(dir)` takes a directory path** and returns `{artifact_name: bool}`.
   False means missing or tampered.
 
+## MCP 子系统
+
+SenseFrame 提供完整的 MCP (Model Context Protocol) 服务器，通过 stdio 与 Agent
+交互。Agent 经由 MCP 可在不读源码的前提下完成配置解析、训练编排、超参搜索、
+探索闭环、技能库与产物管理。
+
+主要工具类别：
+
+| 类别 | 模块 | 覆盖能力 |
+|------|------|----------|
+| `config` | `mcp.tools.config` | YAML 解析、校验、模板生成 |
+| `pipeline` | `mcp.tools.pipeline` | 训练流程编排、阶段查询、resume |
+| `hpo` | `mcp.tools.hpo` | 超参搜索 Study 创建与 ask/tell |
+| `exploration` | `mcp.tools.exploration` | 探索闭环状态、coverage、dashboard |
+| `study` | `mcp.tools.study` | StudyManager 全生命周期管理 |
+| `automl` | `mcp.tools.automl` | loss_search / meta_learner / peft |
+| `skill` | `mcp.tools.skill` | 技能库（`~/.senseframe/skills/`）增删查 |
+| `artifact` | `mcp.tools.artifact` | 产物校验、metadata 版本管理 |
+
+MCP 资源 URI 形如 `senseframe://introspect`、`senseframe://schemas/config`、
+`senseframe://schemas/pipeline` 等，供 Agent 按 URI 直接读取契约。详见
+`reference/reference_mcp.md`。
+
 ## References
 
 Load on demand; do not read all at once.
 
 | Document | When to read |
 |----------|--------------|
-| `reference/config_schema.md` | Writing or validating a YAML config |
-| `reference/training_templates.md` | Generating a config from a template |
-| `reference/datasets_and_models.md` | Choosing a dataset or model |
-| `reference/resource_routing.md` | Probing resources, picking a model, or preflighting |
-| `reference/self_supervised_paradigm.md` | Running self-supervised training |
-| `reference/scene_development.md` | Developing a new scene container |
-| `reference/troubleshooting.md` | Diagnosing a training failure or enumerating error codes |
-| `reference/introspect.md` | Querying field contracts, exploration state, skills, or resume API |
+| `reference/reference_config_schema.md` | Writing or validating a YAML config |
+| `reference/reference_datasets_models.md` | Choosing a dataset or model |
+| `reference/reference_introspect.md` | Querying field contracts, exploration state, skills, or resume API |
+| `reference/reference_resource_routing.md` | Probing resources, picking a model, or preflighting |
+| `reference/reference_training_templates.md` | Generating a config from a template |
+| `reference/reference_mcp.md` | MCP 子系统：工具 / 资源 / 视图契约 |
+| `reference/reference_nas_autoaugment.md` | NAS 与 AutoAugment 搜索 |
+| `reference/reference_automl_peft.md` | AutoML / PEFT 能力 |
+| `reference/reference_orchestration.md` | Orchestration + CloudEvent 编排 |

@@ -57,7 +57,7 @@ input_features:
 output_features:
   - name: action
     type: category
-    num_classes: 14                # NTU-Fi-HumanID 类别数（框架内部硬编码）
+    num_classes: 14                # NTU-Fi-HumanID 类别数（框架自动派生，详见 reference_datasets_models.md）
 
 trainer:
   epochs: 30                       # Stage 2 监督微调轮数

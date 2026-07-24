@@ -45,7 +45,7 @@ $ARGUMENTS = 原始参数字符串（可含 --auto-lr）
 ## Context
 
 - 工作目录: `.`（已部署 SenseFrame 的测试目录）
-- SKILL `senseframe` 已加载，API 文档在 `.opencode/skills/senseframe/SKILL.md`
+- SKILL `senseframe` 已加载，API 文档在 `SKILL.md`
 - 数据集根: `resource/CSI_DATASETS/`
 - **报告输出目录**: `report/`
 - **运行目录**: `runs/auto_<YYYYMMDD_HHMMSS>/`

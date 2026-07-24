@@ -65,7 +65,7 @@ python -m senseframe.cli recommend --dataset $1 --priority balanced
 
 **Introspect**:
 - [ ] recommend 是否基于硬件资源选模型？还是固定推荐？
-- [ ] 路由级别（L0-L4）是否合理？
+- [ ] 5级路由（cpu_minimal/cpu_standard/gpu_entry/gpu_standard/gpu_high）是否合理？
 - [ ] CPU/GPU 切换是否改变策略？（用 `CUDA_VISIBLE_DEVICES=""` 测试）
 
 ### Step 2: 自省 API 查询字段契约
@@ -330,13 +330,13 @@ skill = sf.load_skill("hpo_best")
   |----------|----------|--------|-----------------|
   | <id> | <params> | <val_acc> | <parent or None> |
 - recommend_next 输出: <recommendation>
-- 持久化路径: <如 .senseframe/exploration.json>
+- 持久化路径: <如 {base_dir}/{dataset}/history.json>
 
 ## 技能库测试（Step 5 产物）
 - 保存技能: name=<>, version=<>, 存储路径=<>
 - 检索结果: query="HPO", 匹配数=<N>, 匹配项=<list>
 - 加载技能: name=<>, 加载是否成功=<yes/no>
-- 技能库存储位置: <如 .senseframe/skills/>
+- 技能库存储位置: <如 ~/.senseframe/skills/>
 
 ## 多模型对比（Step 6 产物）
 | 模型 | 最优 val_accuracy | 最优 trial params | 平均耗时(s) | 平均 epochs | 备注 |

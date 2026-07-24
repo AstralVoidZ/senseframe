@@ -26,8 +26,37 @@ trainer:
   epochs: 200
   learning_rate: 0.001
   batch_size: 64
-  optimizer: adam
+  optimizer: adam  # adam / adamw / sgd / rmsprop
   seed: 42
+  # ---- TrainerConfig 可选字段（默认即最佳实践，按需取消注释覆盖）----
+  # weight_decay: 1.0e-4              # L2 正则系数，默认 1e-4
+  # early_stopping: 5                 # 早停 patience（epoch 数），None=不启用早停
+  # early_stopping_min_delta: 0.001   # 视为提升的最小 val_loss 变化阈值
+  # early_stopping_monitor: val_loss  # 监控指标名，默认 val_loss
+  # scheduler: cosine                 # None / cosine / step，默认 cosine
+  # gradient_clip_val: null           # 梯度裁剪阈值，null=不裁剪（须 > 0）
+  # gradient_clip_algorithm: norm     # norm / value
+  # mixed_precision: null             # True=16-mixed, False=32, "bf16-mixed", null=自动
+  # deterministic: false              # 确定性模式（需 CUDA + cuDNN 支持）
+  # num_workers: null                 # DataLoader 进程数，null=由 routing 按资源自动派生
+  # accumulate_grad_batches: 1        # 梯度累积步数（等效大 batch）
+  # logger: csv                       # csv / tensorboard / wandb / none
+  # gpu: null                         # 指定 GPU ID，null=自动
+  # auto_lr_find: false               # 自动 LR 标定（耗时约 1 epoch，仅监督模式）
+  # ---- pin_memory 非 TrainerConfig 字段：由 routing 自动派生（仅 GPU 路由启用），
+  #      不通过 YAML 配置，详见 reference/reference_resource_routing.md ----
 
 output_dir: runs
 save_model: true
+
+# ---- HPO 超参搜索配置示例（HPOConfig，默认不启用，按需取消注释）----
+# hpo:
+#   enabled: true
+#   n_trials: 20
+#   sampler: tpe  # tpe / random / cmaes
+#   pruner: median  # median / none / hyperband
+#   metric: val_accuracy
+#   direction: maximize  # minimize / maximize
+#   storage: sqlite:///hpo_study.db
+#   study_name: ut_har_resnet18
+#   load_if_exists: true

@@ -296,7 +296,7 @@ trainer:
 
 - **confusion_matrix**：最终验证阶段自动计算混淆矩阵，包含在 `final_eval` 返回值的 `confusion_matrix` 字段（`List[List[int]]` 格式）。
 - **learning_rate 日志**：每 epoch 结束自动 log 当前学习率到 `learning_rate` 指标，便于监控 scheduler 衰减曲线。
-- **artifact_manifest.json**：`postprocess.py` 生成产物清单，含所有训练 + 后处理产物的路径、大小、SHA256 校验和，便于完整性校验与版本追溯。
+- **manifest.json**：`postprocess.py` 生成产物清单，含所有训练 + 后处理产物的路径、大小、SHA256 校验和，便于完整性校验与版本追溯。
 
 ### 分布式训练
 
@@ -331,7 +331,7 @@ sync_batchnorm: true
 
 ### 结构化错误码与状态摘要
 
-`TrainOutput.error_code` 字段供 Agent 程序化分支决策。完整 14 项 error_code 枚举见 [troubleshooting.md](./troubleshooting.md)。
+`TrainOutput.error_code` 字段供 Agent 程序化分支决策（错误码详见 senseframe://schemas/errors 资源端点）。
 
 **TrainOutput.summary()**：生成机器可读的状态摘要：
 
@@ -358,6 +358,6 @@ meta = scene.meta()
 
 ### CLI 预检模式
 
-`experiment --dry-run` 执行启动前检查不实际训练，详见 [resource_routing.md](./resource_routing.md) 的"预检模式"章节。
+`experiment --dry-run` 执行启动前检查不实际训练，详见 [reference_resource_routing.md](./reference_resource_routing.md) 的"预检模式"章节。
 
 **list-scenes 增强**：输出含 `supported_learning_modes` 和 `input_shape_hint` 字段，供 Agent 程序化查询场景能力。

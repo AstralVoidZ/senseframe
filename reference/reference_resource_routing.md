@@ -120,3 +120,30 @@ python -m senseframe.cli experiment --config my.yaml --dry-run
 | 7 | `preflight` | 数据存在性、显存、磁盘空间预检 |
 
 `status: ok` 时退出码 0，`status: blocked` 时退出码 1。
+
+### 增强的契约字段
+
+除上表 7 项基础检查外，`--dry-run` 报告还附带以下契约字段（实现于
+`senseframe/engine/runner/preflight.py` 的 `validate_*` 函数，由
+`senseframe/cli.py` 的 `_run_preflight` 组装进 `report`；注意：pipeline stage
+`pipeline/stages/preflight.py` 与 `validate.py` 只做资源探测/路由与 schema 校验，
+不产出这些契约字段）。每项检查均为 `CheckResult` 结构：`name` / `ok` /
+`severity`(info/warning/error) / `detail` / `error_code` / `remediation`。
+
+| 字段 | 类型 | 说明 | 包含的检查项 |
+|------|------|------|--------------|
+| `config_semantics` | 数组 | 配置语义校验（跨字段逻辑约束），有 error 级失败则整体 blocked | `early_stopping_within_epochs` / `batch_size_within_dataset` / `scheduler_epochs_compatible` / `deterministic_cuda_available` |
+| `dependency_contract` | 数组 | 依赖契约校验（logger / export / deterministic 依赖），有 error 级失败则整体 blocked | logger 依赖、export 格式依赖、deterministic 依赖等 |
+| `reproducibility` | 数组 | 可复现性检查（seed / deterministic / 版本记录） | `seed_set` 等 |
+| `resource_contract` | 数组 | 资源契约校验（显存 / num_workers / 训练规模估算）；dry-run 下 `vram_probe_result=None` | `vram_sufficient` / `num_workers_reasonable` 等 |
+| `dynamic_validation` | 对象 | 轻量动态校验（CPU 上 forward + backward 1 step，不启动 Lightning Trainer）。`status`: `passed` / `skipped` / `failed`；`skipped` 触发条件：`--static-only` 或静态检查未通过 | `checks`: `forward_pass` / `output_shape_match` / `backward_pass` / `param_count_reasonable` |
+| `model_contract` | — | 非独立顶层 key：其 checks 归入 `dynamic_validation.checks`（`cli.py` 在统一报告里将 model_contract 类别映射到 `dynamic_validation`） | 同 `dynamic_validation.checks` |
+| `training_contract` | 数组 | 训练契约校验（loss / metrics 与 task_type 一致性）；仅当 `dynamic_validation.status == "passed"` 且拿到 `num_classes` 后才生成 | `loss_task_match` / `metrics_task_match` / `early_stopping_within_epochs` |
+| `data_contract` | 数组 | 数据契约校验（基于 `DataProfile`，如类别覆盖、不平衡）；仅当动态校验成功后且 `detail` 含 `class_distribution` 时才生成 | `class_coverage` 等 |
+
+说明：
+- `config_semantics` 会在动态校验成功后用真实 `n_samples` 重跑一次（首次 `n_samples=0` 时
+  `batch_size_within_dataset` 检查被禁用），使 batch_size 与数据集规模约束真正生效。
+- `dynamic_validation` 失败时会更新顶层 `status` 为 `blocked`（旧逻辑仅 `config_semantics` /
+  `dependency_contract` 失败才置 blocked，已修复）。
+- `--static-only` 标志可显式跳过动态校验（`dynamic_validation.status == "skipped"`）。

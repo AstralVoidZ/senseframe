@@ -348,10 +348,11 @@ tracker.feedback_trace()
 
 ```python
 # 保存（stage_export 自动调用）
-tracker.save("runs/<实验目录>/exploration.json")
+# 探索历史持久化路径格式：{base_dir}/{dataset}/history.json
+tracker.save("runs/<实验目录>/history.json")
 
 # 加载
-tracker = ExplorationTracker.load("runs/<实验目录>/exploration.json")
+tracker = ExplorationTracker.load("runs/<实验目录>/history.json")
 ```
 
 保存的 JSON 结构：`{"history": [...], "action_log": [...]}`

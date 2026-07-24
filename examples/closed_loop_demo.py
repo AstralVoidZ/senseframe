@@ -2,6 +2,9 @@
 
 最小可运行示例：合成数据 → 训练 → feedback → recommend_next → 可视化。
 
+注意：本演示脚本中训练流程为注释占位，如需真实训练请参考
+scripts/run_experiment.py 或使用 `python -m senseframe.cli experiment` 命令。
+
 运行：
     python examples/closed_loop_demo.py
 
