@@ -189,6 +189,7 @@ from .serving import InferenceServer
 
 # RFC-003 DSP-5：自省模块
 from .introspect import (
+    StageIOSpec,
     context_schema,
     context_describe,
     stage_io,

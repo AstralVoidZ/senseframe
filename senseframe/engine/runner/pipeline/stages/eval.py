@@ -62,7 +62,8 @@ def stage_eval(ctx: PipelineContext) -> PipelineContext:
         )
         final_eval = ctx.final_eval
         training_log = ctx.training_log if ctx.training_log else []
-        early_stopped = False
+        # B1 修复：从 ctx 读取 DANN 路径的 early_stopped 状态（stage_train 写入）
+        early_stopped = getattr(ctx, "early_stopped", False)
     else:
         # 修复（2.7）：_is_final_validation 标志在 trainer.validate() 完成后必须 reset，
         # 否则模块复用时（如 HPO 多 trial 复用同一 module）状态污染，后续训练中验证
@@ -82,10 +83,7 @@ def stage_eval(ctx: PipelineContext) -> PipelineContext:
         # get_final_metrics 会合并 val_* 和 test_* 指标
         ctx.module._is_final_test = True
         try:
-            if is_self_supervised:
-                ctx.trainer.test(ctx.module, dataloaders=ctx.datamodule.test_dataloader())
-            else:
-                ctx.trainer.test(ctx.module, dataloaders=ctx.datamodule.test_dataloader())
+            ctx.trainer.test(ctx.module, dataloaders=ctx.datamodule.test_dataloader())
         finally:
             ctx.module._is_final_test = False
 
@@ -104,8 +102,8 @@ def stage_eval(ctx: PipelineContext) -> PipelineContext:
                     stopped_epoch = cb.stopped_epoch
                     break
             _logger.info(
-                f"early stopping triggered at epoch {stopped_epoch} "
-                f"(monitor={getattr(cb, 'monitor', 'val_loss')})"
+                "early stopping triggered at epoch %d (monitor=%s)",
+                stopped_epoch, getattr(cb, "monitor", "val_loss"),
             )
 
     # 保存结果到 first-class 字段

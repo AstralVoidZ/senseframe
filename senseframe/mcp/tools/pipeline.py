@@ -26,12 +26,14 @@ ToolAnnotations 矩阵（设计文档 0.4 节）：
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Literal
 
 from mcp.server.fastmcp import Context
 
 from senseframe.mcp.config import rate_limit as _rate_limit_cfg
+from senseframe.mcp.tools._errors import to_tool_error
 from senseframe.mcp.middleware import (
     MiddlewareStack,
     RateLimitMiddleware,
@@ -90,7 +92,6 @@ def get_pipeline_run_store() -> PipelineRunStore:
 async def senseframe_pipeline_create(
     config: dict[str, Any],
     stages: list[str],
-    trial_id: str | None = None,
     ctx: Context[Any, Any, Any] | None = None,
 ) -> PipelineCreateResponse:
     """创建新的 PipelineRun（声明式：接受 config + stages）。
@@ -98,25 +99,22 @@ async def senseframe_pipeline_create(
     Args:
         config: ExperimentConfig.model_dump() 的 dict。
         stages: stage 名列表（如 ["validate", "preflight", "load", ...]）。
-        trial_id: 可选的 Study trial 关联。
         ctx: MCP Context（注入 request_id）。
 
     Returns:
         PipelineCreateResponse（含 run_id + state=Pending + _transitions）。
+
+    Note:
+        trial_id 关联在 ``advance(action="start")`` 时绑定，create 阶段不接收。
     """
     if ctx:
         await ctx.info(
-            f"senseframe_pipeline_create stages={stages} trial_id={trial_id}"
+            f"senseframe_pipeline_create stages={stages}"
         )
     try:
         async with _stack.instrument("senseframe_pipeline_create", ctx):
             store = get_pipeline_run_store()
             run = store.create(config=config, stages=stages)
-            if trial_id is not None:
-                # trial_id 通过 advance(start) 注入，但 create 时也可记录
-                # 这里用 advance 内部逻辑不能修改 Pending（无动作），所以记录到 run
-                # 实际上 trial_id 是 start 时绑定的，create 时仅存储
-                pass
             transitions = get_transitions(run.state, run)
             return PipelineCreateResponse(
                 run_id=run.run_id,
@@ -127,7 +125,7 @@ async def senseframe_pipeline_create(
     except Exception as e:
         if ctx:
             await ctx.error(f"senseframe_pipeline_create failed: {e}")
-        raise
+        raise to_tool_error(e) from e
 
 
 async def senseframe_pipeline_advance(
@@ -181,7 +179,7 @@ async def senseframe_pipeline_advance(
     except Exception as e:
         if ctx:
             await ctx.error(f"senseframe_pipeline_advance failed: {e}")
-        raise
+        raise to_tool_error(e) from e
 
 
 async def senseframe_pipeline_run(
@@ -237,7 +235,8 @@ async def senseframe_pipeline_run(
                     cfg = ExperimentConfig.from_dict(config)
                 else:
                     cfg = config
-                run_pipeline(cfg)
+                # P1: 训练可能持续数小时，用 asyncio.to_thread 避免阻塞事件循环
+                await asyncio.to_thread(run_pipeline, cfg)
 
                 # 训练成功 → complete
                 run = store.advance(
@@ -263,7 +262,7 @@ async def senseframe_pipeline_run(
     except Exception as e:
         if ctx:
             await ctx.error(f"senseframe_pipeline_run failed: {e}")
-        raise
+        raise to_tool_error(e) from e
 
 
 async def senseframe_pipeline_get(
@@ -290,7 +289,7 @@ async def senseframe_pipeline_get(
     except Exception as e:
         if ctx:
             await ctx.error(f"senseframe_pipeline_get failed: {e}")
-        raise
+        raise to_tool_error(e) from e
 
 
 async def senseframe_pipeline_list(
@@ -339,7 +338,7 @@ async def senseframe_pipeline_list(
     except Exception as e:
         if ctx:
             await ctx.error(f"senseframe_pipeline_list failed: {e}")
-        raise
+        raise to_tool_error(e) from e
 
 
 async def senseframe_pipeline_pause(
@@ -374,7 +373,7 @@ async def senseframe_pipeline_pause(
     except Exception as e:
         if ctx:
             await ctx.error(f"senseframe_pipeline_pause failed: {e}")
-        raise
+        raise to_tool_error(e) from e
 
 
 async def senseframe_pipeline_resume(
@@ -409,4 +408,4 @@ async def senseframe_pipeline_resume(
     except Exception as e:
         if ctx:
             await ctx.error(f"senseframe_pipeline_resume failed: {e}")
-        raise
+        raise to_tool_error(e) from e

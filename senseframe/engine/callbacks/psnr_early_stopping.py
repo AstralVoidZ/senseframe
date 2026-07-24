@@ -10,6 +10,7 @@ v2 差距 3 修复：从 scripts/p0_pretrain_with_psnr.py 迁移为框架级 Cal
 """
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -37,6 +38,10 @@ def compute_psnr(
     Returns:
         PSNR 值（dB），完美重建返回 100.0
     """
+    # M2 修复：空张量（mask_ratio=0.0 时 mask 全 0）mean 返回 nan，
+    # 污染 best_psnr 状态机。入口显式返回 nan 供调用方跳过。
+    if reconstructed.numel() == 0:
+        return float("nan")
     mse = torch.mean((reconstructed - target) ** 2)
     if mse.item() < 1e-10:
         return 100.0
@@ -57,16 +62,27 @@ class PSNREarlyStoppingCallback(Callback):
         should_stop: 是否触发停止
     """
 
-    def __init__(self, patience: int = 10, min_delta: float = 0.1):
+    def __init__(
+        self,
+        patience: int = 10,
+        min_delta: float = 0.1,
+        max_value: float = 5.0,
+    ):
         super().__init__()
         self.patience = patience
         self.min_delta = min_delta
+        # M6 修复：暴露 max_value 参数，避免框架级 Callback 硬编码 CSI 专属 5σ 常量
+        self.max_value = max_value
         self.best_psnr: Optional[float] = None
         self.counter: int = 0
         self.should_stop: bool = False
 
     def _update_psnr(self, psnr: float) -> None:
         """更新 PSNR 状态机（供测试直接调用 + on_validation_epoch_end 内部使用）。"""
+        # M2 修复：nan（空张量等场景）跳过，不污染 best_psnr/counter，
+        # 避免 nan 比较恒 False 误触发早停。
+        if math.isnan(psnr):
+            return
         if self.best_psnr is None or psnr > self.best_psnr + self.min_delta:
             self.best_psnr = psnr
             self.counter = 0
@@ -88,7 +104,7 @@ class PSNREarlyStoppingCallback(Callback):
         target = getattr(pl_module, "_psnr_target", None)
         if recon is None or target is None:
             return
-        psnr = compute_psnr(recon, target)
+        psnr = compute_psnr(recon, target, max_value=self.max_value)
         self._update_psnr(psnr)
         pl_module.log("val_psnr", psnr, prog_bar=True)
         if self.should_stop:

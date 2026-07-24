@@ -114,6 +114,62 @@ def _build_sample_input(
     return sample
 
 
+# ============================================================
+# Phase P0-2：自监督 _Parrallel 模型导出适配
+# ============================================================
+# _Parrallel 模型（来自 SenseFi）的 forward 签名为 forward(x1, x2, flag=...),
+# 返回 (out1, out2) 元组。export_model 假设单输入 forward + 单输出，
+# 直接调用会抛 TypeError: forward() missing 1 required positional argument: 'x2'.
+# 解决：用 wrapper 将 _Parrallel 的监督路径 (x, x, flag='supervised') → (y1, y2)
+# 包装为单输入 → y1 的标准 nn.Module，state_dict 共享原模型权重。
+class _SelfSupervisedInferenceWrapper(nn.Module):
+    """将 _Parrallel 双输入 forward 包装为单输入 forward，仅返回 y1（监督 logits）。
+
+    - wrapper 与 base 共享权重（state_dict key 一致），导出 state_dict 仍为原始 _Parrallel 结构
+    - 推理/导出只需单输出 y1（y2 在训练时作正则，推理时丢弃）
+    """
+
+    def __init__(self, base: nn.Module):
+        super().__init__()
+        self.base = base
+
+    def forward(self, x):
+        # 监督路径：x1=x2=x，返回 (y1, y2) logits，只取 y1
+        y1, _y2 = self.base(x, x, flag="supervised")
+        return y1
+
+    # 透传 base 的属性（state_dict / eval / parameters 等由 nn.Module 自动处理）
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base, name)
+
+
+def _maybe_wrap_self_supervised(
+    model: nn.Module,
+    learning_mode: Optional[str] = None,
+) -> nn.Module:
+    """检测模型是否为 _Parrallel 风格（自监督双输入），如是则包装为单输入。
+
+    检测条件（duck-typed）：
+    - learning_mode == "self_supervised"
+    - model.forward 签名参数数 >= 2（含 self）
+
+    对监督模型（learning_mode=None / "supervised"）完全透明，直接返回原模型。
+    """
+    if learning_mode != "self_supervised":
+        return model
+    # duck-typed：检测 forward 签名
+    import inspect
+    sig = inspect.signature(model.forward)
+    params = [p for p in sig.parameters.values()
+              if p.name != "self" and p.default is inspect.Parameter.empty]
+    if len(params) >= 2:
+        return _SelfSupervisedInferenceWrapper(model)
+    return model
+
+
 def _infer_output_shape(model: nn.Module, sample_input: torch.Tensor) -> List[int]:
     """推断模型输出形状（不含 batch 维度）。"""
     model.eval()
@@ -213,22 +269,51 @@ def _export_onnx(
     sample_input: torch.Tensor,
     output_path: Optional[Path] = None,
 ) -> Path:
-    """导出 ONNX（.onnx），支持动态 batch。"""
+    """导出 ONNX（.onnx），支持动态 batch。
+
+    torch >= 2.9 且 onnxscript 可用时使用 dynamo=True + dynamic_shapes（新路径）；
+    否则使用 dynamo=False + dynamic_axes（经典 TorchScript 路径）。
+    """
     model.eval()
     path = output_path or (output_dir / "model.onnx")
+
+    _torch_ver = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    _use_dynamo = _torch_ver >= (2, 9)
+
+    if _use_dynamo:
+        try:
+            import onnxscript  # noqa: F401
+        except ImportError:
+            _use_dynamo = False
+
     with torch.no_grad():
-        torch.onnx.export(
-            model,
-            sample_input,
-            str(path),
-            input_names=["input"],
-            output_names=["output"],
-            dynamic_axes={
-                "input": {0: "batch"},
-                "output": {0: "batch"},
-            },
-            opset_version=18,
-        )
+        if _use_dynamo:
+            from torch.export import Dim
+            batch = Dim("batch", min=1)
+            torch.onnx.export(
+                model,
+                (sample_input,),
+                str(path),
+                input_names=["input"],
+                output_names=["output"],
+                dynamic_shapes=({0: batch},),
+                opset_version=18,
+                dynamo=True,
+            )
+        else:
+            torch.onnx.export(
+                model,
+                sample_input,
+                str(path),
+                input_names=["input"],
+                output_names=["output"],
+                dynamic_axes={
+                    "input": {0: "batch"},
+                    "output": {0: "batch"},
+                },
+                opset_version=18,
+                dynamo=False,
+            )
     return path
 
 
@@ -412,6 +497,7 @@ def export_model(
     atol: float = 1e-4,
     rtol: float = 1e-5,
     output_activation: Optional[str] = None,
+    learning_mode: Optional[str] = None,
 ) -> ExportResult:
     """
     将模型导出为多种格式。
@@ -428,6 +514,9 @@ def export_model(
         output_activation: Phase 12.2 输出激活名称
             （"none"/"softmax"/"sigmoid"/"tanh"/"relu"），None=不加激活
             通常来自 task_spec.output_activation
+        learning_mode: P0-2 学习模式（"self_supervised" / "supervised" / None）。
+            self_supervised 时若检测到 _Parrallel 双输入 forward，自动包装为单输入 wrapper。
+            None / "supervised" 时透明（直接用原模型）。
 
     Returns:
         ExportResult: 含各格式文件路径与清单
@@ -444,6 +533,10 @@ def export_model(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # P0-2：自监督 _Parrallel 模型双输入 forward 适配
+    # 检测到双输入 forward 时包装为单输入 wrapper，state_dict 共享原模型权重
+    model = _maybe_wrap_self_supervised(model, learning_mode)
 
     # Phase 12.2：先评估原模型，再用激活包装后的模型导出。
     # 包装后模型的 state_dict 仍兼容原模型的 key（权重共享），
@@ -665,6 +758,10 @@ def export_from_metadata(
         atol=atol,
         rtol=rtol,
         output_activation=output_activation,
+        # P0-2 修复：CLI export 路径同样需传入 learning_mode，否则 export_model 无法触发
+        # _maybe_wrap_self_supervised，对 _Parrallel 双输入 forward 仍抛 TypeError。
+        # 之前只修复了 stage_export.py（pipeline 路径），漏改了 export_from_metadata（CLI 路径）。
+        learning_mode=learning_mode,
     )
 
 

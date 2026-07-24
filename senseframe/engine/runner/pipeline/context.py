@@ -294,6 +294,29 @@ class PipelineContext:
     # RFC-004 方案 G：产物溯源注册表 — 各 stage 注册其产出的文件
     artifact_registry: List[ArtifactDescriptor] = field(default_factory=list)
 
+    # ============================================================
+    # P1 改进（2026-07-26）：val_ 指标便捷属性，委托到 final_eval
+    # 自定义 hook/stage 作者可直接用 ctx.val_accuracy 读取评估指标，
+    # 无需记住 final_eval 的键名。final_eval 为空时返回 None。
+    # ============================================================
+    @property
+    def val_accuracy(self) -> Optional[float]:
+        """final_eval["val_accuracy"] 的便捷访问（stage_eval 后可用）。"""
+        v = self.final_eval.get("val_accuracy")
+        return float(v) if v is not None else None
+
+    @property
+    def val_loss(self) -> Optional[float]:
+        """final_eval["val_loss"] 的便捷访问（stage_eval 后可用）。"""
+        v = self.final_eval.get("val_loss")
+        return float(v) if v is not None else None
+
+    @property
+    def val_macro_f1(self) -> Optional[float]:
+        """final_eval["val_macro_f1"] 的便捷访问（stage_eval 后可用）。"""
+        v = self.final_eval.get("val_macro_f1")
+        return float(v) if v is not None else None
+
     def get(self, key: str, default=None):
         """获取上下文属性（含 extra 字段）。"""
         if hasattr(self, key):
@@ -595,6 +618,18 @@ class StageResult:
     context: PipelineContext
     skipped: bool = False
     error: Optional[Exception] = None
+
+    @property
+    def status(self) -> str:
+        """P1-D 修复：对齐 TrainOutput.status 接口，Agent 可统一用 .status 检查执行结果。
+
+        取值："success" / "skipped" / "error"，从 skipped/error 字段派生。
+        """
+        if self.error is not None:
+            return "error"
+        if self.skipped:
+            return "skipped"
+        return "success"
 
 
 @dataclass

@@ -92,24 +92,28 @@ def load_checkpoint_flexible(
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
+    # 安全加固：先以 weights_only=True 加载，仅当检测到 Lightning checkpoint
+    # （含 Python 对象的 callbacks/optimizer_states）时才回退到 weights_only=False。
+    # 旧逻辑先 weights_only=False 再检查，不安全反序列化已在检查前执行。
     ckpt = torch.load(
         checkpoint_path,
         map_location=map_location,
-        weights_only=weights_only,
+        weights_only=True,
     )
 
-    # 安全加固：非 Lightning 分支（backbone_state_dict / bare_state_dict）强制 weights_only=True，
-    # 防止反序列化任意 Python 对象（这两种格式应只含 tensor + 基础类型）。
-    # Lightning ckpt 因含 callbacks/optimizer_states 等 Python 对象，仍按调用方 weights_only 处理。
+    # Lightning checkpoint 含 Python 对象（callbacks/optimizer_states 等），
+    # weights_only=True 无法加载，需回退。仅当 ckpt 是 dict 且含 "state_dict"
+    # 且 "state_dict" 的值确实是 dict（防止恶意对象绕过）时才回退。
     if (
         not weights_only
         and isinstance(ckpt, dict)
-        and "state_dict" not in ckpt
+        and "state_dict" in ckpt
+        and isinstance(ckpt["state_dict"], dict)
     ):
         ckpt = torch.load(
             checkpoint_path,
             map_location=map_location,
-            weights_only=True,
+            weights_only=False,
         )
 
     # 情况 1：Lightning checkpoint，含 "state_dict" 顶层 key

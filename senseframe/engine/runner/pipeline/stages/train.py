@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -25,6 +26,15 @@ from ..stage_spec import stage
 from .....common import load_checkpoint_flexible
 from .....observability import Timer
 from ...callbacks import FrozenDict
+
+
+# ============================================================
+# 命名常量（消除魔法数字）
+# ============================================================
+# OOM 回退：ctx.resolved 缺 batch_size 时的兜底默认值
+_DEFAULT_BATCH_SIZE_FALLBACK = 64
+# OOM 回退：batch_size 减半除数（与 senseframe.retry.RetryPolicy.batch_size_divisor 对齐）
+_OOM_BATCH_SIZE_DIVISOR = 2
 
 
 # ============================================================
@@ -75,17 +85,23 @@ def _fit_with_oom_fallback(
                 try:
                     trainer._teardown()
                 except Exception:
-                    pass
+                    # I6 修复：保留 traceback 便于排障（OOM 恢复是诊断热点）
+                    _logger.debug(
+                        "_fit_with_oom_fallback: non-OOM teardown failed",
+                        exc_info=True,
+                    )
             raise
-        current_bs = ctx.resolved.get("batch_size", 64)
+        current_bs = ctx.resolved.get("batch_size", _DEFAULT_BATCH_SIZE_FALLBACK)
         if current_bs <= min_batch_size:
             _logger.warning(
-                f"OOM at batch_size={current_bs} (<= min {min_batch_size}), not retrying"
+                "OOM at batch_size=%d (<= min %d), not retrying",
+                current_bs, min_batch_size,
             )
             raise
-        new_bs = max(min_batch_size, current_bs // 2)
+        new_bs = max(min_batch_size, current_bs // _OOM_BATCH_SIZE_DIVISOR)
         _logger.warning(
-            f"OOM at batch_size={current_bs}, retrying with batch_size={new_bs}"
+            "OOM at batch_size=%d, retrying with batch_size=%d",
+            current_bs, new_bs,
         )
         ctx.resolved["batch_size"] = new_bs
         # 更新 datamodule batch_size（Lightning DataModule 在 fit 时重新调用 dataloader 方法）
@@ -97,7 +113,11 @@ def _fit_with_oom_fallback(
             try:
                 trainer._teardown()
             except Exception:
-                pass
+                # I6 修复：保留 traceback 便于排障（OOM 恢复是诊断热点）
+                _logger.debug(
+                    "_fit_with_oom_fallback: OOM-path teardown failed",
+                    exc_info=True,
+                )
         del trainer
         # 修复（2.9）：del 后需 gc.collect() 打断 Trainer/LightningModule 内部循环引用，
         # 否则 empty_cache() 时引用计数未归零，显存未真正释放。
@@ -107,11 +127,29 @@ def _fit_with_oom_fallback(
             try:
                 torch.cuda.synchronize()
             except Exception:
-                pass
+                # I6 修复：保留 traceback 便于排障（OOM 恢复是诊断热点）
+                _logger.debug(
+                    "_fit_with_oom_fallback: cuda.synchronize failed",
+                    exc_info=True,
+                )
             torch.cuda.empty_cache()
         # 重建 trainer（旧实例已 teardown）
         trainer = build_trainer()
-        fit_fn(trainer)
+        # I1 修复：第二次 fit 加 try/except，失败时 teardown 新 trainer 避免资源泄露
+        # （新 trainer 内部的 CUDA 显存/dataloader worker/callback 状态需 teardown 释放）
+        try:
+            fit_fn(trainer)
+        except Exception:
+            if hasattr(trainer, "_teardown"):
+                try:
+                    trainer._teardown()
+                except Exception:
+                    _logger.debug(
+                        "_fit_with_oom_fallback: second-fit teardown failed",
+                        exc_info=True,
+                    )
+            del trainer
+            raise
         return trainer
 
 
@@ -140,6 +178,7 @@ class DannTrainResult:
     best_val_loss: Optional[float]
     best_val_macro_f1: Optional[float]
     best_state: Optional[dict]  # model.state_dict() 副本，None 表示无 best epoch
+    early_stopped: bool = False  # B1 修复：DANN 路径 early stopping 状态传递到 stage_eval
 
 
 def _train_dann_loop(
@@ -162,7 +201,6 @@ def _train_dann_loop(
         epochs: 训练 epoch 数
         learning_rate: 学习率
     """
-    import itertools
     import torch.nn.functional as F
     from sklearn.metrics import f1_score
 
@@ -209,8 +247,9 @@ def _train_dann_loop(
     train_loader = ctx.datamodule.train_dataloader()
     val_loader = ctx.datamodule.val_dataloader()
     # CSI 对抗信号：从 scene_kwargs.csi_loader 获取（stage_load 注入），无则跳过对抗
+    # 不使用 itertools.cycle——它会缓存整个首次迭代的全部 batch 到内存，
+    # 大数据集下导致 OOM。改为手动 epoch 级重迭代，每轮重新创建迭代器。
     csi_loader = ctx.scene_kwargs.get("csi_loader") if ctx.scene_kwargs else None
-    csi_iter = itertools.cycle(csi_loader) if csi_loader else None
 
     best_val_acc = -1.0  # I1 修复：避免与合法值 0.0 冲突，确保首个 epoch 被记录
     no_improve_count = 0  # early stopping 计数
@@ -219,6 +258,7 @@ def _train_dann_loop(
     best_val_macro_f1 = None
     best_epoch = None
     best_state = None  # I2 修复：保存 best epoch 的 model.state_dict() 副本
+    early_stopped = False  # B1 修复：追踪 early stopping 状态
 
     for epoch in range(epochs):
         # λ 调度（Ganin & Lempitsky 2015：λ = 2/(1+exp(-10*p))-1）
@@ -227,6 +267,9 @@ def _train_dann_loop(
         # MEDIUM 6：累积 train loss（与 GenericLightningModule 对齐）
         epoch_train_loss_sum = 0.0
         epoch_train_steps = 0
+
+        # CSI 迭代器：每 epoch 重建，避免 itertools.cycle 缓存全部 batch 导致 OOM
+        csi_iter = iter(csi_loader) if csi_loader else None
 
         model.train()
         for batch in train_loader:
@@ -241,8 +284,22 @@ def _train_dann_loop(
             # CSI 对抗信号
             x_csi = None
             if csi_iter is not None:
-                csi_batch = next(csi_iter)
-                if isinstance(csi_batch, (list, tuple)):
+                try:
+                    csi_batch = next(csi_iter)
+                except StopIteration:
+                    # 迭代器耗尽，重建新迭代器继续
+                    csi_iter = iter(csi_loader)
+                    # I5 修复：csi_loader 为空时二次 StopIteration，
+                    # 跳过该 batch 的对抗训练（x_csi 保持 None）
+                    try:
+                        csi_batch = next(csi_iter)
+                    except StopIteration:
+                        _logger.warning(
+                            "DANN: csi_loader empty, skipping adversarial for this batch"
+                        )
+                        csi_batch = None
+                # I5 修复：csi_batch 可能为 None（空 loader），使用前检查
+                if csi_batch is not None and isinstance(csi_batch, (list, tuple)):
                     x_csi = csi_batch[0].to(device).float()
 
             # DANN forward：返回 (logits, disc_loss)
@@ -257,8 +314,13 @@ def _train_dann_loop(
             optimizer.zero_grad()
             total_loss.backward()
             # MEDIUM 5：梯度裁剪（与 Lightning Trainer gradient_clip_val 对齐）
+            # I4 修复：支持 gradient_clip_algorithm（norm/value），与 Lightning 路径对齐
             if gradient_clip_val is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_val)
+                clip_algo = resolved.get("gradient_clip_algorithm", "norm")
+                if clip_algo == "value":
+                    torch.nn.utils.clip_grad_value_(model.parameters(), gradient_clip_val)
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_val)
             optimizer.step()
             # MEDIUM 6：累积 train loss
             epoch_train_loss_sum += float(total_loss.item())
@@ -305,8 +367,10 @@ def _train_dann_loop(
             best_val_loss = epoch_val_loss_sum / max(epoch_val_steps, 1)
             best_val_macro_f1 = macro_f1
             best_epoch = epoch + 1
-            # I2 修复：保存 best epoch 的 model 权重副本（clone 避免引用共享）
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            # I2 修复：保存 best epoch 的 model 权重副本
+            # Praise 补强：detach() 切断 autograd 图，clone() 复制数据避免引用共享，
+            # cpu() 释放 GPU 显存。三者缺一都可能被后续训练污染或泄漏显存。
+            best_state = {k: v.detach().clone().cpu() for k, v in model.state_dict().items()}
             no_improve_count = 0
         else:
             no_improve_count += 1
@@ -319,9 +383,15 @@ def _train_dann_loop(
         # MEDIUM 6 修复：写入 training_log（与 GenericLightningModule.on_validation_epoch_end 对齐）
         if not hasattr(ctx, "training_log") or ctx.training_log is None:
             ctx.training_log = []
+        # 读取当前 optimizer lr（scheduler 修改后反映真实值），而非静态初始 learning_rate
+        current_lr = learning_rate
+        try:
+            current_lr = optimizer.param_groups[0]["lr"]
+        except (IndexError, AttributeError):
+            pass
         ctx.training_log.append({
             "epoch": epoch + 1,
-            "lr": learning_rate,
+            "lr": current_lr,
             "train_loss": round(epoch_train_loss_sum / max(epoch_train_steps, 1), 6),
             "train_accuracy": None,  # DANN 路径暂不计算 train_accuracy
             "val_loss": round(epoch_val_loss_sum / max(epoch_val_steps, 1), 6),
@@ -336,6 +406,7 @@ def _train_dann_loop(
                 "DANN early stopping at epoch %d (patience=%d, no improve=%d)",
                 epoch + 1, early_stopping_patience, no_improve_count,
             )
+            early_stopped = True  # B1 修复：记录早停状态
             break
 
     # I2 修复：加载 best epoch 权重回 model（消除末轮权重与 best 指标不匹配）
@@ -355,6 +426,7 @@ def _train_dann_loop(
         best_val_loss=best_val_loss,
         best_val_macro_f1=best_val_macro_f1,
         best_state=best_state,
+        early_stopped=early_stopped,
     )
 
 
@@ -374,6 +446,27 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
     RFC-002 阶段 K：支持 trainer_factory 注入，Agent 可自定义 Trainer 构造。
     """
     is_self_supervised = (ctx.learning_mode == "self_supervised")
+
+    # P0 修复：配置不一致告警——让静默降级可观测。
+    # 两阶段训练的唯一触发开关是 is_self_supervised（learning_mode == "self_supervised"）。
+    # 当 self_supervised_epochs 被显式配置（scene.params 含此键，或 trainer 值非默认 100）
+    # 但 learning_mode != "self_supervised" 时，EntLoss 预训练会被跳过且旧逻辑无任何提示，
+    # 用户得不到预期的两阶段收益却不知情。此处记录醒目 WARNING 告知如何修正。
+    if not is_self_supervised:
+        _ss_epochs_cfg = ctx.config.trainer.self_supervised_epochs
+        _ss_in_params = bool(ctx.config.scene.params) and (
+            "self_supervised_epochs" in ctx.config.scene.params
+        )
+        if _ss_in_params or _ss_epochs_cfg != 100:
+            _logger.warning(
+                "检测到 self_supervised_epochs 配置（值=%s，来自 %s），但 scene.learning_mode='%s' "
+                "非 'self_supervised'，EntLoss 自监督预训练将被跳过，本次为纯监督训练。"
+                "如需两阶段训练，请设置 scene.learning_mode='self_supervised'。",
+                ctx.resolved.get("self_supervised_epochs", _ss_epochs_cfg) if ctx.resolved else _ss_epochs_cfg,
+                "scene.params" if _ss_in_params else "trainer",
+                ctx.learning_mode,
+            )
+
     deterministic = ctx.config.trainer.deterministic
 
     # 子进程隔离方案（2026-07-11）：probe 在独立子进程中运行，主进程不消耗 RNG，
@@ -389,6 +482,21 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
     resume_ckpt = ctx.config.trainer.resume
     if resume_ckpt is None and ctx.config.scene.params:
         resume_ckpt = ctx.config.scene.params.get("resume")
+
+    # P1-b 修复：断点续跑自动 resume——用户未显式配置 resume 但 ctx.best_model_path
+    # 存在（由 runtime._restore_stage_outputs 从 pipeline checkpoint 恢复）时，
+    # 自动使用该 checkpoint 继续训练，避免续跑时从头开始。
+    if resume_ckpt is None and ctx.best_model_path:
+        if Path(ctx.best_model_path).is_file():
+            resume_ckpt = ctx.best_model_path
+            _logger.info(
+                "断点续跑：自动从 best checkpoint 恢复训练: %s", resume_ckpt
+            )
+        else:
+            _logger.warning(
+                "断点续跑：best_model_path 存在但文件不存在，跳过自动 resume: %s",
+                ctx.best_model_path,
+            )
 
     # P1-4: stage 入口摘要日志
     _epochs = ctx.config.trainer.epochs
@@ -482,17 +590,19 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
         # 写入 final_eval 供 stage_eval 使用（stage_eval 检测 ctx.trainer is None
         # 时跳过 trainer.validate/test，使用此处的 final_eval 计算 feedback）。
         # I3 修复：从 DannTrainResult 读取 metrics（替代 getattr ctx 私有属性）
-        # I2 修复：score > 0 才写入 val_accuracy（与 best_model_score 语义对齐）
+        # I2 修复：best_val_acc 初始化 -1.0（见 _train_dann_loop）作为"未训练"哨兵，
+        # 用 >= 0.0 区分"未训练(-1.0)"和"0 准确率(0.0)"，避免合法 0.0 被过滤为 None
         final_eval = {}
-        if result.best_score > 0:
+        if result.best_score is not None and result.best_score >= 0.0:
             final_eval["val_accuracy"] = round(float(result.best_score), 6)
         if result.best_val_loss is not None:
             final_eval["val_loss"] = round(float(result.best_val_loss), 6)
         if result.best_val_macro_f1 is not None:
             final_eval["val_macro_f1"] = round(float(result.best_val_macro_f1), 6)
         ctx.final_eval = final_eval
-        ctx.best_model_score = result.best_score if result.best_score > 0 else None
+        ctx.best_model_score = result.best_score if (result.best_score is not None and result.best_score >= 0.0) else None
         ctx.best_epoch = result.best_epoch
+        ctx.early_stopped = result.early_stopped  # B1 修复：传递早停状态到 stage_eval
         # Important #2：与 Lightning 路径对齐，冻结 intermediate_values 防止
         # stage_eval 的 trainer.validate() 触发 IntermediateMetricLogger 写入。
         ctx.intermediate_values = FrozenDict(ctx.intermediate_values)
@@ -551,6 +661,23 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
             kwargs["limit_train_batches"] = _limit_train
         if _limit_val is not None:
             kwargs["limit_val_batches"] = _limit_val
+        # P2-a 修复：小验证集兜底——当 limit_val_batches 为 float 且 < 1.0 时，
+            # Lightning 要求 limit * num_val_batches >= 1，否则抛 MisconfigurationException。
+            # 小数据集（如 val=93 样本、1 batch）配合 0.5 会触发崩溃。
+            # 此处检测 dataloader 长度，自动将 limit_val_batches 提升到至少覆盖 1 batch。
+            if isinstance(kwargs.get("limit_val_batches"), float) and 0 < kwargs["limit_val_batches"] < 1.0:
+                try:
+                    _val_dl = ctx.datamodule.val_dataloader()
+                    _n_val_batches = len(_val_dl)
+                    if _n_val_batches > 0 and kwargs["limit_val_batches"] * _n_val_batches < 1.0:
+                        _logger.warning(
+                            "limit_val_batches=%.2f 与 val_batches=%d 组合不足 1 batch，"
+                            "自动修正为 1.0（跑满验证集）",
+                            kwargs["limit_val_batches"], _n_val_batches,
+                        )
+                        kwargs["limit_val_batches"] = 1.0
+                except Exception:
+                    pass
         # Part 4：自动 LR 标定注入 Trainer 构造参数
         if ctx.config.trainer.auto_lr_find:
             kwargs["auto_lr_find"] = True
@@ -561,25 +688,54 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
         ss_epochs = ctx.resolved.get("self_supervised_epochs", 100)
         sup_epochs = ctx.config.trainer.epochs
 
+        _logger.info(
+            "自监督两阶段训练启动：Phase 1 (EntLoss 预训练) %d epochs → "
+            "Phase 2 (监督微调) %d epochs，总计 %d epochs",
+            ss_epochs, sup_epochs, ss_epochs + sup_epochs,
+        )
+
         # Phase 1: 自监督预训练（P3: OOM 回退）
         ctx.module.phase = "self_supervised"
+        _logger.info(
+            "Phase 1 (SS) phase set: module.id=%d, module.phase=%s, ss_epochs=%d",
+            id(ctx.module), ctx.module.phase, ss_epochs,
+        )
         def _build_ss_trainer():
+            # 修复：SS 阶段禁用 CSVLogger，避免与 sup 阶段 metrics.csv 混淆。
+            # 原逻辑共用 ctx.csv_logger，导致两次 fit 的 epoch/step 列在同一个 metrics.csv
+            # 中偏移重叠，train_loss 记录混乱（sup 的 epoch 0-24 与 SS 的 epoch 0-24 冲突）。
+            # SS 阶段的 train_loss/lr 通过 training_log.jsonl 记录
+            # （SelfSupervisedModule.on_train_epoch_end 写入，不依赖 validation 触发）。
+            _ss_logger = False
             if ctx.config.trainer_factory is not None:
                 return ctx.config.trainer_factory(
                     max_epochs=ss_epochs,
-                    logger=ctx.csv_logger,
+                    logger=_ss_logger,
                     enable_checkpointing=False,
                     **_build_trainer_kwargs(limit_val_batches=0),
                 )
             return pl.Trainer(
                 max_epochs=ss_epochs,
-                logger=ctx.csv_logger,
+                logger=_ss_logger,
                 enable_checkpointing=False,
                 **_build_trainer_kwargs(limit_val_batches=0),
             )
         def _fit_ss(trainer):
             # 每次重新获取 dataloader，OOM 重试时反映新 batch_size
+            _logger.info(
+                "Phase 1 (SS) fit start: module.phase=%s, trainer.id=%d, "
+                "module.current_epoch=%d",
+                ctx.module.phase, id(trainer), ctx.module.current_epoch,
+            )
             trainer.fit(ctx.module, train_dataloaders=ctx.datamodule.train_dataloader())
+            _logger.info(
+                "Phase 1 (SS) fit done: module.phase=%s, trainer.id=%d, "
+                "module.current_epoch=%d, trainer.current_epoch=%d, "
+                "trainer.global_step=%d",
+                ctx.module.phase, id(trainer),
+                ctx.module.current_epoch, trainer.current_epoch,
+                trainer.global_step,
+            )
         # RFC-005：存 SS Phase 1 Trainer 返回值，fit 后显式 _teardown 释放
         # 修复（2.10）：非 OOM 异常时 ss_trainer 资源泄露——用 try/finally 确保
         # 异常路径也 teardown。同时修复（2.9）：del 后加 gc.collect() 打断循环引用。
@@ -602,7 +758,14 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
                 torch.cuda.empty_cache()
 
         # Phase 2: 监督微调（P3: OOM 回退）
+        _logger.info("Phase 1 完成，切换到 Phase 2 (监督微调) %d epochs", sup_epochs)
         ctx.module.phase = "supervised"
+        _logger.info(
+            "Phase 2 (sup) phase set: module.id=%d, module.phase=%s, sup_epochs=%d, "
+            "module.current_epoch=%d (after Phase 1)",
+            id(ctx.module), ctx.module.phase, sup_epochs,
+            ctx.module.current_epoch,
+        )
         ctx.module._current_epoch_loss = 0.0
         ctx.module._current_epoch_steps = 0
         def _build_sup_trainer():
@@ -622,11 +785,24 @@ def stage_train(ctx: PipelineContext) -> PipelineContext:
                 **_build_trainer_kwargs(),
             )
         def _fit_sup(trainer):
+            _logger.info(
+                "Phase 2 (sup) fit start: module.phase=%s, trainer.id=%d, "
+                "module.current_epoch=%d",
+                ctx.module.phase, id(trainer), ctx.module.current_epoch,
+            )
             trainer.fit(
                 ctx.module,
                 train_dataloaders=ctx.datamodule.supervised_dataloader(),
                 val_dataloaders=ctx.datamodule.val_dataloader(),
                 ckpt_path=resume_ckpt,
+            )
+            _logger.info(
+                "Phase 2 (sup) fit done: module.phase=%s, trainer.id=%d, "
+                "module.current_epoch=%d, trainer.current_epoch=%d, "
+                "trainer.global_step=%d",
+                ctx.module.phase, id(trainer),
+                ctx.module.current_epoch, trainer.current_epoch,
+                trainer.global_step,
             )
         ctx.trainer = _fit_with_oom_fallback(ctx, _build_sup_trainer, _fit_sup)
     else:

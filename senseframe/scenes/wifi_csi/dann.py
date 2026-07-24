@@ -101,8 +101,8 @@ class ModalityDiscriminator(nn.Module):
 def dann_lambda_schedule(epoch: int, total_epochs: int) -> float:
     """DANN 原论文 λ 调度：从 0 渐增到 1。
 
-    λ = 2 / (1 + exp(-10 * p)) - 1
-    其中 p = epoch / total_epochs
+    λ = 2 / (1 + exp(-γ * p)) - 1
+    其中 γ=10.0（Ganin & Lempitsky 2015 §2.2 经验值），p=epoch/total_epochs。
 
     论文引用：Ganin et al., "Unsupervised Domain Adaptation by
     Backpropagation", ICML 2015.
@@ -114,10 +114,12 @@ def dann_lambda_schedule(epoch: int, total_epochs: int) -> float:
     Returns:
         λ 值（0.0 ~ 1.0）
     """
+    # γ=10.0：DANN 论文 λ 调度公式常数（Ganin & Lempitsky 2015 §2.2）
+    _DANN_LAMBDA_GAMMA = 10.0
     if total_epochs <= 0:
         return 0.0
     p = epoch / total_epochs
-    return 2.0 / (1.0 + math.exp(-10.0 * p)) - 1.0
+    return 2.0 / (1.0 + math.exp(-_DANN_LAMBDA_GAMMA * p)) - 1.0
 
 
 class DANNCrossModalModel(nn.Module):
@@ -128,6 +130,14 @@ class DANNCrossModalModel(nn.Module):
     - task_head: CSIClassifier（EEG 分类头，含 backbone + classifier）
     - discriminator: ModalityDiscriminator（模态判别器）
     - csi_patch_embedder + csi_pos_embed: CSI 模态特定层（跨模态对齐用）
+
+    task_head 契约（I3 修复）：
+    - task_head 必须暴露 .classifier 属性（nn.Module），接受 (B, d_model)
+      输入返回 logits。
+    - task_head.forward 不会被调用（backbone 已在 encode_features 中调过），
+      forward 内部直接访问 self.task_head.classifier(pooled_eeg)。
+    - 当前实现为 CSIClassifier，其 .classifier 是 (B, d_model) → (B, num_classes)
+      的 nn.Module。替换 task_head 时须保持此契约。
 
     双模态特征提取（关键设计）：
     - EEG 路径：backbone.encode_features(x_eeg) → eeg_feat
@@ -174,6 +184,7 @@ class DANNCrossModalModel(nn.Module):
                 param.requires_grad = False
 
         # CSI 模态特定层（跨模态对齐用，始终 freeze）
+        # 注册为 nn.Module 子模块，使参数对 model.to()/parameters()/state_dict() 可见
         if csi_patch_embedder is not None:
             self.csi_patch_embedder = csi_patch_embedder
             for p in self.csi_patch_embedder.parameters():
@@ -219,7 +230,15 @@ class DANNCrossModalModel(nn.Module):
             return self.backbone.encode_features(x_csi)
         inner = self._get_inner_backbone()
         # CSI patch embedding + pos_embed
-        patches = self.csi_patch_embedder(x_csi) + self.csi_pos_embed
+        patches = self.csi_patch_embedder(x_csi)
+        if patches.shape[1] != self.csi_pos_embed.shape[0]:
+            raise RuntimeError(
+                f"CSI patch_embedder output n_patches ({patches.shape[1]}) "
+                f"does not match csi_pos_embed n_patches ({self.csi_pos_embed.shape[0]}). "
+                f"Check that csi_patch_embedder and csi_pos_embed come from the same "
+                f"backbone configuration (input_shape/patch_len)."
+            )
+        patches = patches + self.csi_pos_embed
         # 共享 encoder（含 LoRA，modality-agnostic）
         enc_out = inner.encoder(patches)
         if hasattr(inner, "encoder_norm"):

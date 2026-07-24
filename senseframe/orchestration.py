@@ -491,7 +491,7 @@ class Orchestrator:
         self._subscribers: Dict[str, List[Callable[[CloudEvent], None]]] = {}  # event_type -> callbacks
         # P0.1: PipelineRun ↔ PipelineContext 映射（reconcile 驱动执行）
         self._contexts: Dict[str, Any] = {}  # run_id -> PipelineContext
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # O4: RLock 可重入，避免嵌套获取死锁
         # P2.11: 异步执行支持（reconcile 真循环）
         # ThreadPoolExecutor 用于 start_and_execute 异步提交 _execute_pipeline
         # 单独的 _run_futures 跟踪每个 run 的 Future（用于 wait_for_completion）
@@ -514,8 +514,12 @@ class Orchestrator:
             return
         try:
             self._store.save_run(run)
-        except Exception:
-            pass  # 持久化失败不阻断主流程
+        except Exception as e:
+            # O5: 禁止静默吞持久化异常，至少 warning 留痕（与 _emit_event 风格对齐）
+            logger.warning(
+                "persist_run failed (run_id=%s): %s",
+                run.run_id, e,
+            )
 
     def create_pipeline(self, pipeline_def: PipelineDef) -> str:
         """注册 Pipeline 定义（OP-1/6）。"""
@@ -546,98 +550,105 @@ class Orchestrator:
 
     def start(self, run_id: str) -> None:
         """启动 PipelineRun（OP-6）。"""
-        run = self._get_run(run_id)
-        old_phase = run.phase
-        run.transition(PHASE_RUNNING)
-        # 修复（5.14）：状态转换只发 CloudEvent 不写日志，加 INFO 留痕
-        logger.info(
-            "OP start: run_id=%s, phase transition: %s -> %s",
-            run_id, old_phase, run.phase,
-        )
-        self._emit_event(EVENT_PIPELINE_STARTED, run_id, {"phase": run.phase})
-        self._persist_run(run)
+        with self._lock:
+            run = self._get_run(run_id)
+            old_phase = run.phase
+            run.transition(PHASE_RUNNING)
+            # 修复（5.14）：状态转换只发 CloudEvent 不写日志，加 INFO 留痕
+            logger.info(
+                "OP start: run_id=%s, phase transition: %s -> %s",
+                run_id, old_phase, run.phase,
+            )
+            self._emit_event(EVENT_PIPELINE_STARTED, run_id, {"phase": run.phase})
+            self._persist_run(run)
 
     def pause(self, run_id: str) -> None:
         """暂停 PipelineRun（OP-6）。"""
-        run = self._get_run(run_id)
-        old_phase = run.phase
-        run.transition(PHASE_PAUSED)
-        logger.info(
-            "OP pause: run_id=%s, phase transition: %s -> %s",
-            run_id, old_phase, run.phase,
-        )
-        self._emit_event(EVENT_PIPELINE_PAUSED, run_id, {"phase": run.phase})
-        self._persist_run(run)
+        with self._lock:
+            run = self._get_run(run_id)
+            old_phase = run.phase
+            run.transition(PHASE_PAUSED)
+            logger.info(
+                "OP pause: run_id=%s, phase transition: %s -> %s",
+                run_id, old_phase, run.phase,
+            )
+            self._emit_event(EVENT_PIPELINE_PAUSED, run_id, {"phase": run.phase})
+            self._persist_run(run)
 
     def resume(self, run_id: str) -> None:
         """恢复 PipelineRun（OP-6）。"""
-        run = self._get_run(run_id)
-        old_phase = run.phase
-        run.transition(PHASE_RUNNING)
-        logger.info(
-            "OP resume: run_id=%s, phase transition: %s -> %s",
-            run_id, old_phase, run.phase,
-        )
-        self._emit_event(EVENT_PIPELINE_RESUMED, run_id, {"phase": run.phase})
-        self._persist_run(run)
+        with self._lock:
+            run = self._get_run(run_id)
+            old_phase = run.phase
+            run.transition(PHASE_RUNNING)
+            logger.info(
+                "OP resume: run_id=%s, phase transition: %s -> %s",
+                run_id, old_phase, run.phase,
+            )
+            self._emit_event(EVENT_PIPELINE_RESUMED, run_id, {"phase": run.phase})
+            self._persist_run(run)
 
     def retry(self, run_id: str) -> None:
         """重试 PipelineRun（OP-6）。"""
-        run = self._get_run(run_id)
-        old_phase = run.phase
-        run.transition(PHASE_RUNNING)
-        run.retry_count += 1
-        logger.info(
-            "OP retry: run_id=%s, phase transition: %s -> %s, retry_count=%d",
-            run_id, old_phase, run.phase, run.retry_count,
-        )
-        self._emit_event(EVENT_PIPELINE_STARTED, run_id, {"phase": run.phase, "retry": run.retry_count})
-        self._persist_run(run)
+        with self._lock:
+            run = self._get_run(run_id)
+            old_phase = run.phase
+            run.transition(PHASE_RUNNING)
+            run.retry_count += 1
+            logger.info(
+                "OP retry: run_id=%s, phase transition: %s -> %s, retry_count=%d",
+                run_id, old_phase, run.phase, run.retry_count,
+            )
+            self._emit_event(EVENT_PIPELINE_STARTED, run_id, {"phase": run.phase, "retry": run.retry_count})
+            self._persist_run(run)
 
     def stop(self, run_id: str) -> None:
         """停止 PipelineRun（OP-6）。"""
-        run = self._get_run(run_id)
-        old_phase = run.phase
-        run.transition(PHASE_FAILED)
-        run.error = "Stopped by orchestrator"
-        logger.info(
-            "OP stop: run_id=%s, phase transition: %s -> %s",
-            run_id, old_phase, run.phase,
-        )
-        self._emit_event(EVENT_PIPELINE_FAILED, run_id, {"phase": run.phase, "error": run.error})
-        self._persist_run(run)
+        with self._lock:
+            run = self._get_run(run_id)
+            old_phase = run.phase
+            run.transition(PHASE_FAILED)
+            run.error = "Stopped by orchestrator"
+            logger.info(
+                "OP stop: run_id=%s, phase transition: %s -> %s",
+                run_id, old_phase, run.phase,
+            )
+            self._emit_event(EVENT_PIPELINE_FAILED, run_id, {"phase": run.phase, "error": run.error})
+            self._persist_run(run)
 
     def complete(self, run_id: str, output_uri: str = "") -> None:
         """标记 PipelineRun 成功完成（OP-6）。"""
-        run = self._get_run(run_id)
-        old_phase = run.phase
-        run.transition(PHASE_SUCCEEDED)
-        run.output_uri = output_uri
-        logger.info(
-            "OP complete: run_id=%s, phase transition: %s -> %s, output_uri=%s",
-            run_id, old_phase, run.phase, output_uri,
-        )
-        self._emit_event(EVENT_PIPELINE_SUCCEEDED, run_id, {"phase": run.phase, "output_uri": output_uri})
-        self._persist_run(run)
+        with self._lock:
+            run = self._get_run(run_id)
+            old_phase = run.phase
+            run.transition(PHASE_SUCCEEDED)
+            run.output_uri = output_uri
+            logger.info(
+                "OP complete: run_id=%s, phase transition: %s -> %s, output_uri=%s",
+                run_id, old_phase, run.phase, output_uri,
+            )
+            self._emit_event(EVENT_PIPELINE_SUCCEEDED, run_id, {"phase": run.phase, "output_uri": output_uri})
+            self._persist_run(run)
 
     def fail(self, run_id: str, error: str, stage_name: str = "") -> None:
         """标记 PipelineRun 失败（OP-6）。"""
-        run = self._get_run(run_id)
-        old_phase = run.phase
-        run.transition(PHASE_FAILED)
-        run.error = error
-        if stage_name:
-            for s in run.stages:
-                if s.name == stage_name:
-                    s.phase = "failed"
-                    s.error = error
-                    break
-        logger.info(
-            "OP fail: run_id=%s, phase transition: %s -> %s, stage=%s, error=%s",
-            run_id, old_phase, run.phase, stage_name, error,
-        )
-        self._emit_event(EVENT_PIPELINE_FAILED, run_id, {"phase": run.phase, "error": error, "stage": stage_name})
-        self._persist_run(run)
+        with self._lock:
+            run = self._get_run(run_id)
+            old_phase = run.phase
+            run.transition(PHASE_FAILED)
+            run.error = error
+            if stage_name:
+                for s in run.stages:
+                    if s.name == stage_name:
+                        s.phase = "failed"
+                        s.error = error
+                        break
+            logger.info(
+                "OP fail: run_id=%s, phase transition: %s -> %s, stage=%s, error=%s",
+                run_id, old_phase, run.phase, stage_name, error,
+            )
+            self._emit_event(EVENT_PIPELINE_FAILED, run_id, {"phase": run.phase, "error": error, "stage": stage_name})
+            self._persist_run(run)
 
     def update_stage(self, run_id: str, stage_name: str, phase: str,
                      checkpoint_uri: str = "", error: str = "") -> None:
@@ -800,7 +811,8 @@ class Orchestrator:
             run_id: PipelineRun ID
             ctx: PipelineContext 实例
         """
-        self._contexts[run_id] = ctx
+        with self._lock:
+            self._contexts[run_id] = ctx
 
     def reconcile(
         self,
@@ -852,10 +864,17 @@ class Orchestrator:
         ]
 
         # 委托执行
-        result = pipeline.run(ctx)
-
-        # 恢复原始 stages（pipeline 实例可能被复用）
-        pipeline.stages = original_stages
+        # O1+O2: pipeline.run 抛异常时，run 会卡在 RUNNING 且 stages 保持包装状态。
+        # 用 try/except/finally 包裹：except 标记 run failed，finally 还原 stages。
+        try:
+            result = pipeline.run(ctx)
+        except Exception as exc:
+            self.fail(run_id, error=f"reconcile crashed: {exc}")
+            return {"status": "failed", "completed_stages": [], "failed_stage": None,
+                    "error": str(exc)}
+        finally:
+            # 恢复原始 stages（pipeline 实例可能被复用）
+            pipeline.stages = original_stages
 
         # 映射 StageResult → PipelineRun 状态
         if result.error is None:
@@ -1034,6 +1053,8 @@ class Orchestrator:
 
         # 即使 future 完成，也要确认 run.phase 已是终态（轮询保险）
         import time
+        # 终态轮询间隔：50ms 平衡响应延迟与 CPU 开销
+        _PHASE_POLL_INTERVAL_S = 0.05
         deadline = None if timeout is None else (time.monotonic() + timeout)
         while run.phase not in (PHASE_SUCCEEDED, PHASE_FAILED):
             if deadline is not None and time.monotonic() >= deadline:
@@ -1041,7 +1062,7 @@ class Orchestrator:
                     f"Run '{run_id}' did not complete within {timeout}s "
                     f"(current phase: {run.phase})"
                 )
-            time.sleep(0.05)
+            time.sleep(_PHASE_POLL_INTERVAL_S)
         return run
 
     def shutdown(self) -> None:
@@ -1059,12 +1080,15 @@ class Orchestrator:
 
 # 全局单例
 _orchestrator: Optional[Orchestrator] = None
+_orchestrator_lock = threading.Lock()
 
 def get_orchestrator() -> Orchestrator:
-    """获取全局 Orchestrator 单例。"""
+    """获取全局 Orchestrator 单例（线程安全，双重检查锁定）。"""
     global _orchestrator
     if _orchestrator is None:
-        _orchestrator = Orchestrator()
+        with _orchestrator_lock:
+            if _orchestrator is None:
+                _orchestrator = Orchestrator()
     return _orchestrator
 
 

@@ -20,8 +20,11 @@ import pytest
 class TestV018NoopValidateRemoved:
     """锁定 V018 修复：tools/config.py 不含 config.validate() 调用。"""
 
-    def test_config_py_has_no_validate_call(self):
-        """V018 anchor: AST 检查 tools/config.py 不含 .validate() 调用。
+    def test_config_py_has_no_config_validate_call(self):
+        """V018 anchor: AST 检查 tools/config.py 不含 config.validate() 调用。
+
+        缩小匹配范围：仅匹配 ``config.validate()``（ExperimentConfig 实例的 no-op
+        validate），不再误报其他合法的 ``.validate()`` 调用（如 pydantic 模型校验）。
 
         如果此断言失败，V018 修复被回退（no-op validate 被重新引入）。
         """
@@ -33,14 +36,22 @@ class TestV018NoopValidateRemoved:
 
         tree = ast.parse(py.read_text(encoding="utf-8"))
 
-        # V018 关键断言：不含 .validate() 调用（no-op validate 已移除）
-        validate_calls = []
+        # V018 关键断言：不含 config.validate() 调用（no-op validate 已移除）
+        # 仅匹配 Call.func 是 Attribute 且 attr == "validate" 且
+        # func.value 是 Name 且 id == "config" 的情况，避免误报其他 .validate() 调用
+        config_validate_calls = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 func = node.func
-                if isinstance(func, ast.Attribute) and func.attr == "validate":
-                    validate_calls.append(node)
-        assert not validate_calls, (
+                if (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "validate"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "config"
+                ):
+                    config_validate_calls.append(node)
+        assert not config_validate_calls, (
             f"如果此断言失败，V018 修复被回退：tools/config.py 不应含 "
-            f".validate() 调用（no-op validate 已移除），发现 {len(validate_calls)} 处"
+            f"config.validate() 调用（no-op validate 已移除），"
+            f"发现 {len(config_validate_calls)} 处"
         )

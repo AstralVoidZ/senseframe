@@ -83,3 +83,21 @@ class TestV013CacheDetachCpu:
             "如果此断言失败，V013 修复被回退：validation_step 后 "
             "_psnr_target 应非 None（缓存被填充）"
         )
+
+        # V013 核心断言：缓存张量已 detach（无梯度）且在 CPU（无 GPU 引用）
+        assert not module._psnr_reconstruction.requires_grad, (
+            "V013 修复被回退：_psnr_reconstruction 应已 detach（requires_grad=False），"
+            "否则 autograd 图会持有 GPU 引用导致显存泄漏"
+        )
+        assert module._psnr_reconstruction.device.type == "cpu", (
+            "V013 修复被回退：_psnr_reconstruction 应在 CPU，"
+            f"实际在 {module._psnr_reconstruction.device}，GPU 引用会阻塞显存回收"
+        )
+        assert not module._psnr_target.requires_grad, (
+            "V013 修复被回退：_psnr_target 应已 detach（requires_grad=False），"
+            "否则 autograd 图会持有 GPU 引用导致显存泄漏"
+        )
+        assert module._psnr_target.device.type == "cpu", (
+            "V013 修复被回退：_psnr_target 应在 CPU，"
+            f"实际在 {module._psnr_target.device}，GPU 引用会阻塞显存回收"
+        )

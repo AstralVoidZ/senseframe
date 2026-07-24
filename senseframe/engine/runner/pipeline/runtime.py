@@ -499,6 +499,9 @@ class Pipeline:
             # 此时 trainer/module 已置 None，resources_released=True。
             # 若 checkpoint 在 try 块内写入（stage 执行后），此值为 False（尚未释放）。
             "resources_released": ctx.trainer is None and ctx.module is None,
+            # P2-b 修复：记录最终 output_dir（失败重命名为 FAILED_ 前缀后可能变化）。
+            # resume 时若原路径不存在，可直接用此字段定位 checkpoint，无需猜测 FAILED_ 前缀。
+            "final_output_dir": str(ctx.output_dir),
         }
         if failed_stage:
             data["failed_stage"] = failed_stage
@@ -654,9 +657,19 @@ class Pipeline:
         if not ctx.learning_mode and stage_outputs.get("learning_mode"):
             ctx.learning_mode = stage_outputs["learning_mode"]
 
+        # P1-b 修复：恢复 best_model_path/best_model_score，供 stage_train 断点续跑自动 resume。
+        # 这两个字段在序列化侧（simple_fields）已写入 snapshot，但旧逻辑未恢复回 ctx，
+        # 导致续跑时 stage_train 拿不到失败前的 best checkpoint，只能从头训练。
+        if not ctx.best_model_path and stage_outputs.get("best_model_path"):
+            ctx.best_model_path = stage_outputs["best_model_path"]
+        if ctx.best_model_score is None and stage_outputs.get("best_model_score") is not None:
+            ctx.best_model_score = stage_outputs["best_model_score"]
+
         # preflight 产出
         if ctx.report is None and stage_outputs.get("report"):
-            from ...schemas import ResourceReport
+            # P0-1 修复：原 `from ...schemas`（3点）解析为 senseframe.engine.schemas（不存在），
+            # 应为 4 点 → senseframe.schemas。与同文件 L21 `from ....schemas import TrainOutput` 对齐。
+            from ....schemas import ResourceReport
             ctx.report = ResourceReport.from_dict(stage_outputs["report"])
         if not ctx.route_level and stage_outputs.get("route_level"):
             ctx.route_level = stage_outputs["route_level"]
@@ -727,6 +740,21 @@ class Pipeline:
                     "P3-5: detected FAILED_ prefix, resuming from %s", failed_candidate
                 )
                 output_dir = failed_candidate
+            else:
+                # P2-b 补充：FAILED_ 候选也不存在时，尝试从原 checkpoint 的
+                # final_output_dir 字段定位（覆盖自定义重命名或跨目录移动场景）。
+                _orig_ckpt = output_dir / "pipeline_checkpoint.json"
+                if _orig_ckpt.exists():
+                    try:
+                        _orig_data = json.loads(_orig_ckpt.read_text(encoding="utf-8"))
+                        _final = _orig_data.get("final_output_dir")
+                        if _final and Path(_final).exists() and Path(_final) != output_dir:
+                            _logger.info(
+                                "P2-b: located final_output_dir from checkpoint: %s", _final
+                            )
+                            output_dir = Path(_final)
+                    except Exception:
+                        pass
         ckpt_path = output_dir / "pipeline_checkpoint.json"
         if not ckpt_path.exists():
             raise FileNotFoundError(f"No pipeline checkpoint found at {ckpt_path}")
@@ -757,6 +785,25 @@ class Pipeline:
                     "Resume: 上次运行因 checkpoint 问题失败，建议检查 checkpoint "
                     "文件是否损坏（可能需要删除旧 checkpoint 重新训练）"
                 )
+
+        # P2 改进（2026-07-26）：过滤不可序列化 stage，避免调用方手动去除。
+        # _NON_SERIALIZABLE_STAGES（load/build/probe_vram/train/eval）的对象引用在
+        # 跨进程恢复时丢失，必须在续跑时重跑。旧逻辑返回原始 completed_stages，
+        # 调用方需手动去除 load/build；现在 resume 自动过滤并日志提示。
+        # 注：Pipeline.run 内部也有同样的过滤（line 280-282），此处提前过滤
+        # 让返回值语义更干净，调用方无需关心不可序列化 stage 的处理。
+        _non_serializable_in_completed = [
+            s for s in completed if s in _NON_SERIALIZABLE_STAGES
+        ]
+        if _non_serializable_in_completed:
+            completed = [
+                s for s in completed if s not in _NON_SERIALIZABLE_STAGES
+            ]
+            _logger.info(
+                "Resume: filtered non-serializable stages %s (will re-run on pipeline.run), "
+                "returning completed_stages=%s",
+                _non_serializable_in_completed, completed,
+            )
 
         return pipeline, completed
 

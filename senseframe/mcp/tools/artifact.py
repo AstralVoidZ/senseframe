@@ -78,8 +78,9 @@ _artifact_stack = MiddlewareStack(
     RateLimitMiddleware(limiter=TokenBucketLimiter(_rate_limit_cfg())),
 )
 
-# 必填产物名（与 artifacts.py 的 _REQUIRED_ARTIFACT_NAMES 保持一致）
-_REQUIRED_ARTIFACT_NAMES = frozenset({"config", "metadata", "training_log"})
+# 必填产物种类（P2-5：与 artifacts.py 的 _REQUIRED_ARTIFACT_KINDS 保持一致）
+# 改用 kind 校验替代 name 校验，避免 "metadata" vs "model_metadata" 误报
+_REQUIRED_ARTIFACT_KINDS = frozenset({"config", "metadata", "log"})
 # 支持的导出格式
 _SUPPORTED_EXPORT_FORMATS = frozenset({"zip", "tar", "manifest"})
 
@@ -345,15 +346,28 @@ async def senseframe_artifact_export(
                 export_path.write_text(manifest_json, encoding="utf-8")
             elif format == "zip":
                 export_path = export_dir / f"artifacts_{run_id}.zip"
+                # S1 修复：resolve out_path 一次，用于路径穿越校验
+                out_path_resolved = out_path.resolve()
                 with zipfile.ZipFile(export_path, "w", zipfile.ZIP_DEFLATED) as zf:
                     zf.writestr("manifest.json", manifest_json)
                     for a in export_artifacts:
                         file_path = out_path / a.path
+                        # S1 修复：校验解析后路径仍在 out_path 之内，防路径穿越
+                        try:
+                            file_path.resolve().relative_to(out_path_resolved)
+                        except ValueError:
+                            logger.warning(
+                                "artifact_export: skipping path escaping output_dir: %s",
+                                a.path,
+                            )
+                            continue
                         if file_path.exists():
                             # arcname 用相对路径，避免绝对路径前缀
                             zf.write(file_path, arcname=a.path)
             elif format == "tar":
                 export_path = export_dir / f"artifacts_{run_id}.tar"
+                # S1 修复：resolve out_path 一次，用于路径穿越校验
+                out_path_resolved = out_path.resolve()
                 with tarfile.open(export_path, "w") as tf:
                     manifest_bytes = manifest_json.encode("utf-8")
                     info = tarfile.TarInfo(name="manifest.json")
@@ -361,6 +375,15 @@ async def senseframe_artifact_export(
                     tf.addfile(info, io.BytesIO(manifest_bytes))
                     for a in export_artifacts:
                         file_path = out_path / a.path
+                        # S1 修复：校验解析后路径仍在 out_path 之内，防路径穿越
+                        try:
+                            file_path.resolve().relative_to(out_path_resolved)
+                        except ValueError:
+                            logger.warning(
+                                "artifact_export: skipping path escaping output_dir: %s",
+                                a.path,
+                            )
+                            continue
                         if file_path.exists():
                             tf.add(file_path, arcname=a.path)
 

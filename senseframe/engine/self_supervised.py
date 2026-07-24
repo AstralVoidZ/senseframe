@@ -41,7 +41,10 @@ _logger = logging.getLogger(__name__)
 # ============================================================
 def gaussian_noise(csi: torch.Tensor, epsilon: float, device: torch.device) -> torch.Tensor:
     """对输入添加高斯噪声（使用 device 参数，不硬编码 .cuda()）。"""
-    noise = torch.normal(1, 2, size=csi.shape, device=device)
+    # M3 修复：原 torch.normal(1, 2, ...) 采样自 N(1, 4)，噪声期望为 1 而非 0，
+    # 在输入上叠加 epsilon * 1 的恒定均值偏移，与"零均值扰动"的增强语义相悖。
+    # 改为零均值高斯噪声，std=2.0，保留 epsilon 缩放。
+    noise = torch.randn(size=csi.shape, device=device) * 2.0
     return csi + epsilon * noise
 
 
@@ -140,8 +143,24 @@ class SelfSupervisedModule(pl.LightningModule):
         # PSNREarlyStoppingCallback.on_validation_epoch_end 读取计算 PSNR。
         self._psnr_reconstruction = None
         self._psnr_target = None
+        # P1-4：val 阶段 loss 累加器（与 GenericLightningModule 对称），
+        # 用于 on_validation_epoch_end final validation 分支的 val_loss fallback。
+        # 主路径从 callback_metrics 读取，fallback 从累加器计算。
+        self._current_val_epoch_loss = 0.0
+        self._current_val_epoch_steps = 0
 
     def forward(self, x):
+        # P0-2 修复：_Parrallel.forward 签名为 (x1, x2, flag=...)，单参数调用会 TypeError。
+        # Lightning 不走 forward（走 training_step），但外部调用 module(x)（如 inference）
+        # 需要单输入监督路径。包装为 (x, x, flag='supervised') 取 y1。
+        if hasattr(self.model, "forward") and callable(getattr(self.model, "forward", None)):
+            import inspect
+            sig = inspect.signature(self.model.forward)
+            required = [p for p in sig.parameters.values()
+                        if p.name != "self" and p.default is inspect.Parameter.empty]
+            if len(required) >= 2:
+                y1, _y2 = self.model(x, x, flag="supervised")
+                return y1
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
@@ -201,20 +220,26 @@ class SelfSupervisedModule(pl.LightningModule):
         # I11 修复：改用 mae_reconstruct 公共方法，消除 _forward_encoder/_forward_decoder 私有方法外调
         # I12 修复：except Exception as e + _logger.warning，避免静默吞异常
         # I13 修复：缓存张量 .detach().cpu()，避免 GPU 显存泄漏
+        # 安全修复：先暂存到局部变量，model() 调用成功后才写入实例属性，
+        # 防止 model() 失败后残留缓存导致 PSNREarlyStoppingCallback 基于无效数据决策
+        _psnr_recon = None
+        _psnr_tgt = None
         if hasattr(self.model, "mae_reconstruct"):
             try:
                 mask_ratio = getattr(self.model, "_mask_ratio", 0.75)
                 recon, target, mask = self.model.mae_reconstruct(x, mask_ratio)
                 mask_bool = mask.bool()  # M13 修复：简化死分支
-                self._psnr_reconstruction = recon[mask_bool].detach().cpu()  # I13: 加 .cpu()
-                self._psnr_target = target[mask_bool].detach().cpu()
+                _psnr_recon = recon[mask_bool].detach().cpu()  # I13: 加 .cpu()
+                _psnr_tgt = target[mask_bool].detach().cpu()
             except Exception as e:
                 _logger.warning("PSNR reconstruction cache failed: %s", e, exc_info=True)  # I12: debug→warning
-                self._psnr_reconstruction = None
-                self._psnr_target = None
 
         y1, y2 = self.model(x, x, flag="supervised")
         loss = self.ce_criterion(y1, y) + self.ce_criterion(y2, y)
+
+        # model() 调用成功，将暂存的 PSNR 缓存写入实例属性
+        self._psnr_reconstruction = _psnr_recon
+        self._psnr_target = _psnr_tgt
 
         preds = torch.argmax(y1, dim=1)
         for name, metric in self.val_metrics.items():
@@ -225,6 +250,11 @@ class SelfSupervisedModule(pl.LightningModule):
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         for name in self.val_metrics:
             self.log(f"val_{name}", self.val_metrics[name], prog_bar=True, on_step=False, on_epoch=True)
+
+        # P1-4：累加 val_loss 供 on_validation_epoch_end fallback 使用
+        # （主路径从 callback_metrics 读取，此为备用路径）
+        self._current_val_epoch_loss += loss.item()
+        self._current_val_epoch_steps += 1
 
         return loss
 
@@ -271,10 +301,17 @@ class SelfSupervisedModule(pl.LightningModule):
             self._test_confusion_matrix.reset()
 
     def on_train_epoch_end(self):
-        """Phase 2.2c：每 epoch 结束 log 当前学习率，便于监控 scheduler 衰减。"""
+        """每 epoch 结束：log 学习率 + SS 阶段写 training_log。
+
+        修复：SS 阶段 training_log 写入从 on_validation_epoch_end 移到此处。
+        原逻辑在 on_validation_epoch_end 写，但 SS 阶段 limit_val_batches=0 时
+        on_validation_epoch_end 不触发，导致 SS 阶段无 training_log 记录，
+        Agent 无法判断预训练收敛，HPO 缺少预训练曲线。
+        """
         # sanity_check 阶段无 optimizer，跳过
         if self.trainer.sanity_checking:
             return
+        current_lr = None
         try:
             opt = self.optimizers()
             if opt is not None and hasattr(opt, "param_groups") and len(opt.param_groups) > 0:
@@ -282,8 +319,26 @@ class SelfSupervisedModule(pl.LightningModule):
                 if current_lr is not None:
                     self.log("learning_rate", float(current_lr),
                              prog_bar=False, on_step=False, on_epoch=True)
-        except Exception:
-            pass
+        except Exception as e:
+            _logger.debug("learning_rate log skipped: %s", e)
+        # 修复：SS 阶段在 on_train_epoch_end 写 training_log（不依赖 validation 触发）
+        if self.phase == "self_supervised":
+            if self._current_epoch_steps > 0:
+                epoch_entry = {
+                    "epoch": self.current_epoch,
+                    "phase": "self_supervised",
+                    "train_loss": round(self._current_epoch_loss / max(self._current_epoch_steps, 1), 6),
+                }
+                if current_lr is not None:
+                    epoch_entry["lr"] = round(float(current_lr), 6)
+                else:
+                    epoch_entry["lr"] = None
+                epoch_entry["train_accuracy"] = None
+                self.training_log.append(epoch_entry)
+                if self._log_writer is not None:
+                    self._log_writer.write(epoch_entry)
+            self._current_epoch_loss = 0.0
+            self._current_epoch_steps = 0
 
     def on_validation_epoch_end(self):
         """收集每轮验证指标到训练日志。"""
@@ -291,7 +346,10 @@ class SelfSupervisedModule(pl.LightningModule):
         if self.trainer.sanity_checking:
             return
 
-        # 自监督预训练阶段不做验证指标收集（limit_val_batches=0，无验证数据）
+        # 修复：SS 阶段 training_log 已在 on_train_epoch_end 写入（不依赖 validation 触发）。
+        # 原逻辑在 on_validation_epoch_end 写，但 limit_val_batches=0 时不触发，
+        # 导致 SS 阶段无 training_log 记录。现 on_train_epoch_end 负责写入，此处仅重置累加器
+        # （on_train_epoch_end 已重置，此处冗余但安全，防止 limit_val_batches>0 时重复写入）。
         if self.phase == "self_supervised":
             self._current_epoch_loss = 0.0
             self._current_epoch_steps = 0
@@ -303,6 +361,20 @@ class SelfSupervisedModule(pl.LightningModule):
             # 修复（双重 compute 陷阱）：val_metrics 已交给 self.log，Lightning 自动
             # compute + reset，手动 compute 返回 0。改为从 callback_metrics 读取。
             cb_metrics = self.trainer.callback_metrics if self.trainer else {}
+            # P1-4 修复：补 val_loss 读取，与 GenericLightningModule（module.py L563-571）对齐。
+            # validation_step 已 self.log("val_loss", loss, ...)，cb_metrics 必有 val_loss 键。
+            # 旧逻辑只迭代 val_metrics（accuracy/macro_f1），遗漏 val_loss，导致 final_eval
+            # 缺 val_loss，下游 hpo.py:432 result.final_eval.get("val_loss") 拿到 None。
+            val_loss_cb = cb_metrics.get("val_loss")
+            if val_loss_cb is not None:
+                self._last_val_metrics["val_loss"] = round(
+                    float(val_loss_cb.item() if hasattr(val_loss_cb, "item") else val_loss_cb), 6
+                )
+            elif self._current_val_epoch_steps > 0:
+                # Fallback：callback_metrics 未命中时从累加器计算（与 GenericLightningModule 对称）
+                self._last_val_metrics["val_loss"] = round(
+                    self._current_val_epoch_loss / max(self._current_val_epoch_steps, 1), 6
+                )
             for name in self.val_metrics:
                 # self.log 键名为 f"val_{name}"（见 validation_step），从 callback_metrics
                 # 读取对应值。旧逻辑直接用 name 作键（无 val_ 前缀），与 training_log
@@ -317,6 +389,9 @@ class SelfSupervisedModule(pl.LightningModule):
             cm = self._val_confusion_matrix.compute()
             self._final_confusion_matrix = cm.long().tolist()
             self._val_confusion_matrix.reset()
+            # P1-4：重置 val 累加器（与 train 累加器对称，防止跨 final validation 重复累积）
+            self._current_val_epoch_loss = 0.0
+            self._current_val_epoch_steps = 0
             return
 
         # 训练中的验证：添加到训练日志
@@ -363,6 +438,11 @@ class SelfSupervisedModule(pl.LightningModule):
             self._log_writer.write(epoch_entry)
         self._current_epoch_loss = 0.0
         self._current_epoch_steps = 0
+        # P1-4 修复：重置 val 累加器，与 GenericLightningModule（module.py L673-674）对称。
+        # 旧逻辑遗漏此重置，导致跨 epoch 持续累加，final validation fallback 路径
+        # 计算的是多 epoch 平均值而非单 epoch 值。
+        self._current_val_epoch_loss = 0.0
+        self._current_val_epoch_steps = 0
 
     def get_final_metrics(self) -> Dict[str, Any]:
         """获取最终评测指标（含 Phase 2.2b confusion_matrix）。"""

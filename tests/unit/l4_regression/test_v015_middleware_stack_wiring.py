@@ -10,41 +10,86 @@ Anchor: bug 编号 V015 + 修复 commit 6be8b80。
 """
 from __future__ import annotations
 
-import ast
-import pathlib
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 
 @pytest.mark.l4_regression
 class TestV015MiddlewareStackWiring:
-    """锁定 V015 修复：tools/config.py 通过 _config_stack.instrument 调用。"""
+    """锁定 V015 修复：senseframe_config_parse 通过 _config_stack.instrument 注入 request_id。
+
+    行为测试：调用 senseframe_config_parse 时，RequestIdMiddleware 应将 ctx.request_id
+    注入模块级 ContextVar（get_request_id() 返回非 "-"）。
+
+    替代 AST 检查的理由：AST 结构检查会因合法重命名（如 _config_stack 改为局部变量）
+    误报，行为测试直接验证功能不受重命名影响。
+    """
 
     @staticmethod
-    def _has_call_pattern(tree, func_name: str, method_name: str) -> bool:
-        """检查 AST 是否含 ``<func_name>.<method_name>(...)`` 调用。"""
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute):
-                if node.attr == method_name:
-                    value = node.value
-                    if isinstance(value, ast.Name) and value.id == func_name:
-                        return True
-        return False
+    def _valid_yaml() -> str:
+        """最小合法 YAML（与 tests/test_mcp_config_parse.py 对齐）。"""
+        return """
+scene:
+  name: wifi_csi
+  dataset: UT_HAR_data
+  model_id: MLP
+  data_root: /tmp/data
 
-    def test_config_tools_use_middleware_stack(self):
-        """V015 anchor: AST 检查 tools/config.py 含 _config_stack.instrument(...) 调用。
+input_features:
+  - name: csi
+    type: csi
+    shape: [1, 250, 90]
+
+output_features:
+  - name: action
+    type: category
+    num_classes: 7
+
+trainer:
+  epochs: 50
+  batch_size: 32
+"""
+
+    @pytest.mark.asyncio
+    async def test_config_parse_wires_request_id_middleware(self):
+        """V015 anchor: senseframe_config_parse 调用期间 request_id 被注入 ContextVar。
+
+        通过 spy ExperimentConfig.from_dict（在 async with _config_stack.instrument
+        块内被调用）捕获 get_request_id() 的值。如果 _config_stack.instrument 被移除，
+        get_request_id() 始终返回 "-"，测试失败。
 
         如果此断言失败，V015 修复被回退。
         """
-        # tests/unit/l4_regression/test_v015_*.py → SenseFrame/
-        # parents[0]=l4_regression, [1]=unit, [2]=tests, [3]=SenseFrame
-        senseframe_root = pathlib.Path(__file__).resolve().parents[3]
-        py = senseframe_root / "senseframe" / "mcp" / "tools" / "config.py"
-        assert py.exists(), f"{py} must exist"
+        from senseframe.engine.config import ExperimentConfig
+        from senseframe.mcp.middleware import get_request_id
+        from senseframe.mcp.tools.config import senseframe_config_parse
 
-        tree = ast.parse(py.read_text(encoding="utf-8"))
-        # V015 关键断言：含 _config_stack.instrument 调用
-        assert self._has_call_pattern(tree, "_config_stack", "instrument"), (
-            f"如果此断言失败，V015 修复被回退：{py} must call "
-            f"_config_stack.instrument(...) to wrap tool logic with MiddlewareStack"
+        mock_ctx = SimpleNamespace(
+            request_id="v015-test-req-123",
+            info=AsyncMock(),
+            error=AsyncMock(),
+        )
+
+        captured_request_ids: list[str] = []
+        original_from_dict = ExperimentConfig.from_dict
+
+        def spy_from_dict(d):
+            # 在 _config_stack.instrument 块内捕获 request_id
+            captured_request_ids.append(get_request_id())
+            return original_from_dict(d)
+
+        with patch.object(ExperimentConfig, "from_dict", spy_from_dict):
+            await senseframe_config_parse(
+                config_yaml=self._valid_yaml(), ctx=mock_ctx
+            )
+
+        assert captured_request_ids, (
+            "ExperimentConfig.from_dict 未被调用，spy 未触发"
+        )
+        assert captured_request_ids[0] == "v015-test-req-123", (
+            "V015 修复被回退：senseframe_config_parse 未通过 _config_stack.instrument "
+            f"注入 request_id（实际值: {captured_request_ids[0]}），"
+            "RequestIdMiddleware 可能未接入或 instrument 调用被移除"
         )

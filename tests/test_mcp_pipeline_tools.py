@@ -816,13 +816,18 @@ class TestPipelineToolHandlers:
         view = await senseframe_pipeline_list(
             limit=2, filter_dict={"state": STATE_PENDING}
         )
-        # 第二页用不同 filter，应抛 CursorFilterMismatch
-        with pytest.raises(CursorFilterMismatch):
+        # 第二页用不同 filter，应抛 ToolError（含 CursorFilterMismatch code）
+        # E1 修复后 pipeline 工具统一通过 to_tool_error 路由异常
+        from mcp.server.fastmcp.exceptions import ToolError
+        import json as _json
+        with pytest.raises(ToolError) as exc_info:
             await senseframe_pipeline_list(
                 cursor=view.next_cursor,
                 limit=2,
                 filter_dict={"state": STATE_RUNNING},
             )
+        payload = _json.loads(str(exc_info.value))
+        assert payload["code"] == "CursorFilterMismatch"
 
     @pytest.mark.asyncio
     async def test_pipeline_pause_resume_cycle(
@@ -869,29 +874,45 @@ class TestPipelineToolHandlers:
     async def test_pipeline_advance_unknown_run_raises_pipeline_not_found(
         self, fresh_store
     ):
-        """advance 不存在的 run_id 应抛 PipelineNotFound。"""
-        with pytest.raises(PipelineNotFound):
+        """advance 不存在的 run_id 应抛 ToolError（含 PipelineNotFound code）。"""
+        # E1 修复后 pipeline 工具统一通过 to_tool_error 路由异常
+        from mcp.server.fastmcp.exceptions import ToolError
+        import json as _json
+        with pytest.raises(ToolError) as exc_info:
             await senseframe_pipeline_advance(
                 run_id="nonexistent", action="start"
             )
+        payload = _json.loads(str(exc_info.value))
+        assert payload["code"] == "PipelineNotFound"
+        assert payload["category"] == "pipeline"
 
     @pytest.mark.asyncio
     async def test_pipeline_get_unknown_run_raises(self, fresh_store):
-        with pytest.raises(PipelineNotFound):
+        """get 不存在的 run_id 应抛 ToolError（含 PipelineNotFound code）。"""
+        from mcp.server.fastmcp.exceptions import ToolError
+        import json as _json
+        with pytest.raises(ToolError) as exc_info:
             await senseframe_pipeline_get(run_id="nonexistent")
+        payload = _json.loads(str(exc_info.value))
+        assert payload["code"] == "PipelineNotFound"
 
     @pytest.mark.asyncio
     async def test_pipeline_advance_illegal_transition_raises(
         self, fresh_store, sample_config, sample_stages
     ):
-        """Pending → complete 非法转换应抛 IllegalTransition。"""
+        """Pending → complete 非法转换应抛 ToolError（含 IllegalTransition code）。"""
         create_resp = await senseframe_pipeline_create(
             config=sample_config, stages=sample_stages
         )
-        with pytest.raises(IllegalTransition):
+        from mcp.server.fastmcp.exceptions import ToolError
+        import json as _json
+        with pytest.raises(ToolError) as exc_info:
             await senseframe_pipeline_advance(
                 run_id=create_resp.run_id, action="complete"
             )
+        payload = _json.loads(str(exc_info.value))
+        assert payload["code"] == "IllegalTransition"
+        assert payload["category"] == "pipeline"
 
 
 # ============================================================

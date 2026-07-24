@@ -213,7 +213,12 @@ PARADIGM_REGISTRY: Dict[str, Paradigm] = {
         config_template={
             "learning_mode": "self_supervised",
             "epochs": 100,
-            "supervised_epochs": 300,
+            # P0 修复：字段名修正 supervised_epochs → self_supervised_epochs。
+            # 框架在 stage_train 读取 ctx.resolved["self_supervised_epochs"]（默认 100），
+            # 旧字段名 supervised_epochs 无消费者，静默失效。
+            # 注意：learning_mode 必须设在 scene 顶层（scene.learning_mode），
+            # 而非扁平放置——SceneConfig.extra="forbid"，扁平 learning_mode 会被忽略。
+            "self_supervised_epochs": 300,
             "batch_size": 64,
             "learning_rate": 1e-3,
             "optimizer": "adamw",
@@ -438,8 +443,8 @@ def _cmd_recommend(args):
                     model_id, args.dataset, n_samples=n_samples)
             except (KeyError, ValueError) as e:
                 _logger.warning(
-                    f"get_default_epochs failed for ({model_id}, {args.dataset}): {e}; "
-                    f"default_epochs set to None"
+                    "get_default_epochs failed for (%s, %s): %s; default_epochs set to None",
+                    model_id, args.dataset, e,
                 )
                 info["default_epochs"] = None
         recommendations.append(info)
@@ -685,7 +690,7 @@ def _run_dynamic_validation(config: ExperimentConfig) -> dict:
         }
 
     except Exception as e:
-        _logger.error(f"dynamic validation failed: {e}", exc_info=True)
+        _logger.error("dynamic validation failed: %s", e, exc_info=True)
         return {
             "status": "failed",
             "error": str(e),
@@ -1050,6 +1055,130 @@ def _cmd_export(args):
         sys.exit(1)
 
 
+def _cmd_compare(args):
+    """对比实验命令：给定两份 YAML 配置，各跑 N 次训练，对比产物。
+
+    用法：
+        senseframe compare config_a.yaml config_b.yaml --repeats 3 --metric val_accuracy
+    """
+    import statistics
+
+    from .engine.config import ExperimentConfig
+    from .experiment.baseline import BaselineRunner
+    from .experiment.design import BaselineConfig
+    from .experiment.types import TrialGroup, TrialStatus
+
+    # --- 加载两份配置 ---
+    configs = {}
+    for label, path_str in (("a", args.config_a), ("b", args.config_b)):
+        p = Path(path_str)
+        if not p.exists():
+            print(json.dumps({
+                "error": f"Config file not found: {path_str}",
+                "code": "CONFIG_NOT_FOUND",
+            }, ensure_ascii=False), file=sys.stderr)
+            sys.exit(1)
+        with open(p, "r", encoding="utf-8") as f:
+            d = yaml.safe_load(f)
+        if not isinstance(d, dict):
+            print(json.dumps({
+                "error": f"Config file must contain a YAML mapping: {path_str}",
+                "code": "INVALID_CONFIG_FORMAT",
+            }, ensure_ascii=False), file=sys.stderr)
+            sys.exit(1)
+        try:
+            configs[label] = ExperimentConfig.from_dict(d)
+        except ValueError as e:
+            print(json.dumps({
+                "error": str(e),
+                "code": "CONFIG_VALIDATION_ERROR",
+            }, ensure_ascii=False), file=sys.stderr)
+            sys.exit(1)
+
+    config_a = configs["a"]
+    config_b = configs["b"]
+    repeats = args.repeats
+    metric = args.metric
+
+    # --- 串行训练 ---
+    results = {"a": [], "b": []}
+    run_idx = 0
+    for label, cfg in (("a", config_a), ("b", config_b)):
+        runner = BaselineRunner(
+            config=BaselineConfig(
+                name=Path(args.config_a if label == "a" else args.config_b).stem,
+                base_config=cfg,
+                group=TrialGroup.BASELINE_REPRO,
+            ),
+            experiment_id=f"compare_{Path(args.config_a).stem}_vs_{Path(args.config_b).stem}",
+        )
+        for _ in range(repeats):
+            r = runner.run(cfg.scene.dataset, cfg.scene.model_id, run_idx)
+            results[label].append(r)
+            run_idx += 1
+
+    # --- 摘要 + 对比 ---
+    def _summarize(trial_results):
+        success = [r for r in trial_results if r.status == TrialStatus.SUCCESS]
+        n_failed = len(trial_results) - len(success)
+        metric_values = [r.metrics.get(metric, 0.0) for r in success if metric in r.metrics]
+        wall_times = [r.wall_time_s for r in success if r.wall_time_s > 0]
+        return {
+            "n_runs": len(trial_results),
+            "n_success": len(success),
+            "n_failed": n_failed,
+            f"{metric}_mean": statistics.mean(metric_values) if metric_values else None,
+            f"{metric}_std": statistics.stdev(metric_values) if len(metric_values) >= 2 else None,
+            "wall_time_s_mean": statistics.mean(wall_times) if wall_times else None,
+            "wall_time_s_std": statistics.stdev(wall_times) if len(wall_times) >= 2 else None,
+        }
+
+    summary_a = _summarize(results["a"])
+    summary_b = _summarize(results["b"])
+
+    comparison = {}
+    key_a = f"{metric}_mean"
+    key_b = f"{metric}_mean"
+    if summary_a.get(key_a) is not None and summary_b.get(key_b) is not None:
+        delta = summary_b[key_a] - summary_a[key_a]
+        comparison[metric] = {
+            "delta": delta,
+            "delta_pct": (delta / summary_a[key_a] * 100) if summary_a[key_a] != 0 else None,
+            "favor": "b" if delta > 0 else ("a" if delta < 0 else "tie"),
+        }
+    if summary_a.get("wall_time_s_mean") is not None and summary_b.get("wall_time_s_mean") is not None:
+        dt = summary_b["wall_time_s_mean"] - summary_a["wall_time_s_mean"]
+        comparison["wall_time_s"] = {
+            "delta": dt,
+            "delta_pct": (dt / summary_a["wall_time_s_mean"] * 100) if summary_a["wall_time_s_mean"] != 0 else None,
+            "favor": "a" if dt < 0 else ("b" if dt > 0 else "tie"),
+        }
+
+    report = {
+        "config_a": {"path": args.config_a, "name": Path(args.config_a).stem},
+        "config_b": {"path": args.config_b, "name": Path(args.config_b).stem},
+        "repeats": repeats,
+        "metric": metric,
+        "summary": {"a": summary_a, "b": summary_b},
+        "comparison": comparison,
+        "results": {
+            "a": [r.to_dict() for r in results["a"]],
+            "b": [r.to_dict() for r in results["b"]],
+        },
+    }
+
+    if args.output:
+        out = Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        _print_json({"output": str(out), "summary": {"a": summary_a, "b": summary_b}, "comparison": comparison})
+    else:
+        _print_json(report)
+
+
 def _cmd_predict(args):
     """
     Phase 8.3：批量推理命令。
@@ -1112,6 +1241,26 @@ def _cmd_predict(args):
             "code": "INVALID_SAMPLES_FORMAT",
         }, ensure_ascii=False))
         sys.exit(1)
+
+    # C2 安全预检：默认仅允许纯权重 .pth（weights_only=True），
+    # 防止不可信 .pth 通过 pickle 反序列化触发任意代码执行。
+    # predict() 内部 load_checkpoint_flexible 在 Lightning ckpt 场景会回退到
+    # weights_only=False；若 weights_only=True 预检通过，说明整个 pickle 图仅含
+    # 安全类型（tensor/基础类型），回退加载也不会实例化恶意对象。
+    # --unsafe-trust-model 时跳过预检（用户自担风险）。
+    if not args.unsafe_trust_model:
+        import torch
+        try:
+            torch.load(model_path, weights_only=True, map_location="cpu")
+        except Exception:
+            print(json.dumps({
+                "error": (
+                    "Model file may contain full model object (not just state_dict). "
+                    "Use --unsafe-trust-model to load with pickle deserialization."
+                ),
+                "code": "UNSAFE_MODEL_FILE",
+            }, ensure_ascii=False))
+            sys.exit(1)
 
     # 执行推理
     try:
@@ -1650,6 +1799,20 @@ def main():
         help="Phase 12.2：输出激活包装（默认从 metadata.task_spec 推断）",
     )
 
+    # compare 对比实验命令
+    p_compare = subparsers.add_parser(
+        "compare",
+        help="给定两份 YAML 配置，各跑 N 次训练，对比产物",
+    )
+    p_compare.add_argument("config_a", type=str, help="配置 A 的 YAML 路径")
+    p_compare.add_argument("config_b", type=str, help="配置 B 的 YAML 路径")
+    p_compare.add_argument("--repeats", type=int, default=3,
+                           help="每份配置重复次数（默认 3，>=2 时可算 std）")
+    p_compare.add_argument("--metric", type=str, default="val_accuracy",
+                           help="对比指标名（默认 val_accuracy）")
+    p_compare.add_argument("--output", type=str, default=None,
+                           help="报告保存路径（不指定时输出到 stdout）")
+
     # Phase 8.3：predict 批量推理命令
     p_predict = subparsers.add_parser(
         "predict",
@@ -1667,6 +1830,13 @@ def main():
                            choices=["cpu", "cuda"], help="推理设备")
     p_predict.add_argument("--include-logits", action="store_true",
                            help="在结果中包含原始 logits")
+    p_predict.add_argument(
+        "--unsafe-trust-model", action="store_true", dest="unsafe_trust_model",
+        help=(
+            "允许加载含完整 pickle 对象的 .pth 文件（默认拒绝，仅加载纯权重）。"
+            "仅在信任模型来源时使用，否则存在任意代码执行风险。"
+        ),
+    )
 
     # experiment（声明式 YAML 配置入口）
     p_exp = subparsers.add_parser(
@@ -1797,6 +1967,7 @@ def main():
         "paradigms": _cmd_paradigms,
         "recommend": _cmd_recommend,
         "export": _cmd_export,
+        "compare": _cmd_compare,
         "predict": _cmd_predict,
         "experiment": _cmd_experiment,
         # RFC-002 阶段 W：新能力子命令

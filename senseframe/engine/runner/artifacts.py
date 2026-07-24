@@ -263,9 +263,14 @@ _REQUIRED_MANIFEST_FIELDS = frozenset({
     "config_hash", "data_hash",
 })
 
-# 成功路径必须声明的产物
-_REQUIRED_ARTIFACT_NAMES = frozenset({
-    "config", "metadata", "training_log",
+# 成功路径必须声明的产物种类（P2-5：改用 kind 校验替代 name 校验）
+# P2-5 根因：原 _REQUIRED_ARTIFACT_NAMES = {"config", "metadata", "training_log"}
+# 期望逻辑名 "metadata"，但 stage_export.py 注册时用 "model_metadata"（kind="metadata"），
+# 集合差集必然命中 "metadata" → 误报。
+# 修复：改为按 kind 校验，kind 是类型分组（VALID_KINDS 含 "metadata"），
+# 只要任一产物 kind="metadata" 即通过，与逻辑名解耦。
+_REQUIRED_ARTIFACT_KINDS = frozenset({
+    "config", "metadata", "log",
 })
 
 
@@ -316,13 +321,15 @@ def verify_artifacts_full(output_dir: Path) -> Dict[str, Any]:
     # 2. hash 校验（复用现有逻辑）
     hash_check = verify_artifacts(output_dir)
 
-    # 3. 必填产物校验
+    # 3. 必填产物校验（P2-5：按 kind 校验，与逻辑名解耦）
+    # 旧逻辑按 name 集合差集，"metadata" vs "model_metadata" 误报；
+    # 新逻辑按 kind 集合差集，只要 kind="metadata" 的产物存在即通过。
     try:
         manifest = ArtifactManifest.load(output_dir)
-        declared = {a.name for a in manifest.artifacts}
+        declared_kinds = {a.kind for a in manifest.artifacts}
     except Exception:
-        declared = set()
-    missing_artifacts = [n for n in _REQUIRED_ARTIFACT_NAMES if n not in declared]
+        declared_kinds = set()
+    missing_artifacts = [k for k in _REQUIRED_ARTIFACT_KINDS if k not in declared_kinds]
 
     return {
         "hash_check": hash_check,

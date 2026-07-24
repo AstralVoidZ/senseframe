@@ -7,7 +7,20 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional, Union
+
+
+class StageIOSpec(NamedTuple):
+    """Stage IO 规格（RFC-003 DSP-5，结构化返回）。
+
+    P2 修复：原返回 dict，Agent 需 result["reads"] 访问；改为 NamedTuple 支持
+    result.reads 属性访问，与 API 文档一致。dict 兼容 via _asdict()。
+    """
+
+    name: str
+    reads: List[Dict[str, Any]]
+    writes: List[Dict[str, Any]]
+    description: str = ""
 
 
 def context_schema() -> Dict[str, Any]:
@@ -39,34 +52,35 @@ def context_describe(ctx) -> Dict[str, Any]:
     }
 
 
-def stage_io(name: Optional[str] = None) -> Dict[str, Any]:
+def stage_io(name: Optional[str] = None) -> Union[StageIOSpec, Dict[str, Any]]:
     """返回 stage 的 IO Spec（RFC-003 DSP-5）。
 
     Args:
         name: stage 名（如 "validate"）。None 时返回全部 stage 的 Spec 列表。
 
     Returns:
-        单个 stage 时返回该 stage 的 spec dict；
-        name=None 时返回 {"stages": [spec_dict, ...]}
+        单个 stage 时返回 StageIOSpec（支持 .name/.reads/.writes/.description 属性访问，
+        亦可 ._asdict() 转 dict）；
+        name=None 时返回 {"stages": [dict, ...]}（JSON 可序列化）。
     """
     from .engine.runner.pipeline import Pipeline
     specs = Pipeline.default().stages_with_spec()
 
-    def _spec_to_dict(spec) -> Dict[str, Any]:
-        return {
-            "name": spec.name,
-            "reads": [{"name": f.name, "type": f.type, "required": f.required, "description": f.description} for f in spec.reads],
-            "writes": [{"name": f.name, "type": f.type, "required": f.required, "description": f.description} for f in spec.writes],
-            "description": spec.description,
-        }
+    def _spec_to_namedtuple(spec) -> StageIOSpec:
+        return StageIOSpec(
+            name=spec.name,
+            reads=[{"name": f.name, "type": f.type, "required": f.required, "description": f.description} for f in spec.reads],
+            writes=[{"name": f.name, "type": f.type, "required": f.required, "description": f.description} for f in spec.writes],
+            description=spec.description,
+        )
 
     if name is not None:
         for spec in specs:
             if spec.name == name:
-                return _spec_to_dict(spec)
+                return _spec_to_namedtuple(spec)
         return {"error": f"Stage '{name}' not found", "available": [s.name for s in specs]}
 
-    return {"stages": [_spec_to_dict(s) for s in specs]}
+    return {"stages": [_spec_to_namedtuple(s)._asdict() for s in specs]}
 
 
 def list_stages() -> List[str]:
@@ -169,6 +183,7 @@ def _fallback_context_schema() -> Dict[str, Any]:
 
 
 __all__ = [
+    "StageIOSpec",
     "context_schema",
     "context_describe",
     "stage_io",

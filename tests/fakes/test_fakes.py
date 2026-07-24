@@ -138,6 +138,23 @@ class TestFakeLightningModuleContract:
         module.training_log.append({"epoch": 1, "loss": 0.5})
         assert len(module.training_log) == 1
 
+    def test_trainer_attribute_exists_and_default_none(self):
+        """Module.trainer 属性存在且默认 None（engine/module.py 访问 self.trainer.sanity_checking）。"""
+        module = FakeLightningModule()
+        assert hasattr(module, "trainer")
+        assert module.trainer is None  # 默认 None，测试可按需设置为 FakeTrainer
+
+    def test_parameters_returns_non_empty_iterable(self):
+        """Module.parameters() 返回非空可迭代对象（torch.optim.Adam 构造依赖）。"""
+        module = FakeLightningModule()
+        params = list(module.parameters())
+        assert len(params) > 0, (
+            "parameters() 返回空，torch.optim.Adam(module.parameters()) 会抛 ValueError"
+        )
+        # 验证返回的参数可被 optimizer 消费（不抛异常）
+        optimizer = torch.optim.Adam(module.parameters(), lr=1e-3)
+        assert optimizer is not None
+
 
 # ============================================================
 # FakeSampler 契约测试

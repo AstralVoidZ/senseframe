@@ -1,7 +1,6 @@
 """Stage 3: 加载数据 + 数据画像。"""
 from __future__ import annotations
 
-import glob
 import os
 from datetime import datetime
 from pathlib import Path
@@ -126,14 +125,29 @@ def _load_pretrain_checkpoint(
     base_dir = Path(output_dir) if output_dir else Path(".")
     search_dirs = [base_dir, base_dir / "runs"]
 
-    # 同时匹配 .pt 和 .ckpt 扩展名（glob.escape 防御数据集名中的特殊字符）
+    # I7 修复：glob 注入面校验——pretrain_dataset_name 拼入 glob 模式，
+    # 含元字符（* ? [ ]）会导致非预期匹配或路径遍历。数据集名来自代码常量/
+    # 配置，正常不含元字符；校验失败时跳过（返回 None）而非抛异常，保持降级语义。
+    import re
+    if re.search(r"[*?\[\]]", pretrain_dataset_name):
+        _logger.warning(
+            "pretrain_dataset_name contains glob metacharacters, skipping: %s",
+            pretrain_dataset_name,
+        )
+        return None
+
+    # 同时匹配 .pt 和 .ckpt 扩展名
+    # 不使用 glob.escape——它将方括号等元字符转义为 [[] 形式，
+    # 嵌入 *...* 通配符模式后可能无法正确匹配实际文件名。
+    # 改为直接用数据集名构造模式（数据集名来自代码常量/配置，非用户自由输入，
+    # 不含 glob 元字符；I7 修复已在此处上方做安全校验）。
     candidates = []
     for search_dir in search_dirs:
         if not search_dir.exists():
             continue
         for ext in (".pt", ".ckpt"):
             candidates.extend(
-                search_dir.glob(f"*{glob.escape(pretrain_dataset_name)}*{ext}")
+                search_dir.glob(f"*{pretrain_dataset_name}*{ext}")
             )
 
     if not candidates:

@@ -61,7 +61,9 @@ def sample_output_dir(tmp_path):
     artifacts = []
     for name, path, kind in [
         ("model_weights", "model.pth", "model"),
-        ("metadata", "metadata.json", "metadata"),
+        # P2-5：镜像生产命名（stage_export.py L452 用 "model_metadata" name + kind="metadata"），
+        # 使测试真正覆盖 "name ≠ kind" 场景，验证 kind 校验逻辑
+        ("model_metadata", "metadata.json", "metadata"),
         ("config", "config.yaml", "config"),
         ("training_log", "training_log.jsonl", "log"),
     ]:
@@ -105,7 +107,8 @@ class TestArtifactVerify:
         assert isinstance(result, ArtifactVerifyResponse)
         assert result.run_id == "test-run-001"
         assert "model_weights" in result.hash_check
-        assert "metadata" in result.hash_check
+        # P2-5：name 改为 "model_metadata"（镜像生产命名），hash_check key 是 name 而非 kind
+        assert "model_metadata" in result.hash_check
         assert "config" in result.hash_check
         assert "training_log" in result.hash_check
         # 全部产物完整 → overall_ok=True

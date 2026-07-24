@@ -20,17 +20,28 @@ DataProfile 包含：
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+_logger = logging.getLogger(__name__)
+
 
 def _count_dtypes(dtypes: Dict[str, str]) -> Dict[str, int]:
     """统计 dtype 分布。"""
     from collections import Counter
     return dict(Counter(dtypes.values()))
+
+
+# P1-3：高维特征展开阈值。超过此值时 per-feature dict 折叠为 "_all" 共享原型，
+# 避免 684K 维 CSI 数据生成 ~93MB 冗余 JSON。
+# 阈值选择 10000：覆盖典型表格数据集（UCI 成人 14K 行 × 100+ 列 ≈ 1.4M cells，
+# 但 feature 数通常 < 1000），同时对高维信号（CSI 22.5K / 图像 3072 / 音频 64000）
+# 触发折叠。下游消费者通过 "_all" 键识别折叠模式。
+_FEATURE_EXPANSION_THRESHOLD = 10000
 
 
 @dataclass
@@ -113,7 +124,10 @@ class DataProfile:
     def describe(self) -> Dict[str, Any]:
         """返回当前画像摘要（RFC-003 DSP-4）。"""
         return {
-            "n_features": len(self.feature_names),
+            # P1-3 修复：用 self.n_features 而非 len(self.feature_names)。
+            # 高维折叠时 feature_names 为空列表（用 "_all" 键存共享原型），
+            # len() 返回 0，但 n_features 仍为原始数量（如 684000）。
+            "n_features": self.n_features,
             "dtype_distribution": _count_dtypes(self.dtypes),
             "nullable_ratio": sum(1 for v in self.nullable.values() if v) / max(len(self.nullable), 1),
         }
@@ -255,13 +269,26 @@ class DataProfiler:
         )
 
         # RFC-003 DSP-4：结构深化 — 计算 dtypes/feature_names/nullable/shapes
+        # P1-3 修复：高维数据（如 CSI 684000 维）按 feature 展开 4 个 dict 会产生
+        # ~93MB JSON（每条目内容相同却重复 684K 次）。引入阈值折叠：超过阈值时
+        # 用 "_all" 键存共享原型 + n_features 记录原始数量，避免冗余展开。
+        # 同质数据（典型场景：所有 feature 共享 dtype/shape/nullable）折叠为单条目，
+        # 异质数据（罕见）仍按 feature 展开。
         if input_shape:
             n_feat = int(np.prod(input_shape)) if input_shape else 0
-            feature_names_list = [f"feature_{i}" for i in range(n_feat)]
             first_dtype = str(first_x.dtype) if hasattr(first_x, 'dtype') else "unknown"
-            dtypes_dict = {name: first_dtype for name in feature_names_list}
-            nullable_dict = {name: bool(missing_rate > 0) for name in feature_names_list}
-            shapes_dict = {name: tuple(input_shape) for name in feature_names_list}
+            first_nullable = bool(missing_rate > 0)
+            if n_feat > _FEATURE_EXPANSION_THRESHOLD:
+                # 高维折叠：用 "_all" 键存共享原型，feature_names 仅存数量
+                feature_names_list = []
+                dtypes_dict = {"_all": first_dtype}
+                nullable_dict = {"_all": first_nullable}
+                shapes_dict = {"_all": tuple(input_shape)}
+            else:
+                feature_names_list = [f"feature_{i}" for i in range(n_feat)]
+                dtypes_dict = {name: first_dtype for name in feature_names_list}
+                nullable_dict = {name: first_nullable for name in feature_names_list}
+                shapes_dict = {name: tuple(input_shape) for name in feature_names_list}
         else:
             feature_names_list = []
             dtypes_dict = {}
@@ -301,6 +328,7 @@ class DataProfiler:
         dataset_name: str = "",
         modality_hint: Optional[str] = None,
         learning_mode: str = "supervised",
+        scene: Optional[Any] = None,
     ) -> DataProfile:
         """探查 DatasetBundle，按学习模式选择采样源。
 
@@ -322,15 +350,28 @@ class DataProfiler:
         动作标签）而非 14（NTU-Fi-HumanID 14 类身份标签），class_weights 维度不匹配
         14 类 CrossEntropy，且 Agent 基于 data_profile.n_classes=6 错误决策。
 
+        P1 改进（2026-07-26）：新增 scene 参数，支持从 scene.meta.modality 自动继承
+        modality_hint。Pipeline 内部 stage_load 已从 ctx.meta.modality 传入，此参数
+        主要服务直接调用 profile_bundle 的场景（如 notebook 探索），减少必须显式
+        传入 modality_hint 的认知负担。modality_hint 显式传入时优先级最高。
+
         Args:
             bundle: DatasetBundle（含 train/test/val/unsupervised/supervised_finetune）
             dataset_name: 数据集名称
-            modality_hint: 场景显式声明的数据模态（如 "csi"），覆盖 shape 启发式
+            modality_hint: 场景显式声明的数据模态（如 "csi"），覆盖 shape 启发式。
+                           None 时尝试从 scene.meta.modality 继承。
             learning_mode: "supervised" 或 "self_supervised"，决定采样源
+            scene: 可选的场景容器实例，modality_hint 为 None 时从 scene.meta.modality 读取
 
         Returns:
             DataProfile 数据画像
         """
+        # P1 改进：modality_hint 未显式传入时，从 scene.meta.modality 自动继承。
+        # Pipeline 内部 stage_load 已显式传入 modality_hint，此分支主要服务直接调用场景。
+        if modality_hint is None and scene is not None:
+            _scene_meta = getattr(scene, "meta", None)
+            if _scene_meta is not None:
+                modality_hint = getattr(_scene_meta, "modality", None)
         if learning_mode == "self_supervised":
             # P5 P2-3：自监督模式必须从 unsupervised 集采样画像。
             # 旧代码回退到 test 集，导致 normalization 常量来自测试集（数据泄露）。
@@ -367,7 +408,18 @@ class DataProfiler:
                 profile.recommended_task_type = task_profile.recommended_task_type
                 profile.recommended_loss = task_profile.recommended_loss
                 profile.recommended_metrics = task_profile.recommended_metrics
-            return profile
+                # P1-C 修复：input_shape 应来自 supervised_finetune（单样本形状），
+                # 而非 unsupervised ConcatDataset（拼接后矩阵形状）。
+                # 旧逻辑用 unsupervised 的 (342, 2000) 而非 spec 声明的 (3, 114, 500)，
+                # Agent 基于错误 input_shape 做模型选择。
+                # 注：P1-a 修复后，_apply_spec_shape 会用注册表 DatasetSpec.input_shape
+                # 进一步覆盖（优先级最高），此处作为未注册数据集的兜底。
+                if task_profile.input_shape:
+                    profile.input_shape = task_profile.input_shape
+                    profile.n_features = task_profile.n_features
+                    profile.is_spatial = task_profile.is_spatial
+                    profile.is_temporal = task_profile.is_temporal
+            return self._apply_spec_shape(profile, dataset_name)
         else:
             ds = getattr(bundle, "train", None)
             if ds is None:
@@ -376,10 +428,45 @@ class DataProfiler:
                     f"dataset={dataset_name}"
                 )
             profile_source = "train"
-        return self.profile_dataset(
-            ds, dataset_name=dataset_name, profile_source=profile_source,
-            modality_hint=modality_hint,
+        return self._apply_spec_shape(
+            self.profile_dataset(
+                ds, dataset_name=dataset_name, profile_source=profile_source,
+                modality_hint=modality_hint,
+            ),
+            dataset_name,
         )
+
+    def _apply_spec_shape(self, profile: "DataProfile", dataset_name: str) -> "DataProfile":
+        """P1-a 修复：用 DatasetSpec 声明的变换后 input_shape 覆盖 profiler 采样值。
+
+        根因：profiler 直接采样 CSIDataset.__getitem__ 返回原始 .mat 形状（如 (342, 2000)），
+        而 transform（stride + reshape）在 stage_build 才注入 GenericDataModule。注册表
+        DatasetSpec.input_shape 声明的是变换后形状（如 (3, 114, 500)），是模型实际接收的
+        权威形状，应覆盖采样值。仅对已注册数据集覆盖；未注册（generic/CustomContainer）
+        保留采样值（前序 P1-C 的 supervised_finetune 覆盖作为兜底）。
+
+        Args:
+            profile: 待修正的数据画像
+            dataset_name: 数据集名称（用于查注册表）
+
+        Returns:
+            修正后的 DataProfile（input_shape/n_features/is_spatial/is_temporal 已覆盖）
+        """
+        if not dataset_name:
+            return profile
+        try:
+            from ..registry import is_dataset_registered, get_dataset_spec
+            if is_dataset_registered(dataset_name):
+                spec = get_dataset_spec(dataset_name)
+                spec_shape = getattr(spec, "input_shape", None)
+                if spec_shape:
+                    profile.input_shape = tuple(spec_shape)
+                    profile.n_features = int(np.prod(spec_shape))
+                    profile.is_spatial = len(spec_shape) >= 3
+                    profile.is_temporal = len(spec_shape) >= 2
+        except Exception as e:
+            _logger.debug("spec input_shape override skipped for %s: %s", dataset_name, e)
+        return profile
 
     def _to_numpy(self, x) -> np.ndarray:
         """转换为 numpy array。"""

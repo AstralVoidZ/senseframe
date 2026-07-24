@@ -257,6 +257,10 @@ class CSIFoundationModel(nn.Module):
         mask: (B, n_patches) float，1 = masked / 0 = visible，按原始顺序
         ids_restore: (B, n_patches)，用于 decoder 还原顺序
         """
+        if not 0.0 <= mask_ratio <= 1.0:
+            raise ValueError(
+                f"mask_ratio must be in [0.0, 1.0], got {mask_ratio}"
+            )
         B, N, D = x.shape
         len_keep = int(N * (1 - mask_ratio))
         noise = torch.rand(B, N, device=x.device)
@@ -434,9 +438,11 @@ class CSIFoundationModel(nn.Module):
             ValueError: new_input_shape 不是 (C, L) 元组或 L 不能被 patch_len 整除
         """
         # 构建新 patch_embedder（CSIPatchEmbedder.__init__ 内部会校验 input_shape / patch_len）
+        # M5 修复：新建模块默认在 CPU，需迁移到模型所在设备，避免 GPU 模型设备不匹配崩溃
+        device = next(self.parameters()).device
         new_patch_embedder = CSIPatchEmbedder(
             new_input_shape, new_patch_len, self.d_model
-        )
+        ).to(device)
         new_n_patches = new_patch_embedder.n_patches
 
         # 替换 modality-specific 模块
@@ -446,19 +452,21 @@ class CSIFoundationModel(nn.Module):
 
         # 重新初始化 pos_embed（n_patches 改变）
         # 对齐 __init__ 的 P3-P2-10 优化：torch.empty + trunc_normal_，跳过冗余 zeros
-        self.pos_embed = nn.Parameter(torch.empty(1, new_n_patches, self.d_model))
+        self.pos_embed = nn.Parameter(
+            torch.empty(1, new_n_patches, self.d_model, device=device)
+        )
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
         # 重新初始化 decoder_pos_embed（n_patches 改变）
         self.decoder_pos_embed = nn.Parameter(
-            torch.empty(1, new_n_patches, self.decoder_dim)
+            torch.empty(1, new_n_patches, self.decoder_dim, device=device)
         )
         nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
 
         # 重新初始化 decoder_proj（输出维度 patch_len * C 改变）
         new_C = new_patch_embedder.C
         new_pl = new_patch_embedder.patch_len
-        self.decoder_proj = nn.Linear(self.decoder_dim, new_pl * new_C)
+        self.decoder_proj = nn.Linear(self.decoder_dim, new_pl * new_C).to(device)
 
         # encoder / encoder_norm / decoder_embed / mask_token / decoder / decoder_norm
         # 保持不变（modality-agnostic，跨模态迁移的核心价值所在）

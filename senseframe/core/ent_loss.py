@@ -10,6 +10,11 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 
+# KDE loss 缩放因子（AutoFi 论文 §3.2：KDE 项量级远小于 KL/EH/HE，需放大 100 倍
+# 才能在 final-kde 总损失中起到有效正则作用）
+_KDE_LOSS_SCALE = 100
+
+
 class EntLoss(nn.Module):
     """AutoFi 自监督损失：KL + EH + HE + KDE。"""
 
@@ -35,7 +40,7 @@ class EntLoss(nn.Module):
         loss["final"] = loss["kl"] + ((1 + self.lam1) * loss["eh"] - self.lam2 * loss["he"])
 
         loss["kde"] = self._cosine_similarity_loss(feat1, feat2)
-        loss["final-kde"] = loss["kde"] * 100 + loss["final"]
+        loss["final-kde"] = loss["kde"] * _KDE_LOSS_SCALE + loss["final"]
 
         return loss
 

@@ -5,6 +5,7 @@ import json
 import pytest
 
 from senseframe.introspect import (
+    StageIOSpec,
     context_schema,
     context_describe,
     stage_io,
@@ -125,19 +126,20 @@ class TestStageIO:
 
     def test_get_single_stage(self):
         result = stage_io("validate")
-        assert result["name"] == "validate"
-        assert "reads" in result
-        assert "writes" in result
-        assert "description" in result
+        assert isinstance(result, StageIOSpec)
+        assert result.name == "validate"
+        assert isinstance(result.reads, list)
+        assert isinstance(result.writes, list)
+        assert isinstance(result.description, str)
 
     def test_validate_reads_config(self):
         result = stage_io("validate")
-        read_names = [f["name"] for f in result["reads"]]
+        read_names = [f["name"] for f in result.reads]
         assert "config" in read_names
 
     def test_validate_writes_scene(self):
         result = stage_io("validate")
-        write_names = [f["name"] for f in result["writes"]]
+        write_names = [f["name"] for f in result.writes]
         assert "scene" in write_names
         assert "meta" in write_names
 

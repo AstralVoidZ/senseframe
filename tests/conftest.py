@@ -17,8 +17,6 @@ pytest 配置与 fixtures（R-fix 重构后骨架）。
 路径安全规范（P5 P2-14）：
 - 禁止硬编码 /tmp/... 或 /home/user/... 等 Unix 路径（跨平台失败）
 - 需要临时目录时使用 pytest 内置 tmp_path fixture
-- 需要 data_root 占位但不触发真实数据加载时使用 safe_data_root fixture
-- 需要真实数据集时使用 data_root fixture（从 SENSEFRAME_DATA_ROOT env 读）
 - debug_*.py 是开发期调试脚本（不进入 pytest 收集），不受此规范约束
 """
 
@@ -80,33 +78,3 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_slow)
         if "requires_data" in kw and not has_data:
             item.add_marker(skip_data)
-
-
-@pytest.fixture
-def project_root() -> Path:
-    """项目根目录。"""
-    return PROJECT_ROOT
-
-
-@pytest.fixture
-def data_root() -> Path:
-    """数据集根目录（从 SENSEFRAME_DATA_ROOT env 读，未设置则 raise）。"""
-    if DATA_ROOT is None:
-        pytest.skip("SENSEFRAME_DATA_ROOT 未设置，跳过依赖数据的测试")
-    return DATA_ROOT
-
-
-@pytest.fixture
-def safe_data_root(tmp_path) -> Path:
-    """安全的临时数据根目录（P5 P2-14）。
-
-    供需要 data_root 占位但不触发真实数据加载的测试使用。
-    替代硬编码 /tmp/... 或 /home/user/... 路径，确保跨平台兼容。
-
-    用法：
-        def test_something(safe_data_root):
-            config = SceneConfig(data_root=str(safe_data_root), ...)
-    """
-    data_dir = tmp_path / "sf_test_data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return data_dir

@@ -297,6 +297,9 @@ def stage_export(ctx: PipelineContext) -> PipelineContext:
                     "num_classes": ctx.num_classes,
                     "final_eval": final_eval,
                 },
+                # P0-2：传入 learning_mode，export_model 内部检测 _Parrallel 双输入 forward
+                # 并自动包装为单输入 wrapper，避免 TypeError: forward() missing x2
+                learning_mode=ctx.learning_mode,
             )
             if ctx.output:
                 ctx.output.export = export_result.to_dict()

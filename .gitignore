@@ -69,6 +69,7 @@ coverage.xml
 # IDE / Agent 配置
 .idea/
 .vscode/
+.claude/
 .opencode/
 .trae/
 .workbuddy/
