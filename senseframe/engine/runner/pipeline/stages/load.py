@@ -156,6 +156,7 @@ def _build_csi_adversarial_loader(
     csi_dataset_name: str,
     csi_data_root: str,
     batch_size: int,
+    num_workers: int = 0,
 ) -> "DataLoader | None":
     """构造 CSI val 集 DataLoader（DANN 对抗信号）。
 
@@ -176,6 +177,8 @@ def _build_csi_adversarial_loader(
         csi_dataset_name: CSI 数据集名（如 "NTU-Fi_HAR"）
         csi_data_root: CSI 数据集根目录（独立于 target data_root）
         batch_size: batch 大小（从 config.trainer.batch_size 读取）
+        num_workers: DataLoader 工作进程数（与 GenericDataModule.num_workers 对齐，
+            默认 0；调用方传 ctx.config.trainer.num_workers or 0）
 
     Returns:
         DataLoader 实例，或 None（加载失败时降级，不中断 pipeline）
@@ -202,7 +205,7 @@ def _build_csi_adversarial_loader(
                 "DANN adversarial branch will be skipped", csi_dataset_name,
             )
             return None
-        return DataLoader(adv_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        return DataLoader(adv_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     except (FileNotFoundError, ValueError) as e:
         _logger.warning(
             "csi_adversarial_loader: failed to load CSI dataset=%s (%s: %s), "
@@ -282,10 +285,14 @@ def stage_load(ctx: PipelineContext) -> PipelineContext:
             csi_data_root = ctx.config.scene.params.get("csi_data_root")
         if csi_data_root is None:
             csi_data_root = data_root
+        # M12 现状：stage_load 在 stage_resolve 之前执行（runtime 顺序 load → resolve），
+        # ctx.resolved 尚未填充，故 batch_size 沿用 ctx.config.trainer.batch_size；
+        # num_workers 与 GenericDataModule 对齐，从 ctx.config.trainer.num_workers 读取（None 时 fallback 0）。
         csi_loader = _build_csi_adversarial_loader(
             pretrain_dataset,
             csi_data_root,
             ctx.config.trainer.batch_size,
+            num_workers=ctx.config.trainer.num_workers or 0,
         )
         if csi_loader is not None:
             ctx.scene_kwargs["csi_loader"] = csi_loader

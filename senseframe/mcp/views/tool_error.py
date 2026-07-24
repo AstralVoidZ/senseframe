@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from typing import Literal
 
+import pydantic
+
 from senseframe.mcp.errors import (
     ArtifactError,
     CheckpointError,
@@ -47,6 +49,9 @@ from senseframe.mcp.views._base import FrozenModel
 __all__ = ["ToolErrorResponse", "CategoryT"]
 
 # 7 类 category，严格按设计文档 0.5 节定义，不可增减。
+# search category 当前预留：待 HPO tool（senseframe_hpo_setup 等）落地后，
+# 将 HPO 相关异常映射到 search。当前 HPO 超时等异常仍由 pipeline category
+# 承载（见 _CATEGORY_BY_EXC 中 TimeBudgetExceeded → pipeline）。
 CategoryT = Literal[
     "pipeline",
     "study",
@@ -102,6 +107,11 @@ _CATEGORY_BY_EXC: tuple[tuple[type[BaseException], CategoryT], ...] = (
     (ModelBuildError, "internal"),
     (SaveError, "internal"),
     (ConfigValidationError, "config"),
+    # I15: pydantic ValidationError —— 子配置（SceneConfig/TrainerConfig 等）
+    # field_validator 校验失败时由 pydantic 抛出。放在 ConfigValidationError
+    # 之后（两者均继承 ValueError 但互不继承，顺序无冲突；ConfigValidationError
+    # 更具体到 SenseFrame，故在前）。
+    (pydantic.ValidationError, "config"),
     (MetadataVersionError, "config"),
 )
 
@@ -111,7 +121,10 @@ class ToolErrorResponse(FrozenModel):
 
     Fields:
         code: 异常类名（如 `PipelineNotFound`）。
-        message: `str(exc)` — 已由 orchestrator 脱敏（无 SQL 片段/路径/堆栈）。
+        message: `str(exc)` — 原始异常消息，可能含敏感信息（路径/输入等）。
+            注意：message 会通过 ToolError payload surface 给 MCP 客户端，
+            运维侧日志（`to_tool_error` 的 logger.exception）只记录 code + category
+            安全元数据，不记录 message（M19 修复）。
         category: 7 类 category 之一，客户端按类别路由错误恢复策略。
     """
 

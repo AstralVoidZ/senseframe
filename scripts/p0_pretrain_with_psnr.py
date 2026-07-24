@@ -5,10 +5,11 @@
 - PSNR 是业界图像/信号重建的标准质量评估指标
 - 连续 patience 次无提升（< min_delta dB）则停止
 
-设计要点：
-- compute_psnr：CSI 归一化后范围约 [-5, 5]，用 MAX=5.0（5σ 边界）
-- PSNREarlyStopping：状态机，跟踪 best_psnr + counter + should_stop
-- main()：完整训练入口（Task 2 追加）
+I21 修复：
+- compute_psnr 改用框架 senseframe.engine.callbacks.psnr_early_stopping 版本（消除重复）
+- evaluate_psnr 改用 backbone.mae_reconstruct 公共方法（消除重复前向逻辑）
+- PSNREarlyStopping dataclass 保留：scripts 独立训练循环用 __call__ 接口，
+  与框架 PSNREarlyStoppingCallback（Lightning Callback）接口不同，不可替换
 """
 from __future__ import annotations
 
@@ -18,7 +19,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 # 项目根加入 sys.path（从 scripts/p0_pretrain_with_psnr.py 向上两级），
 # 让 `from senseframe...` / `from scripts...` 在直接 python scripts/xxx.py 运行时也能工作
@@ -26,34 +26,20 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+# I21 修复：compute_psnr 改用框架版本（消除重复，单一真相源）
+from senseframe.engine.callbacks.psnr_early_stopping import compute_psnr  # noqa: E402
+
 logger = logging.getLogger(__name__)
-
-
-def compute_psnr(
-    reconstructed: torch.Tensor,
-    target: torch.Tensor,
-    max_value: float = 5.0,
-) -> float:
-    """计算 PSNR（dB），值越高重建质量越好。
-
-    Args:
-        reconstructed: 重建的 tensor
-        target: 原始 tensor
-        max_value: 信号最大值（CSI 归一化后约 5σ 边界，默认 5.0）
-
-    Returns:
-        PSNR 值（dB），完美重建返回 100.0
-    """
-    mse = F.mse_loss(reconstructed, target)
-    if mse.item() < 1e-10:
-        return 100.0
-    psnr = 10 * torch.log10(max_value ** 2 / mse)
-    return psnr.item()
 
 
 @dataclass
 class PSNREarlyStopping:
-    """PSNR-based early stopping。
+    """PSNR-based early stopping（scripts 独立训练循环专用）。
+
+    注意：框架级 PSNREarlyStoppingCallback（senseframe.engine.callbacks）是
+    Lightning Callback，用于 SelfSupervisedModule 走 Trainer.fit 路径。
+    本 dataclass 用 __call__ 接口，供 scripts/p0_pretrain_with_psnr.py 的
+    纯 torch 训练循环调用，两者接口不同，不可替换。
 
     Args:
         patience: 连续无提升的最大 epoch 数
@@ -84,10 +70,8 @@ class PSNREarlyStopping:
 def evaluate_psnr(backbone, val_loader, mask_ratio: float, device: str) -> float:
     """在验证集上计算 MAE 重建 PSNR（仅 masked patches）。
 
-    复用 backbone 内部方法：
-    - patch_embedder.to_patches：获取重建 target
-    - random_masking：随机 mask
-    - _forward_encoder / _forward_decoder：编码 + 重建
+    I21 修复：改用 backbone.mae_reconstruct 公共方法（I11 提供），
+    消除与 _mae_forward_loss 的前向逻辑重复。
 
     Args:
         backbone: CSIFoundationModel（已 train() 或 eval()）
@@ -106,15 +90,9 @@ def evaluate_psnr(backbone, val_loader, mask_ratio: float, device: str) -> float
             x = batch[0] if isinstance(batch, (list, tuple)) else batch
             x = x.to(device)
             torch.manual_seed(123)  # 验证用固定 seed，保证 PSNR 可比
-            # 复用 _mae_forward_loss 的前向流程，但获取重建结果而非 loss
-            target = backbone.patch_embedder.to_patches(x)
-            patches = backbone.patch_embedder.proj(target) + backbone.pos_embed
-            x_visible, mask, ids_restore = backbone.random_masking(patches, mask_ratio)
-            enc_out = backbone._forward_encoder(x_visible)
-            recon = backbone._forward_decoder(enc_out, ids_restore)
+            # I21: 改用 mae_reconstruct 公共方法（消除重复前向逻辑）
+            recon, target, mask = backbone.mae_reconstruct(x, mask_ratio)
             # PSNR on masked patches only（与 loss 计算口径一致）
-            # mask: (B, n_patches)，recon/target: (B, n_patches, D)
-            # 用 (B, n_patches) bool mask 索引前两维，返回 (n_masked_total, D)
             mask_bool = mask.bool()
             masked_recon = recon[mask_bool]
             masked_target = target[mask_bool]

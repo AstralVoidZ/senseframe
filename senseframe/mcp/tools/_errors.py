@@ -26,6 +26,11 @@ def to_tool_error(exc: BaseException) -> ToolError:
     2. logger.exception 记录完整堆栈到 stderr（运维诊断用）
     3. 返回 ToolError，其 message 是信封 JSON（客户端可程序化解析 category）
 
+    M19 修复：logger 只记录安全元数据（code + category），不记录 envelope.message。
+    原因：envelope.message = str(exc)，可能含用户输入/路径/SQL 片段等敏感信息，
+    写入 stderr 结构化日志有泄露风险。完整堆栈通过 logger.exception 的 exc_info
+    自动记录（堆栈中的局部变量 repr 由 traceback 模块控制，不暴露原始 message）。
+
     Args:
         exc: 捕获的业务异常实例。
 
@@ -33,5 +38,10 @@ def to_tool_error(exc: BaseException) -> ToolError:
         ToolError 实例，message 为 ToolErrorResponse 的 model_dump_json()。
     """
     envelope = ToolErrorResponse.envelope_from(exc)
-    logger.exception("%s envelope=%s", type(exc).__name__, envelope.model_dump_json())
+    # 只记录安全元数据；完整堆栈由 exc_info=True 自动附加
+    logger.exception(
+        "tool error routed: code=%s category=%s",
+        envelope.code,
+        envelope.category,
+    )
     return ToolError(envelope.model_dump_json())

@@ -760,3 +760,25 @@ def test_skill_views_inherit_frozen_model() -> None:
             f"{py}: class {cls.name} must inherit FrozenModel "
             f"(or a known view base); got bases={base_names}"
         )
+
+
+# ============================================================
+# 批次 3 Group A 新增 AST 守卫（I14）
+# ============================================================
+
+
+def test_config_tools_use_middleware_stack() -> None:
+    """Invariant: tools/config.py 必须通过 MiddlewareStack.instrument 调用。
+
+    I14 修复：config_parse 是唯一未接入 MiddlewareStack 的 tool，
+    修复后应通过 ``async with _config_stack.instrument(...)``
+    调用核心逻辑，确保 RequestId + RateLimit 中间件生效。
+    """
+    py = MCP_ROOT / "tools" / "config.py"
+    assert py.exists(), f"{py} must exist"
+    tree = ast.parse(py.read_text(encoding="utf-8"))
+    # 检查 _config_stack.instrument 调用（async with _config_stack.instrument(...)）
+    assert _has_call_pattern(tree, "_config_stack", "instrument"), (
+        f"{py}: must call _config_stack.instrument(...) to wrap tool logic "
+        f"with MiddlewareStack"
+    )

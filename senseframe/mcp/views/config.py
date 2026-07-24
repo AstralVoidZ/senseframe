@@ -6,8 +6,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import Field
-
 from ._base import FrozenModel
 
 
@@ -18,7 +16,7 @@ class ConfigParseResponse(FrozenModel):
         config: 解析后的 ExperimentConfig.to_dict() 输出
     """
 
-    config: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any]
 
 
 __all__ = ["ConfigParseResponse"]

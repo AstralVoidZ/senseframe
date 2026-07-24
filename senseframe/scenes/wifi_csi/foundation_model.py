@@ -380,7 +380,7 @@ class CSIFoundationModel(nn.Module):
         return self._forward_encoder(patches)
 
     def encode_features(self, x: torch.Tensor) -> torch.Tensor:
-        """提取特征序列（供 DANN 等下游模块用，避免重复 forward）。
+        """提取特征序列：encode 的语义别名，供 DANN 等下游模块调用以表达意图。
 
         与 encode() 的区别：
         - encode() 返回 (B, n_patches, d_model)，是 backbone 完整 forward

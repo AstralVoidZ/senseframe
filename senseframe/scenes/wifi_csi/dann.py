@@ -10,15 +10,12 @@ Backpropagation", ICML 2015.
 """
 from __future__ import annotations
 
-import logging
 import math
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-logger = logging.getLogger(__name__)
 
 
 class GradientReversalFunction(torch.autograd.Function):
@@ -73,9 +70,6 @@ class GradientReversalLayer(nn.Module):
         self.lambda_ = lambda_
 
 
-# 后续 Task 会添加 ModalityDiscriminator + DANNCrossModalModel + dann_lambda_schedule
-
-
 class ModalityDiscriminator(nn.Module):
     """模态判别器：判别特征来自 CSI 还是 EEG（二分类）。
 
@@ -121,7 +115,7 @@ def dann_lambda_schedule(epoch: int, total_epochs: int) -> float:
         λ 值（0.0 ~ 1.0）
     """
     if total_epochs <= 0:
-        return 1.0
+        return 0.0
     p = epoch / total_epochs
     return 2.0 / (1.0 + math.exp(-10.0 * p)) - 1.0
 

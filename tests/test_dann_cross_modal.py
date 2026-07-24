@@ -114,7 +114,7 @@ class TestDANNCrossModalModel:
     def _make_small_dann(self):
         """构造小规模 DANN 模型用于测试。"""
         from senseframe.scenes.wifi_csi.foundation_model import CSIFoundationModel
-        from scripts.p3_eval_common import CSIClassifier
+        from senseframe.scenes.wifi_csi.classifier import CSIClassifier
         # CSI backbone（小规模）
         backbone = CSIFoundationModel(
             input_shape=(3, 64), d_model=32, n_heads=4,
@@ -216,7 +216,7 @@ class TestDANNCrossModalEndToEnd:
         """合成数据跑通 1 epoch DANN 训练（3 个 batch）。"""
         import torch.nn.functional as F
         from senseframe.scenes.wifi_csi.foundation_model import CSIFoundationModel
-        from scripts.p3_eval_common import CSIClassifier
+        from senseframe.scenes.wifi_csi.classifier import CSIClassifier
 
         backbone = CSIFoundationModel(
             input_shape=(3, 64), d_model=32, n_heads=4,
@@ -246,7 +246,7 @@ class TestDANNCrossModalEndToEnd:
     def test_dann_eval_mode_no_disc(self):
         """eval 模式下不计算 disc_loss。"""
         from senseframe.scenes.wifi_csi.foundation_model import CSIFoundationModel
-        from scripts.p3_eval_common import CSIClassifier
+        from senseframe.scenes.wifi_csi.classifier import CSIClassifier
 
         backbone = CSIFoundationModel(
             input_shape=(3, 64), d_model=32, n_heads=4,

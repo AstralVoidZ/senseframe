@@ -119,3 +119,41 @@ unknown_field: should_fail
 
         envelope = json.loads(str(exc_info.value))
         assert envelope["category"] == "config"
+
+    @pytest.mark.asyncio
+    async def test_subconfig_validation_error_routes_to_config(self):
+        """I15 修复：子配置 ValidationError 应路由到 config category。
+
+        ``trainer.epochs=-1`` 触发 TrainerConfig._validate_epochs field_validator，
+        pydantic 包装为 ValidationError。修复前 _CATEGORY_BY_EXC 无此映射，
+        误路由到 internal；修复后正确路由到 config。
+        """
+        from senseframe.mcp.tools.config import senseframe_config_parse
+
+        bad_yaml = """
+scene:
+  name: wifi_csi
+  dataset: UT_HAR_data
+  model_id: MLP
+  data_root: /tmp/data
+
+input_features:
+  - name: csi
+    type: csi
+    shape: [1, 250, 90]
+
+output_features:
+  - name: action
+    type: category
+    num_classes: 7
+
+trainer:
+  epochs: -1
+"""
+        with pytest.raises(ToolError) as exc_info:
+            await senseframe_config_parse(config_yaml=bad_yaml)
+
+        envelope = json.loads(str(exc_info.value))
+        assert envelope["category"] == "config", (
+            f"子配置 ValidationError 应路由到 config，实际: {envelope['category']}"
+        )

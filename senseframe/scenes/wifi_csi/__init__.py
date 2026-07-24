@@ -2,5 +2,6 @@
 
 from .container import WiFiCSIContainer
 from .foundation_model import CSIFoundationModel
+from .classifier import CSIClassifier
 
-__all__ = ["WiFiCSIContainer", "CSIFoundationModel"]
+__all__ = ["WiFiCSIContainer", "CSIFoundationModel", "CSIClassifier"]

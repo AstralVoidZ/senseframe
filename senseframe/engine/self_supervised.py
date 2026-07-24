@@ -195,6 +195,9 @@ class SelfSupervisedModule(pl.LightningModule):
         # Tradeoff：每个 batch 覆盖缓存，仅保留最后一个 batch 的重建。
         # 这避免 cat 累积所有 batch 导致显存膨胀，PSNR 用单 batch 作代表已足够指示趋势。
         # 若需更精确的 epoch 级 PSNR，应改为 accumulate + on_validation_epoch_end 聚合。
+        # M14：mae_reconstruct 内部随机采样 mask，此处接受 mask 随机性，不固定 seed——
+        # PSNR 仅作为重建质量趋势的指示指标（早停判断用），单 batch 随机 mask 的波动
+        # 在 epoch 级别可接受；若需复现严格 PSNR 数值，应在 mae_reconstruct 内固定 generator。
         # I11 修复：改用 mae_reconstruct 公共方法，消除 _forward_encoder/_forward_decoder 私有方法外调
         # I12 修复：except Exception as e + _logger.warning，避免静默吞异常
         # I13 修复：缓存张量 .detach().cpu()，避免 GPU 显存泄漏
@@ -320,13 +323,29 @@ class SelfSupervisedModule(pl.LightningModule):
         if self._current_epoch_steps == 0:
             return
 
-        epoch_entry = {"epoch": self.current_epoch + 1, "phase": self.phase}
+        # I18 修复：去掉 +1，与 GenericLightningModule（module.py L623）对齐。
+        # Lightning 2.x on_validation_epoch_end 触发时 current_epoch 已是递增后的值
+        # （训练 epoch 0 结束后 current_epoch 即为 1），旧逻辑 +1 导致 epoch 从 2 开始，
+        # 跨阶段对比错位（self_supervised 与 supervised 阶段日志错位 1 epoch）。
+        epoch_entry = {"epoch": self.current_epoch, "phase": self.phase}
         # 修复（2.6 字段命名）：loss → train_loss，与 _TRAINING_LOG_ENTRY_SCHEMA 一致
         epoch_entry["train_loss"] = round(self._current_epoch_loss / max(self._current_epoch_steps, 1), 6)
 
+        # I19 修复：补 lr + train_accuracy 字段，与 GenericLightningModule（module.py L624/L650）
+        # 和 DANN 路径对齐（schemas.TrainingLogEntry 契约要求 lr/train_accuracy 等字段）。
+        # lr 从 callback_metrics['learning_rate'] 读取（on_train_epoch_end L280 已 log）。
+        cb_metrics = self.trainer.callback_metrics if self.trainer else {}
+        lr_val = cb_metrics.get("learning_rate")
+        if lr_val is not None:
+            epoch_entry["lr"] = round(float(lr_val.item() if hasattr(lr_val, "item") else lr_val), 6)
+        else:
+            epoch_entry["lr"] = None
+        # SelfSupervisedModule 无 train_metrics（仅 val_metrics），train_accuracy 恒为 None。
+        # 补此字段使 analyze_training_result 的 train-val gap 检测不会因缺字段被跳过。
+        epoch_entry["train_accuracy"] = None
+
         # 修复（双重 compute 陷阱）：从 callback_metrics 读取，不手动 compute。
         # 旧逻辑 val_metrics[name].compute() 在 Lightning 已 reset 后返回 0。
-        cb_metrics = self.trainer.callback_metrics if self.trainer else {}
         for name in self.val_metrics:
             key = f"val_{name}"
             val = cb_metrics.get(key)

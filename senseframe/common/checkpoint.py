@@ -1,6 +1,6 @@
 """Checkpoint 加载公共工具。
 
-处理 Lightning checkpoint 与裸 state_dict 两种格式的兼容加载，
+处理 Lightning checkpoint、backbone_state_dict 与裸 state_dict 三种格式的兼容加载，
 消除 export/inference/pipeline 三处的反模式重复。
 
 背景：
@@ -98,6 +98,20 @@ def load_checkpoint_flexible(
         weights_only=weights_only,
     )
 
+    # 安全加固：非 Lightning 分支（backbone_state_dict / bare_state_dict）强制 weights_only=True，
+    # 防止反序列化任意 Python 对象（这两种格式应只含 tensor + 基础类型）。
+    # Lightning ckpt 因含 callbacks/optimizer_states 等 Python 对象，仍按调用方 weights_only 处理。
+    if (
+        not weights_only
+        and isinstance(ckpt, dict)
+        and "state_dict" not in ckpt
+    ):
+        ckpt = torch.load(
+            checkpoint_path,
+            map_location=map_location,
+            weights_only=True,
+        )
+
     # 情况 1：Lightning checkpoint，含 "state_dict" 顶层 key
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         raw_state_dict = ckpt["state_dict"]
@@ -156,7 +170,7 @@ def load_checkpoint_flexible(
                 "source_format": "backbone_state_dict",
                 "num_keys_loaded": len(loadable_state),
                 "stripped_prefix": "",
-                "raw_keys": list(loadable_state.keys())[:5],
+                "raw_keys": list(backbone_state.keys())[:5],
             }
         model.load_state_dict(backbone_state, strict=strict)
         return {

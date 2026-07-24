@@ -78,7 +78,7 @@ class PSNREarlyStoppingCallback(Callback):
     def on_validation_epoch_end(self, trainer, pl_module) -> None:
         """validation 结束后计算 PSNR 并更新状态机。
 
-        从 pl_module 缓存的 reconstruction_batch / target_batch 取数据。
+        从 pl_module 缓存的 _psnr_reconstruction / _psnr_target 取数据。
         若模块未缓存，跳过（no-op）。
         """
         # I9 修复：sanity_check 阶段不污染状态机（与其他 on_validation_epoch_end 对齐）

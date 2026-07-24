@@ -24,7 +24,6 @@ from senseframe.mcp.views.artifact import (
     ArtifactListView,
     ArtifactVerifyResponse,
 )
-from senseframe.mcp.views.config import ConfigParseResponse
 from senseframe.mcp.views.automl import (
     AutoMLAdvanceResponse,
     AutoMLCreateResponse,
@@ -32,6 +31,7 @@ from senseframe.mcp.views.automl import (
     AutoMLPipelineView,
     AutoMLStageView,
 )
+from senseframe.mcp.views.config import ConfigParseResponse
 from senseframe.mcp.views.exploration import (
     ExplorationRecommendationItem,
     ExplorationRecommendationView,

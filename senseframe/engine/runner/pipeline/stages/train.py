@@ -169,6 +169,7 @@ def _train_dann_loop(
     from .....scenes.wifi_csi.dann import dann_lambda_schedule
 
     accelerator = (ctx.lightning_params or {}).get("accelerator")
+    # 不支持 mps/tpu，项目目标平台为 cpu/gpu
     device = torch.device("cuda" if accelerator in ("gpu", "cuda") else "cpu")
     model = ctx.model.to(device)
 
@@ -184,8 +185,10 @@ def _train_dann_loop(
     if optimizer_type == "adam":
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     elif optimizer_type == "sgd":
+        # momentum=0.9 与 GenericLightningModule.configure_optimizers 行为一致，暂不暴露为可配置字段
         optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9)
     elif optimizer_type == "rmsprop":
+        # momentum=0.9 与 GenericLightningModule.configure_optimizers 行为一致，暂不暴露为可配置字段
         optimizer = torch.optim.RMSprop(model.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9)
     elif optimizer_type == "adamw":
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -230,6 +233,7 @@ def _train_dann_loop(
             if isinstance(batch, (list, tuple)):
                 x_eeg, y_eeg = batch[0], batch[1]
             else:
+                _logger.warning("DANN train loop: batch 格式非 list/tuple，跳过: %s", type(batch))
                 continue
             x_eeg = x_eeg.to(device).float()
             y_eeg = y_eeg.to(device).long()
@@ -271,6 +275,7 @@ def _train_dann_loop(
                 if isinstance(batch, (list, tuple)):
                     x, y = batch[0], batch[1]
                 else:
+                    _logger.warning("DANN val loop: batch 格式非 list/tuple，跳过: %s", type(batch))
                     continue
                 x = x.to(device).float()
                 y = y.to(device).long()
