@@ -55,7 +55,8 @@ def build_experiment_configs(
     for exp_def in CROSS_DOMAIN_EXPERIMENTS:
         if exp_def["id"] not in experiments:
             continue
-        cfg = ExperimentConfig(
+        # 构造 kwargs，仅传递 exp_def 中存在的字段（B5_DANN/B6_DANN 带 DANN 字段）
+        cfg_kwargs = dict(
             experiment_id=exp_def["id"],
             experiment_group="cross_domain",
             pretrain_source=exp_def["pretrain"],
@@ -64,6 +65,20 @@ def build_experiment_configs(
             output_dir=output_dir,
             seed=seed,
         )
+        # 可选字段（B5_DANN/B6_DANN 用）
+        if "params" in exp_def:
+            cfg_kwargs["finetune_params"] = exp_def["params"]
+        if "use_dann" in exp_def:
+            cfg_kwargs["use_dann"] = exp_def["use_dann"]
+        if "pretrain_checkpoint" in exp_def:
+            cfg_kwargs["pretrain_checkpoint"] = exp_def["pretrain_checkpoint"]
+        if "pretrain_epochs" in exp_def:
+            cfg_kwargs["pretrain_epochs"] = exp_def["pretrain_epochs"]
+        if "epochs" in exp_def:
+            cfg_kwargs["epochs"] = exp_def["epochs"]
+        if "batch_size" in exp_def:
+            cfg_kwargs["batch_size"] = exp_def["batch_size"]
+        cfg = ExperimentConfig(**cfg_kwargs)
         if args is not None:
             cfg = apply_arg_overrides(args, cfg)
         configs.append(cfg)
@@ -74,7 +89,7 @@ def main():
     parser = argparse.ArgumentParser(description="P3 验证 10.4：跨场景迁移评估 B1-B8")
     parser.add_argument("--experiments", nargs="+",
                         default=["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8"],
-                        help="实验组（默认全部 8 个）")
+                        help="实验组（默认 B1-B8；DANN 组需显式指定，如 --experiments B5_DANN B6_DANN）")
     add_common_args(parser)
     args = parser.parse_args()
 
@@ -130,8 +145,15 @@ def main():
     if not args.dry_run and len(results) >= 2:
         print(f"\n=== 迁移增益 ===")
         result_map = {r.experiment_id: r for r in results}
-        for baseline_id, transfer_id in [("B1", "B2"), ("B1", "B3"),
-                                          ("B4", "B5"), ("B4", "B6")]:
+        # B2/B3 vs B1（CSI→雷达），B5/B6/B5_DANN/B6_DANN vs B4（CSI→EEG）
+        pairs = [
+            ("B1", "B2"), ("B1", "B3"),
+            ("B4", "B5"), ("B4", "B6"),
+            ("B4", "B5_DANN"), ("B4", "B6_DANN"),
+            # DANN vs 非 DANN 对照（同 pretrain/finetune，仅多了对抗对齐）
+            ("B5", "B5_DANN"), ("B6", "B6_DANN"),
+        ]
+        for baseline_id, transfer_id in pairs:
             if baseline_id in result_map and transfer_id in result_map:
                 gain = compute_transfer_gain(
                     result_map[baseline_id], result_map[transfer_id]

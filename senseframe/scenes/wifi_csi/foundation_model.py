@@ -348,6 +348,21 @@ class CSIFoundationModel(nn.Module):
         patches = self.patch_embedder(x) + self.pos_embed
         return self._forward_encoder(patches)
 
+    def encode_features(self, x: torch.Tensor) -> torch.Tensor:
+        """提取特征序列（供 DANN 等下游模块用，避免重复 forward）。
+
+        与 encode() 的区别：
+        - encode() 返回 (B, n_patches, d_model)，是 backbone 完整 forward
+        - encode_features() 是 encode() 的别名，语义上强调"供下游用"
+
+        Args:
+            x: (B, C, L) 输入信号
+
+        Returns:
+            (B, n_patches, d_model) 特征序列
+        """
+        return self.encode(x)
+
     def get_peft_module(self, peft_config: PEFTConfig) -> nn.Module:
         """基于 PEFT 配置构建微调模块（深拷贝避免污染预训练权重）。"""
         foundation_copy = copy.deepcopy(self)

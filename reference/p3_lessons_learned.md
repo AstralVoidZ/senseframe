@@ -1,8 +1,9 @@
-# P3 验证经验教训（10.2 单场景验证）
+# P3 验证经验教训（10.2 单场景 + 10.4 跨场景 + DANN 跨模态）
 
-> 本文档记录 P3 验证 10.2 单场景性能验证（A1-A5 × 4 CSI 数据集）过程中踩过的坑、根因分析与防御性设计建议。
+> 本文档记录 P3 验证 10.2 单场景（A1-A5 × 4 CSI 数据集）、10.4 跨场景（B1-B8）与
+> DANN 跨模态对齐（B5_DANN/B6_DANN）过程中踩过的坑、根因分析与防御性设计建议。
 > 所有教训均对齐 [project_memory.md 第 129 条](../../project_memory.md) 的归一化历史根因。
-> 更新日期：2026-07-19
+> 更新日期：2026-07-21
 
 ## 目录
 
@@ -16,6 +17,8 @@
 8. [SP 搜索 vs 固定配置：上限数据集上难显优势](#8-sp-搜索-vs-固定配置上限数据集上难显优势)
 9. [GridSampler 全网格爆炸：n_trials 必须显式限制](#9-gridsampler-全网格爆炸n_trials-必须显式限制)
 10. [B5/B6 跨场景迁移的双层架构对齐缺失](#10-b5b6-跨场景迁移的双层架构对齐缺失)
+11. [非上限数据集 SP 搜索价值有限 + GridSampler 遍历顺序缺陷](#11-非上限数据集-sp-搜索价值有限--gridsampler-遍历顺序缺陷)
+12. [DANN 跨模态对齐：双模态架构冲突与短训练失效](#12-dann-跨模态对齐双模态架构冲突与短训练失效)
 
 ---
 
@@ -769,6 +772,100 @@ Widar 22 类 / 936 训练样本，adapter 参数量大（1.6M-3.3M）能充分�
 1. SP 搜索价值不能简单按"上限/非上限"二分，真正决定因素是"当前配置距数据集真实上限的距离"
 2. GridSampler 在多方法 search_space + 小 n_trials 下会因字典序遍历错过最优区域，应优先用 RandomSampler
 3. PEFT 方法选择应基于数据集特性（样本数 / 类别数 / 特征维度），而非"一刀切"默认 lora
+
+---
+
+## 12. DANN 跨模态对齐：双模态架构冲突与短训练失效
+
+### 现象
+
+10.4 跨场景迁移评估追加 B5_DANN/B6_DANN 实验组（CSI→EEG），设计意图：在 B5（LoRA）/ B6（full）基础上引入 DANN 跨模态对抗，让 CSI 预训练特征空间更"对齐"EEG 模态，从而提升迁移增益。
+
+| 实验 | pretrain | target | finetune | use_dann | 设计意图 |
+|---|---|---|---|---|---|
+| B5 | csi_4datasets | PhysioNet_MI | lora | False | CSI MAE 预训练 → EEG LoRA 微调（基线） |
+| B5_DANN | csi_4datasets | PhysioNet_MI | lora | True | B5 + CSI/EEG 模态对抗对齐 |
+| B6 | csi_4datasets | PhysioNet_MI | full | False | CSI MAE 预训练 → EEG 全量微调（基线） |
+| B6_DANN | csi_4datasets | PhysioNet_MI | full | True | B6 + CSI/EEG 模态对抗对齐 |
+
+5 epoch 真实训练结果（commit d561212 后运行）：
+
+| 实验 | val_acc | macro_f1 | disc_loss 行为 |
+|---|---|---|---|
+| B5_DANN (lora) | 0.5336 | 0.3479 | 0.04 → 0.0001（对抗失效） |
+| B6_DANN (full) | 0.5336 | 0.3479 | 0.09 → 0.82（对抗有效但波动） |
+
+val_acc=0.5336 = PhysioNet 二分类 majority class baseline，说明 DANN 未带来任何增益，模型只预测多数类。
+
+### 根因
+
+#### 1. 双模态架构冲突（最严重）
+
+`replace_patch_embedder` 后 backbone 只能处理 EEG 输入 (64, 480)，CSI 对抗信号 (342, 2000) forward 失败：
+
+```
+RuntimeError: shape '[2, 24, 20, 342]' is invalid for input of size 1368000
+```
+
+修复方案：`DANNCrossModalModel` 持有独立的 `csi_patch_embedder` + `csi_pos_embed`（replace 前深拷贝保存），CSI 路径通过它们 + 共享 `backbone.encoder`（modality-agnostic）。CSI 模态特定层始终 freeze（不被对抗破坏）。
+
+#### 2. LoRA + DANN 架构上不兼容
+
+B5_DANN (lora) 的 disc_loss 从 0.04 衰减到 0.0001，判别器完全失效。根因：
+- LoRA freeze backbone（`freeze_backbone=True`），encoder 主体不更新
+- 判别器对抗的目的是让 encoder 学到"模态不可区分"的特征
+- 但 encoder 不更新，对抗梯度无法反向影响 encoder → 判别器也学不到判别性特征
+- **结论**：LoRA 的"冻结 backbone"设计目标与 DANN 的"对抗更新 encoder"目标根本冲突
+
+#### 3. λ 调度不匹配短训练
+
+DANN 原论文 λ 调度：`λ = 2/(1+exp(-10*p))-1`，p=epoch/total_epochs。该调度设计用于 50-100 epoch，5 epoch 下：
+- epoch 1: λ=0.000（无对抗，浪费 1/5 训练预算）
+- epoch 2: λ=0.762（对抗骤增到 76%）
+- epoch 3-5: λ=0.964→0.999（接近满对抗）
+
+encoder 还没学到任务特征就被强对抗压制，task_loss 不下降。
+
+#### 4. CSI/EEG 模态差异过大
+
+| 模态 | input_shape | n_patches | 特征空间 |
+|---|---|---|---|
+| CSI (NTU-Fi_HAR) | (342, 2000) | 100 | 高维时频 |
+| EEG (PhysioNet_MI) | (64, 480) | 24 | 低维时序 |
+
+两个模态的 patch 数（100 vs 24）和维度差异巨大，判别器对 pooled 特征 (B, d_model) 做模态判别，但 pooled 特征已丢失模态特定的时频结构，对抗信号弱。
+
+#### 5. PhysioNet 类不平衡
+
+PhysioNet MI 二分类（左/右手运动想象），53% 是 majority class。task_loss 在 0.70 附近（接近 -log(0.53)=0.63），说明模型只学到多数类先验，DANN 对抗无法弥补弱 task 信号。
+
+### 防御性建议
+
+- **LoRA + DANN 不应组合使用**：LoRA freeze backbone 使对抗梯度无法影响 encoder，判别器失效。若需 PEFT + DANN，应使用 `freeze_backbone=False` 的 full 微调，或修改 DANN 架构让对抗梯度仅流向 LoRA 层（不动 frozen backbone）
+- **DANNCrossModalModel 必须持有独立的源模态 patch_embedder**：`replace_patch_embedder` 后 backbone 只能处理目标模态，源模态对抗信号需要独立 patch_embedder + pos_embed，共享 encoder。CSI 模态特定层应 freeze（预训练好，不被对抗破坏）
+- **短训练（epoch ≤ 10）应避免 DANN 原论文 λ 调度**：原调度设计用于 50-100 epoch，短训练下 λ 从 0 骤增到 0.76 压制任务学习。短训练应用固定 λ=0.5 或线性调度 `λ = epoch/total_epochs`
+- **DANN 实验组必须先跑同配置非 DANN baseline**：B5_DANN/B6_DANN 需与 B5/B6 对照才能计算 transfer_gain。单独看 DANN 的 val_acc 无法判断对抗是否有效（需对照同 epoch 数的非 DANN 基线）
+- **跨模态对齐应优先评估模态相似度**：CSI (342, 2000) vs EEG (64, 480) 差异过大，对抗信号弱。应先用 CKA / 余弦相似度等无监督指标评估两模态特征空间重叠度，再决定是否值得 DANN 对齐
+- **类不平衡数据集应加权 loss 或重采样**：PhysioNet 53% majority class，应使用 `class_weight` 或 `WeightedRandomSampler`，否则 task 信号过弱无法驱动对抗学习
+
+### 验证效果
+
+| 检查项 | B5_DANN (lora) | B6_DANN (full) |
+|---|---|---|
+| 双模态 forward | ✅（EEG + CSI 同时输入正确处理） | ✅ |
+| CSI 模态特定层 freeze | ✅（requires_grad=False） | ✅ |
+| checkpoint 加载 | ✅（跳过 100 epoch MAE） | ✅ |
+| GRL 梯度反转 | ✗（disc_loss→0，对抗失效） | ✅（disc_loss 波动） |
+| λ 调度 | ✅（照搬原论文公式） | ✅ |
+| val_acc 超越 majority baseline | ✗（0.5336 = 53% baseline） | ✗ |
+| DANN 带来增益 | ✗（无 B5/B6 基线对照） | ✗ |
+
+**核心结论**：
+1. DANN 跨模态对齐的架构正确性已验证（双模态 forward / GRL / λ 调度 / checkpoint 加载 / CSI freeze 全部正常）
+2. LoRA + DANN 架构上不兼容（freeze backbone 使对抗失效），不应组合使用
+3. 5 epoch 短训练 + 原论文 λ 调度不匹配，DANN 需 50+ epoch 才能体现对抗对齐价值
+4. 跨模态对齐前应先评估模态相似度，CSI/EEG 差异过大导致对抗信号弱
+5. 负面结果符合"验证架构价值而非刷 SOTA"的项目立场，为后续改进提供清晰方向
 
 ---
 

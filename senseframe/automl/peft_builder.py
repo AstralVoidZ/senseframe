@@ -239,6 +239,24 @@ class PEFTModel(nn.Module):
             args = (x,) + args[1:]
         return self.backbone(*args, **kwargs)
 
+    def encode_features(self, x: torch.Tensor) -> torch.Tensor:
+        """提取特征序列（供 DANN 等下游模块用）。
+
+        与 forward 等价：应用 PEFT 模块（LoRA/Adapter/Prompt/Prefix）后
+        返回 backbone 的特征输出 (B, n_patches, d_model)。
+
+        语义上强调"供下游用"，与 CSIFoundationModel.encode_features 对齐。
+        DANN 的 DANNCrossModalModel.forward 调用 backbone.encode_features(x)
+        提取特征，PEFTModel 必须暴露此方法否则 AttributeError。
+
+        Args:
+            x: 输入张量 (B, C, L)
+
+        Returns:
+            特征序列 (B, n_patches, d_model)
+        """
+        return self.forward(x)
+
 
 # ============================================================
 # PEFTBuilder 构建器

@@ -247,6 +247,13 @@ class ExperimentConfig:
     pretrain_epochs: int = 20
     pretrain_lr: float = 1e-3
     pretrain_mask_ratio: float = 0.75
+    # DANN 跨模态对齐（仅 B5_DANN/B6_DANN 用）
+    # use_dann=True 时启用 DANN 训练分支：CSI val 集作对抗信号 + λ 调度
+    use_dann: bool = False
+    dann_hidden_dim: int = 64
+    dann_dropout: float = 0.1
+    # 预训练 checkpoint 路径（P0-1 产出的 PSNR best checkpoint，可选）
+    pretrain_checkpoint: Optional[str] = None
 
 
 @dataclass
@@ -541,6 +548,46 @@ def _load_pretrain_dataset(pretrain_dataset_name: str):
     return pretrain_ds, pretrain_collate_fn, pretrain_dataset_config
 
 
+def _load_csi_dataset_val(dataset_name: str):
+    """加载 CSI 验证集（DANN 对抗信号用，避免数据泄露）。
+
+    与 _load_pretrain_dataset 区别：
+    - _load_pretrain_dataset 加载 train 集（用于 MAE 预训练）
+    - _load_csi_dataset_val 加载 val 集（用于 DANN 对抗信号，未参与预训练）
+
+    设计原则：DANN 对抗信号必须用"未参与预训练"的数据，否则判别器会
+    对预训练分布过拟合，失去跨模态对齐意义。val/test 集未参与 MAE 预训练，
+    符合要求。
+
+    Args:
+        dataset_name: CSI 数据集名（如 "NTU-Fi_HAR"）
+
+    Returns:
+        (val_ds, collate_fn, dataset_config)
+    """
+    pretrain_dataset_config = _get_dataset_config(dataset_name)
+    if pretrain_dataset_config is None:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    if dataset_name not in CSI_DATASET_CONFIG:
+        raise ValueError(
+            f"DANN 对抗信号仅支持 CSI 数据集，got {dataset_name}。"
+            f"B5_DANN/B6_DANN 的 pretrain_source 应解析为 CSI 数据集。"
+        )
+
+    bundle = _load_csi_dataset(dataset_name, _CSI_DATA_ROOT, learning_mode="supervised")
+    # 与 run_single_experiment 中 target val 加载逻辑对齐：val 优先，fallback test
+    val_ds = bundle.val if bundle.val else bundle.test
+
+    pretrain_target_shape = (
+        pretrain_dataset_config.get("reshape_to")
+        or pretrain_dataset_config.get("input_shape")
+    )
+    pretrain_collate_fn = _make_collate_fn(
+        pretrain_target_shape, dataset_name=dataset_name
+    )
+    return val_ds, pretrain_collate_fn, pretrain_dataset_config
+
+
 # ============================================================
 # SP 搜索驱动 PEFT 超参搜索（10.5 C4/C5 用）
 # ============================================================
@@ -808,6 +855,133 @@ def _train_classifier(
     return best_val_acc, best_macro_f1, trainable_params
 
 
+def _train_dann(
+    model: nn.Module,
+    eeg_loader: DataLoader,
+    csi_loader: Optional[DataLoader],
+    val_loader: DataLoader,
+    num_classes: int,
+    epochs: int,
+    learning_rate: float,
+    device: torch.device,
+) -> Tuple[float, float, int]:
+    """DANN 训练主循环：EEG 任务分类 + CSI/EEG 模态对抗对齐。
+
+    model 是 DANNCrossModalModel（backbone + task_head + discriminator）。
+
+    训练流程（每个 epoch）：
+    1. λ 调度：λ = 2/(1+exp(-10*p))-1，p=epoch/epochs，从 0 渐增到 1
+       （照搬 Ganin & Lempitsky, ICML 2015）
+    2. 遍历 EEG batch：
+       - task_loss = CE(logits, y_eeg)
+       - disc_loss = CE(disc_logits, modality_labels)  # CSI=0, EEG=1
+       - total_loss = task_loss + disc_loss
+    3. CSI 对抗信号：itertools.cycle(csi_loader) 无限迭代，与 EEG batch 对齐
+    4. 验证：model.eval() + 计算 val_acc + macro_f1（仅 task，无对抗）
+
+    Args:
+        model: DANNCrossModalModel
+        eeg_loader: EEG 训练集（task + 对抗）
+        csi_loader: CSI val 集（仅对抗信号，None 时跳过对抗）
+        val_loader: EEG 验证集（仅 task 评估）
+        num_classes: 类别数（签名对齐用，DANN 内部由 task_head 决定）
+        epochs: 训练 epoch 数
+        learning_rate: 学习率
+        device: 计算设备
+
+    Returns:
+        (best_val_acc, best_macro_f1, trainable_params)
+    """
+    import itertools
+    import torch.nn.functional as F
+    from sklearn.metrics import f1_score
+
+    from senseframe.scenes.wifi_csi.dann import dann_lambda_schedule
+
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    # 统计可训练参数
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # CSI 对抗信号无限迭代器（EEG batch 数可能 > CSI batch 数，cycle 保证不耗尽）
+    csi_iter = itertools.cycle(csi_loader) if csi_loader is not None else None
+
+    best_val_acc = 0.0
+    best_macro_f1 = 0.0
+
+    for epoch in range(epochs):
+        # ---- 训练 ----
+        model.train()
+        lambda_ = dann_lambda_schedule(epoch, epochs)
+        total_task_loss = 0.0
+        total_disc_loss = 0.0
+        n_batches = 0
+
+        for eeg_batch in eeg_loader:
+            x_eeg, y_eeg = eeg_batch[0], eeg_batch[1]
+            x_eeg = x_eeg.to(device).float()
+            y_eeg = y_eeg.to(device).long()
+
+            x_csi = None
+            if csi_iter is not None:
+                csi_batch = next(csi_iter)
+                x_csi = csi_batch[0].to(device).float()
+
+            # DANN forward：返回 (logits, disc_loss)
+            # disc_loss 在 model 内部已计算（CSI=0, EEG=1 的模态分类 CE）
+            logits, disc_loss = model(x_eeg, x_csi, lambda_)
+            task_loss = F.cross_entropy(logits, y_eeg)
+
+            total_loss = task_loss
+            if disc_loss is not None:
+                total_loss = total_loss + disc_loss
+
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+
+            total_task_loss += float(task_loss.item())
+            total_disc_loss += float(disc_loss.item()) if disc_loss is not None else 0.0
+            n_batches += 1
+
+        # ---- 验证（仅 task 分类，无对抗）----
+        model.eval()
+        all_preds = []
+        all_labels = []
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            for batch_x, batch_y in val_loader:
+                batch_x = batch_x.to(device).float()
+                batch_y = batch_y.to(device).long()
+                # 验证时 x_csi=None, lambda_=0（不触发对抗路径）
+                logits, _ = model(batch_x, None, 0.0)
+                preds = logits.argmax(dim=-1)
+                all_preds.extend(preds.cpu().numpy().tolist())
+                all_labels.extend(batch_y.cpu().numpy().tolist())
+                val_correct += (preds == batch_y).sum().item()
+                val_total += len(batch_y)
+
+        val_acc = val_correct / max(val_total, 1)
+        macro_f1 = float(f1_score(all_labels, all_preds, average="macro", zero_division=0))
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_macro_f1 = macro_f1
+
+        mean_task_loss = total_task_loss / max(n_batches, 1)
+        mean_disc_loss = total_disc_loss / max(n_batches, 1)
+        logger.info(
+            "DANN epoch %d/%d | λ=%.3f | task_loss=%.4f | disc_loss=%.4f | "
+            "val_acc=%.4f | macro_f1=%.4f",
+            epoch + 1, epochs, lambda_, mean_task_loss, mean_disc_loss,
+            val_acc, macro_f1,
+        )
+
+    return best_val_acc, best_macro_f1, trainable_params
+
+
 # ============================================================
 # 实验执行入口
 # ============================================================
@@ -914,6 +1088,12 @@ def run_single_experiment(
             config.pretrain_source, config.target_dataset
         )
 
+        # DANN 跨模态对齐：保存 CSI 模态的 patch_embedder + pos_embed
+        # 仅 use_dann + 跨模态预训练分支会填充（replace_patch_embedder 前）
+        # 其他分支保持 None，DANN 分支会校验非 None
+        csi_patch_embedder_saved = None
+        csi_pos_embed_saved = None
+
         if pretrain_dataset_name is None:
             # 无预训练：用 target_dataset_config 构建 backbone（B1/B4 baseline 路径）
             backbone = _build_backbone(dataset_config, d_model=d_model)
@@ -956,21 +1136,49 @@ def run_single_experiment(
             )
             backbone = _build_backbone(pretrain_dataset_config, d_model=d_model)
 
-            logger.info("experiment %s: MAE pretraining %d epochs on %s (cross-modal)",
-                        config.experiment_id, config.pretrain_epochs,
-                        pretrain_dataset_name)
-            from senseframe.core.foundation_model import PretrainConfig
-            pretrain_cfg = PretrainConfig(
-                epochs=config.pretrain_epochs,
-                batch_size=config.batch_size,
-                learning_rate=config.pretrain_lr,
-                mask_ratio=config.pretrain_mask_ratio,
-            )
-            pretrain_loader = DataLoader(
-                pretrain_ds, batch_size=config.batch_size, shuffle=True,
-                collate_fn=pretrain_collate_fn, num_workers=0,
-            )
-            backbone.pretrain(pretrain_loader, pretrain_cfg)
+            # 优先加载预训练 checkpoint（避免重复跑 100 epoch MAE）
+            # B5_DANN/B6_DANN 用：P0-1 已产出 PSNR best checkpoint，直接加载
+            if config.pretrain_checkpoint and Path(config.pretrain_checkpoint).exists():
+                logger.info(
+                    "experiment %s: loading pretrain checkpoint %s (skipping %d-epoch MAE)",
+                    config.experiment_id, config.pretrain_checkpoint,
+                    config.pretrain_epochs,
+                )
+                ckpt = torch.load(
+                    config.pretrain_checkpoint, map_location="cpu",
+                    weights_only=False,
+                )
+                # checkpoint 结构：{"backbone_state_dict": ..., "best_psnr": ..., "config": ...}
+                backbone.load_state_dict(ckpt["backbone_state_dict"])
+                logger.info(
+                    "experiment %s: checkpoint loaded, best_psnr=%.2f dB, final_epoch=%d",
+                    config.experiment_id,
+                    ckpt.get("best_psnr", float("nan")),
+                    ckpt.get("final_epoch", -1),
+                )
+            else:
+                if config.pretrain_checkpoint:
+                    logger.warning(
+                        "experiment %s: pretrain_checkpoint '%s' not found, "
+                        "falling back to %d-epoch on-the-fly MAE pretrain",
+                        config.experiment_id, config.pretrain_checkpoint,
+                        config.pretrain_epochs,
+                    )
+                logger.info("experiment %s: MAE pretraining %d epochs on %s (cross-modal)",
+                            config.experiment_id, config.pretrain_epochs,
+                            pretrain_dataset_name)
+                from senseframe.core.foundation_model import PretrainConfig
+                pretrain_cfg = PretrainConfig(
+                    epochs=config.pretrain_epochs,
+                    batch_size=config.batch_size,
+                    learning_rate=config.pretrain_lr,
+                    mask_ratio=config.pretrain_mask_ratio,
+                )
+                pretrain_loader = DataLoader(
+                    pretrain_ds, batch_size=config.batch_size, shuffle=True,
+                    collate_fn=pretrain_collate_fn, num_workers=0,
+                )
+                backbone.pretrain(pretrain_loader, pretrain_cfg)
 
             # 替换 patch_embedder 到目标模态（保留 transformer encoder + decoder 主体）
             # 核心跨模态迁移：modality-specific 的 patch_embedder/pos_embed/decoder_proj 重新初始化，
@@ -990,6 +1198,19 @@ def run_single_experiment(
                 pretrain_dataset_name, pretrain_input_shape,
                 config.target_dataset, target_shape,
             )
+
+            # DANN 跨模态对齐：replace 前保存 CSI 模态的 patch_embedder + pos_embed
+            # 用于 DANN 训练时提取 CSI 特征（共享 encoder，模态特定层独立）
+            # 不保存则 DANN 无法处理 CSI 输入（replace 后 backbone 只能处理 EEG）
+            if config.use_dann:
+                import copy as _copy
+                csi_patch_embedder_saved = _copy.deepcopy(backbone.patch_embedder)
+                csi_pos_embed_saved = backbone.pos_embed.detach().clone()
+                logger.info(
+                    "experiment %s: saved CSI patch_embedder + pos_embed for DANN "
+                    "(n_patches=%d, will be frozen)",
+                    config.experiment_id, backbone.patch_embedder.n_patches,
+                )
             backbone.replace_patch_embedder(
                 new_input_shape=target_shape,
                 new_patch_len=dataset_config["patch_len"],
@@ -1051,19 +1272,70 @@ def run_single_experiment(
         total_params = sum(p.numel() for p in classifier.parameters())
 
         # ---- 8. 训练 ----
-        logger.info("experiment %s: training %d epochs, method=%s",
-                    config.experiment_id, config.epochs, config.finetune_method)
+        logger.info("experiment %s: training %d epochs, method=%s%s",
+                    config.experiment_id, config.epochs, config.finetune_method,
+                    " (DANN)" if config.use_dann else "")
         t0 = time.time()
-        val_acc, macro_f1, trainable_params = _train_classifier(
-            model=classifier,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            num_classes=num_classes,
-            epochs=config.epochs,
-            learning_rate=config.learning_rate,
-            device=device,
-            d_model=d_model,
-        )
+        if config.use_dann:
+            # DANN 模式：构建 DANNCrossModalModel + 加载 CSI val 集 + λ 调度训练
+            from senseframe.scenes.wifi_csi.dann import DANNCrossModalModel
+
+            # 加载 CSI val 集作对抗信号（避免数据泄露）
+            # pretrain_dataset_name 在步骤 4 已解析（B5_DANN/B6_DANN 应解析为 CSI 数据集）
+            if pretrain_dataset_name is None:
+                raise ValueError(
+                    "DANN 模式要求 pretrain_source 解析为 CSI 数据集，"
+                    "但 pretrain_dataset_name=None（pretrain_source='none'）。"
+                    "B5_DANN/B6_DANN 的 pretrain_source 应为 'csi_4datasets'。"
+                )
+            csi_val_ds, csi_val_collate_fn, _ = _load_csi_dataset_val(
+                pretrain_dataset_name
+            )
+            csi_val_loader = DataLoader(
+                csi_val_ds, batch_size=config.batch_size, shuffle=True,
+                collate_fn=csi_val_collate_fn, num_workers=0,
+            )
+
+            # 构建 DANN 模型（backbone 用 peft_model，task_head 用 classifier）
+            # DANNCrossModalModel 内部共享 peft_model 实例，避免重复 forward backbone
+            # csi_patch_embedder_saved + csi_pos_embed_saved 用于 CSI 特征提取
+            #   （replace_patch_embedder 前保存的 CSI 模态特定层）
+            if csi_patch_embedder_saved is None or csi_pos_embed_saved is None:
+                raise ValueError(
+                    "DANN 模式要求跨模态预训练（pretrain_source != target_dataset）"
+                    "以保存 CSI patch_embedder/pos_embed，但 csi_*_saved=None。"
+                    "检查 pretrain_source 是否为 'csi_4datasets' 且 target 是 EEG/Radio。"
+                )
+            dann_model = DANNCrossModalModel(
+                backbone=peft_model,
+                task_head=classifier,
+                d_model=d_model,
+                hidden_dim=config.dann_hidden_dim,
+                dropout=config.dann_dropout,
+                csi_patch_embedder=csi_patch_embedder_saved,
+                csi_pos_embed=csi_pos_embed_saved,
+            )
+            val_acc, macro_f1, trainable_params = _train_dann(
+                model=dann_model,
+                eeg_loader=train_loader,
+                csi_loader=csi_val_loader,
+                val_loader=val_loader,
+                num_classes=num_classes,
+                epochs=config.epochs,
+                learning_rate=config.learning_rate,
+                device=device,
+            )
+        else:
+            val_acc, macro_f1, trainable_params = _train_classifier(
+                model=classifier,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                num_classes=num_classes,
+                epochs=config.epochs,
+                learning_rate=config.learning_rate,
+                device=device,
+                d_model=d_model,
+            )
         training_time = time.time() - t0
 
         # ---- 8. 收集结果 ----
@@ -1173,7 +1445,11 @@ SINGLE_SCENE_EXPERIMENTS: List[Dict[str, Any]] = [
     {"id": "A5", "pretrain": "csi_4datasets", "finetune": "prompt_tuning", "datasets": ["UT_HAR_data", "NTU-Fi_HAR", "NTU-Fi-HumanID", "Widar"], "params": {"prompt_length": 10}},
 ]
 
-# 10.4 跨场景迁移评估（B1-B8）
+# 10.4 跨场景迁移评估（B1-B8 + B5_DANN/B6_DANN）
+# B5_DANN/B6_DANN：DANN 跨模态对齐实验组（Task 12 新增）
+# - 复用 B5/B6 的 pretrain/finetune 配置，额外启用 DANN 对抗训练
+# - pretrain_checkpoint 指向 P0-1 产出的 PSNR best checkpoint，避免重复跑 100 epoch MAE
+# - pretrain_epochs=100 仅作记录（checkpoint 已含 100 epoch 预训练结果）
 CROSS_DOMAIN_EXPERIMENTS: List[Dict[str, Any]] = [
     {"id": "B1", "pretrain": "none",          "target": "RadioML2018",     "finetune": "scratch"},
     {"id": "B2", "pretrain": "csi_4datasets", "target": "RadioML2018",     "finetune": "lora"},
@@ -1183,6 +1459,59 @@ CROSS_DOMAIN_EXPERIMENTS: List[Dict[str, Any]] = [
     {"id": "B6", "pretrain": "csi_4datasets", "target": "PhysioNet_MI",    "finetune": "full"},
     {"id": "B7", "pretrain": "radioml",       "target": "PhysioNet_MI",    "finetune": "lora"},
     {"id": "B8", "pretrain": "eegmmidb",      "target": "RadioML2018",     "finetune": "lora"},
+    # DANN 跨模态对齐实验组（B5/B6 + DANN 对抗训练）
+    {
+        "id": "B5_DANN",
+        "pretrain": "csi_4datasets",
+        "target": "PhysioNet_MI",
+        "finetune": "lora",
+        "params": {"peft_rank": 8, "peft_alpha": 1, "peft_target_modules": "query_value"},
+        "use_dann": True,
+        "pretrain_checkpoint": "checkpoints/ntu_pretrain_NTU-Fi_HAR_psnr19p4.pt",
+        "pretrain_epochs": 100,  # 仅记录，checkpoint 已含 100 epoch 结果
+        "epochs": 5,
+        "batch_size": 32,
+    },
+    {
+        "id": "B6_DANN",
+        "pretrain": "csi_4datasets",
+        "target": "PhysioNet_MI",
+        "finetune": "full",
+        "params": {},
+        "use_dann": True,
+        "pretrain_checkpoint": "checkpoints/ntu_pretrain_NTU-Fi_HAR_psnr19p4.pt",
+        "pretrain_epochs": 100,
+        "epochs": 5,
+        "batch_size": 32,
+    },
+    # P0-3 基线对照实验组（B5_v2/B6_v2 = B5/B6 配置 + P0-1 PSNR checkpoint）
+    # 用于与 B5_DANN/B6_DANN 对照，计算 DANN 的 transfer_gain
+    # 与原 B5/B6 的差异：pretrain 用 P0-1 的 PSNR best checkpoint（100 epoch + early stopping）
+    # 而非现场 20 epoch MAE 预训练
+    {
+        "id": "B5_v2",
+        "pretrain": "csi_4datasets",
+        "target": "PhysioNet_MI",
+        "finetune": "lora",
+        "params": {"peft_rank": 8, "peft_alpha": 1, "peft_target_modules": "query_value"},
+        "use_dann": False,
+        "pretrain_checkpoint": "checkpoints/ntu_pretrain_NTU-Fi_HAR_psnr19p4.pt",
+        "pretrain_epochs": 100,
+        "epochs": 5,
+        "batch_size": 32,
+    },
+    {
+        "id": "B6_v2",
+        "pretrain": "csi_4datasets",
+        "target": "PhysioNet_MI",
+        "finetune": "full",
+        "params": {},
+        "use_dann": False,
+        "pretrain_checkpoint": "checkpoints/ntu_pretrain_NTU-Fi_HAR_psnr19p4.pt",
+        "pretrain_epochs": 100,
+        "epochs": 5,
+        "batch_size": 32,
+    },
 ]
 
 # 10.5 SP 搜索有效性（C1-C5）

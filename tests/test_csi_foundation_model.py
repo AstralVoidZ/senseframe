@@ -266,6 +266,30 @@ class TestEncode:
 
 
 # ============================================================
+# TestEncodeFeatures（DANN 用）
+# ============================================================
+class TestEncodeFeatures:
+    """验证 encode_features 暴露中间特征（DANN 用）。"""
+
+    def test_encode_features_output_shape(self):
+        """encode_features 返回 (B, n_patches, d_model)。"""
+        model = _make_small_model()
+        x = torch.randn(4, 3, 64)
+        feat = model.encode_features(x)
+        assert feat.shape == (4, 8, 32)  # n_patches=8, d_model=32
+
+    def test_encode_features_equals_encode(self):
+        """encode_features 是 encode 的别名，语义上强调"供下游用"。"""
+        model = _make_small_model()
+        model.eval()
+        x = torch.randn(2, 3, 64)
+        with torch.no_grad():
+            feat = model.encode_features(x)
+            feat_encode = model.encode(x)
+        assert torch.allclose(feat, feat_encode)
+
+
+# ============================================================
 # TestPretrainMAE
 # ============================================================
 class TestPretrainMAE:
