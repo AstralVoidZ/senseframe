@@ -20,6 +20,7 @@ from senseframe.engine.runner.pipeline import PipelineContext
 from senseframe.scenes.base import DatasetBundle
 from senseframe.core.profiler import DataProfile
 from senseframe.engine.config import ExperimentConfig, SceneConfig, InputFeature, OutputFeature, TrainerConfig
+from senseframe.engine.runner.pipeline.runtime import Pipeline
 
 
 def _make_test_config():
@@ -33,10 +34,6 @@ def _make_test_config():
 
 
 class TestContextSchema:
-    def test_returns_json_serializable(self):
-        schema = context_schema()
-        json.dumps(schema)  # 不抛异常
-
     def test_has_schema_version(self):
         schema = context_schema()
         assert "schema_version" in schema
@@ -111,18 +108,13 @@ class TestContextDescribe:
         assert "trial_id" in desc
         assert "completed_stages" in desc
 
-    def test_json_serializable(self):
-        config = _make_test_config()
-        ctx = PipelineContext(config=config)
-        desc = context_describe(ctx)
-        json.dumps(desc)
-
 
 class TestStageIO:
     def test_list_all_stages(self):
         result = stage_io()
         assert "stages" in result
-        assert len(result["stages"]) == 9
+        expected = len(Pipeline.default().stages)
+        assert len(result["stages"]) == expected
 
     def test_get_single_stage(self):
         result = stage_io("validate")
@@ -150,13 +142,15 @@ class TestStageIO:
 
     def test_json_serializable(self):
         result = stage_io()
-        json.dumps(result)
+        serialized = json.dumps(result)
+        assert isinstance(serialized, str)
 
 
 class TestListStages:
     def test_returns_9_stages(self):
         stages = list_stages()
-        assert len(stages) == 9
+        expected = len(Pipeline.default().stages)
+        assert len(stages) == expected
         assert "validate" in stages
         assert "export" in stages
 
@@ -187,10 +181,6 @@ class TestPipelineGraph:
         config = graph["fields"].get("config", {})
         assert config.get("producers", []) == []
 
-    def test_json_serializable(self):
-        graph = pipeline_graph()
-        json.dumps(graph)
-
 
 class TestDataBundleSchema:
     def test_has_filling_rules(self):
@@ -213,10 +203,6 @@ class TestDataBundleSchema:
         assert rule["unsupervised"] == "required"
         assert rule["supervised_finetune"] == "required"
 
-    def test_json_serializable(self):
-        schema = data_bundle_schema()
-        json.dumps(schema)
-
 
 class TestDataBundleDescribe:
     def test_empty_bundle_supervised(self):
@@ -230,11 +216,6 @@ class TestDataBundleDescribe:
         desc = data_bundle_describe(bundle, "self_supervised")
         assert len(desc["validation_errors"]) > 0
 
-    def test_json_serializable(self):
-        bundle = DatasetBundle()
-        desc = data_bundle_describe(bundle)
-        json.dumps(desc)
-
 
 class TestDataProfileSchema:
     def test_has_new_fields(self):
@@ -245,10 +226,6 @@ class TestDataProfileSchema:
         assert "nullable" in names
         assert "shapes" in names
 
-    def test_json_serializable(self):
-        schema = data_profile_schema()
-        json.dumps(schema)
-
 
 class TestDataProfileDescribe:
     def test_empty_profile(self):
@@ -258,7 +235,21 @@ class TestDataProfileDescribe:
         assert "dtype_distribution" in desc
         assert "nullable_ratio" in desc
 
-    def test_json_serializable(self):
-        profile = DataProfile()
-        desc = data_profile_describe(profile)
-        json.dumps(desc)
+
+class TestJsonSerializable:
+    """所有 introspect API 返回值应可 JSON 序列化。"""
+
+    @pytest.mark.parametrize("api_call", [
+        pytest.param(lambda: context_schema(), id="context_schema"),
+        pytest.param(lambda: context_describe(PipelineContext(config=_make_test_config())), id="context_describe"),
+        pytest.param(lambda: stage_io(), id="stage_io"),
+        pytest.param(lambda: pipeline_graph(), id="pipeline_graph"),
+        pytest.param(lambda: data_bundle_schema(), id="data_bundle_schema"),
+        pytest.param(lambda: data_bundle_describe(DatasetBundle()), id="data_bundle_describe"),
+        pytest.param(lambda: data_profile_schema(), id="data_profile_schema"),
+        pytest.param(lambda: data_profile_describe(DataProfile()), id="data_profile_describe"),
+    ])
+    def test_json_serializable(self, api_call):
+        result = api_call()
+        serialized = json.dumps(result)
+        assert isinstance(serialized, str)

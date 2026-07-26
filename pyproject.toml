@@ -144,6 +144,8 @@ markers = [
     "slow: 标记跑得慢的测试",
     "integration: 集成测试（需要真实数据集/模型）",
     "gpu: 需要 GPU 的测试",
+    "e2e: 端到端测试（跑真实训练，默认跳过，-m e2e 启用）",
+    "requires_data: 需要外部数据集（SENSEFRAME_DATA_ROOT 未设置时跳过）",
     # 测试分层重构（plan_test_refactor_v1.md）：4 层 marker
     "l1_contract: L1 外部协议契约测试（锚点：外部协议/库 API）",
     "l2_orchestration: L2 编排 spec 契约测试（锚点：项目内 RFC/设计文档）",

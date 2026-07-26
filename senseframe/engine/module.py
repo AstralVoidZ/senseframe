@@ -174,6 +174,16 @@ class GenericLightningModule(pl.LightningModule):
         # on_val_end 从累积器算 train_loss（此时累积器有当前 epoch 的值），
         # on_train_end 不重置、不保存实例变量。
 
+    @property
+    def current_epoch_loss(self) -> float:
+        """当前 epoch 累积 loss。"""
+        return self._current_epoch_loss
+
+    @property
+    def current_epoch_steps(self) -> int:
+        """当前 epoch 累积步数。"""
+        return self._current_epoch_steps
+
     def _check_finite(self, t: torch.Tensor, name: str, batch_idx: int):
         """守卫：检测 NaN/Inf，触发时抛出含上下文的 RuntimeError（B1）。"""
         if not torch.isfinite(t).all():

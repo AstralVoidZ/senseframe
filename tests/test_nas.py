@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+import importlib
+import inspect
 from dataclasses import fields
 from pathlib import Path
 from typing import Dict, List
@@ -47,7 +49,9 @@ from senseframe.nas.search_space import (
     SUPPORTED_ACTIVATIONS,
     SUPPORTED_CELL_TYPES,
     SUPPORTED_RNN_TYPES,
+    _default_attention_params,
 )
+from senseframe.nas.builder import Conv1dNet, RNNNet, HybridNet
 from senseframe.search_protocol import (
     ParameterSpec,
     Sampler,
@@ -440,10 +444,10 @@ class TestEvolutionarySampler:
         ss = ArchitectureSearchSpace().to_sp_search_space()
         # 第一次采样：population 为空
         params = sampler.sample(ss, [])
-        assert len(sampler._population) == 1
+        assert sampler.population_size_actual() == 1
         # 第二次采样：population 仍不足
         params2 = sampler.sample(ss, [])
-        assert len(sampler._population) == 2
+        assert sampler.population_size_actual() == 2
 
     def test_sample_evolution_phase_uses_tournament(self):
         """population 已满 + history 有 fitness 时，应进入进化阶段。"""
@@ -628,107 +632,72 @@ class TestMakeNasModuleFactory:
 
 
 # ============================================================
-# 反假绿：grep 实证检查（源码不可绕过）
+# 模块完整性（合并自原 TestGrepEvidence / TestGrepEvidenceDartsEnas）
 # ============================================================
-class TestGrepEvidence:
-    """源码 grep 实证：mock 可绕过运行时，但绕不过源码 grep。"""
+class TestModuleIntegrity:
+    """模块完整性：验证 NAS 模块关键类/函数/常量存在（合并自原 TestGrepEvidence）。"""
 
-    def test_search_space_has_architecture_parameter_spec(self):
-        """search_space.py 应定义 ArchitectureParameterSpec。"""
-        path = _source_path("nas/search_space.py")
-        assert _grep_source(path, "class ArchitectureParameterSpec"), \
-            "应有 ArchitectureParameterSpec 类"
+    @pytest.mark.parametrize("module_path,attr_name", [
+        # senseframe.nas.search_space
+        ("senseframe.nas.search_space", "ArchitectureParameterSpec"),
+        ("senseframe.nas.search_space", "ArchitectureSearchSpace"),
+        ("senseframe.nas.search_space", "SUPPORTED_CELL_TYPES"),
+        ("senseframe.nas.search_space", "SUPPORTED_RNN_TYPES"),
+        ("senseframe.nas.search_space", "_default_attention_params"),
+        # senseframe.nas.builder
+        ("senseframe.nas.builder", "ArchitectureBuilder"),
+        ("senseframe.nas.builder", "Conv1dNet"),
+        ("senseframe.nas.builder", "RNNNet"),
+        ("senseframe.nas.builder", "HybridNet"),
+        ("senseframe.nas.builder", "AttentionNet"),
+        # senseframe.nas.sampler
+        ("senseframe.nas.sampler", "EvolutionarySampler"),
+        ("senseframe.nas.sampler", "ENASSampler"),
+        # senseframe.nas.darts
+        ("senseframe.nas.darts", "DARTSSampler"),
+        ("senseframe.nas.darts", "DARTSPipelineRun"),
+        # senseframe.nas（__init__.py 导出）
+        ("senseframe.nas", "make_nas_module_factory"),
+        ("senseframe.nas", "DARTSSampler"),
+        ("senseframe.nas", "ENASSampler"),
+        ("senseframe.nas", "DARTSPipelineRun"),
+        ("senseframe.nas", "AttentionNet"),
+        # senseframe.engine.module
+        ("senseframe.engine.module", "GenericLightningModule"),
+    ])
+    def test_attr_exists(self, module_path, attr_name):
+        mod = importlib.import_module(module_path)
+        assert hasattr(mod, attr_name), f"{module_path}.{attr_name} 不存在"
 
-    def test_search_space_has_architecture_search_space(self):
-        """search_space.py 应定义 ArchitectureSearchSpace。"""
-        path = _source_path("nas/search_space.py")
-        assert _grep_source(path, "class ArchitectureSearchSpace"), \
-            "应有 ArchitectureSearchSpace 类"
+    @pytest.mark.parametrize("module_path,class_name,method_name", [
+        ("senseframe.nas.search_space", "ArchitectureSearchSpace", "to_sp_search_space"),
+        ("senseframe.nas.search_space", "ArchitectureSearchSpace", "schema"),
+        ("senseframe.nas.search_space", "ArchitectureSearchSpace", "describe"),
+        ("senseframe.nas.builder", "ArchitectureBuilder", "build"),
+        ("senseframe.nas.builder", "ArchitectureBuilder", "_build_attention"),
+        ("senseframe.nas.sampler", "EvolutionarySampler", "sample"),
+        ("senseframe.nas.sampler", "EvolutionarySampler", "_tournament_select"),
+        ("senseframe.nas.sampler", "EvolutionarySampler", "_mutate"),
+        ("senseframe.nas.sampler", "ENASSampler", "warm_start"),
+        ("senseframe.nas.darts", "DARTSSampler", "warm_start"),
+    ])
+    def test_method_exists(self, module_path, class_name, method_name):
+        mod = importlib.import_module(module_path)
+        cls = getattr(mod, class_name)
+        assert hasattr(cls, method_name), f"{module_path}.{class_name}.{method_name} 不存在"
 
-    def test_search_space_has_to_sp_search_space(self):
-        """search_space.py 应有 to_sp_search_space 方法。"""
-        path = _source_path("nas/search_space.py")
-        assert _grep_source(path, "def to_sp_search_space"), \
-            "应有 to_sp_search_space 方法（NAS → SP 转换）"
-
-    def test_search_space_has_dsp_schema(self):
-        """search_space.py 应有 DSP schema 方法。"""
-        path = _source_path("nas/search_space.py")
-        assert _grep_source(path, "def schema(cls)"), \
-            "应有 schema 方法（DSP 自省）"
-        assert _grep_source(path, "def describe(self)"), \
-            "应有 describe 方法（DSP 自省）"
-
-    def test_search_space_has_supported_constants(self):
-        """search_space.py 应有 SUPPORTED_CELL_TYPES 常量。"""
-        path = _source_path("nas/search_space.py")
-        assert _grep_source(path, "SUPPORTED_CELL_TYPES"), \
-            "应有 SUPPORTED_CELL_TYPES 常量"
-        assert _grep_source(path, "SUPPORTED_RNN_TYPES"), \
-            "应有 SUPPORTED_RNN_TYPES 常量"
-
-    def test_builder_has_architecture_builder_class(self):
-        """builder.py 应定义 ArchitectureBuilder 类。"""
-        path = _source_path("nas/builder.py")
-        assert _grep_source(path, "class ArchitectureBuilder"), \
-            "应有 ArchitectureBuilder 类"
-
-    def test_builder_has_build_method(self):
-        """builder.py 应有 build 方法。"""
-        path = _source_path("nas/builder.py")
-        assert _grep_source(path, "def build("), \
-            "ArchitectureBuilder 应有 build 方法"
-
-    def test_builder_has_conv1d_rnn_hybrid(self):
-        """builder.py 应实现 conv1d / rnn / hybrid 三种 cell_type。"""
-        path = _source_path("nas/builder.py")
-        assert _grep_source(path, "class Conv1dNet"), "应有 Conv1dNet 类"
-        assert _grep_source(path, "class RNNNet"), "应有 RNNNet 类"
-        assert _grep_source(path, "class HybridNet"), "应有 HybridNet 类"
-
-    def test_sampler_has_evolutionary_sampler_class(self):
-        """sampler.py 应定义 EvolutionarySampler 类。"""
-        path = _source_path("nas/sampler.py")
-        assert _grep_source(path, "class EvolutionarySampler"), \
-            "应有 EvolutionarySampler 类"
+    # --- 值检查 / grep 实证（保留） ---
 
     def test_sampler_has_name_evolutionary(self):
         """sampler.py 应有 name = 'evolutionary' 类属性。"""
-        path = _source_path("nas/sampler.py")
-        assert _grep_source(path, 'name = "evolutionary"'), \
+        assert EvolutionarySampler.name == "evolutionary", \
             "EvolutionarySampler.name 应为 'evolutionary'"
-
-    def test_sampler_has_sample_method(self):
-        """sampler.py 应有 sample 方法。"""
-        path = _source_path("nas/sampler.py")
-        assert _grep_source(path, "def sample("), \
-            "EvolutionarySampler 应有 sample 方法"
-
-    def test_sampler_has_tournament_and_mutate(self):
-        """sampler.py 应实现锦标赛选择和变异。"""
-        path = _source_path("nas/sampler.py")
-        assert _grep_source(path, "_tournament_select"), \
-            "应有 _tournament_select 方法"
-        assert _grep_source(path, "_mutate"), \
-            "应有 _mutate 方法"
 
     def test_sampler_registered_in_sp_registry(self):
         """sampler.py 应注册到 SP Sampler 注册表。"""
         path = _source_path("nas/sampler.py")
         assert _grep_source(path, 'register_sampler("evolutionary"'), \
             "应注册到 SP Sampler 注册表"
-
-    def test_init_has_make_nas_module_factory(self):
-        """__init__.py 应定义 make_nas_module_factory。"""
-        path = _source_path("nas/__init__.py")
-        assert _grep_source(path, "def make_nas_module_factory"), \
-            "__init__.py 应有 make_nas_module_factory 函数"
-
-    def test_init_uses_generic_lightning_module(self):
-        """__init__.py 应使用 GenericLightningModule 包装。"""
-        path = _source_path("nas/__init__.py")
-        assert _grep_source(path, "GenericLightningModule"), \
-            "make_nas_module_factory 应使用 GenericLightningModule"
 
     def test_pipeline_module_factory_supports_nas_injection(self):
         """pipeline/stages/build.py 应支持 module_factory 注入（NAS 集成前提）。
@@ -740,6 +709,33 @@ class TestGrepEvidence:
             "stage_build 应检查 module_factory 非空"
         assert _grep_source(path, "ctx.config.module_factory("), \
             "stage_build 应调用 module_factory"
+
+    def test_grep_supported_cell_types_has_attention(self):
+        """search_space.py 的 SUPPORTED_CELL_TYPES 应含 attention。"""
+        assert "attention" in SUPPORTED_CELL_TYPES, \
+            f"SUPPORTED_CELL_TYPES 应含 attention, got: {SUPPORTED_CELL_TYPES}"
+
+    def test_grep_darts_registered(self):
+        """darts.py 应含 register_sampler("darts" 注册调用。"""
+        path = _source_path("nas/darts.py")
+        assert _grep_source(path, 'register_sampler("darts"'), \
+            "darts.py 应注册 DARTSSampler 到 SP"
+
+    def test_grep_enas_registered(self):
+        """sampler.py 应含 register_sampler("enas" 注册调用。"""
+        path = _source_path("nas/sampler.py")
+        assert _grep_source(path, 'register_sampler("enas"'), \
+            "sampler.py 应注册 ENASSampler 到 SP"
+
+    def test_grep_darts_sampler_name(self):
+        """darts.py 应有 name = 'darts' 类属性。"""
+        assert DARTSSampler.name == "darts", \
+            "DARTSSampler.name 应为 'darts'"
+
+    def test_grep_enas_sampler_name(self):
+        """sampler.py 应有 name = 'enas' 类属性。"""
+        assert ENASSampler.name == "enas", \
+            "ENASSampler.name 应为 'enas'"
 
 
 # ============================================================
@@ -1316,115 +1312,6 @@ class TestENASSampler:
 
 
 # ============================================================
-# P3.3.4: 反假绿 grep 实证检查
-# ============================================================
-class TestGrepEvidenceDartsEnas:
-    """P3.3 DARTS/ENAS/attention 源码 grep 实证检查。"""
-
-    def test_grep_attention_net_class(self):
-        """builder.py 应含 class AttentionNet。"""
-        path = _source_path("nas/builder.py")
-        assert _grep_source(path, "class AttentionNet"), \
-            "builder.py 应有 AttentionNet 类"
-
-    def test_grep_build_attention_method(self):
-        """builder.py 应含 _build_attention 方法。"""
-        path = _source_path("nas/builder.py")
-        assert _grep_source(path, "def _build_attention"), \
-            "builder.py 应有 _build_attention 方法"
-
-    def test_grep_supported_cell_types_has_attention(self):
-        """search_space.py 的 SUPPORTED_CELL_TYPES 应含 attention。"""
-        path = _source_path("nas/search_space.py")
-        content = path.read_text(encoding="utf-8")
-        # SUPPORTED_CELL_TYPES 行应含 attention
-        for line in content.splitlines():
-            if "SUPPORTED_CELL_TYPES" in line and "=" in line and "[" in line:
-                assert "attention" in line, \
-                    f"SUPPORTED_CELL_TYPES 应含 attention, got: {line}"
-                return
-        assert False, "未找到 SUPPORTED_CELL_TYPES 定义"
-
-    def test_grep_default_attention_params(self):
-        """search_space.py 应含 _default_attention_params 函数。"""
-        path = _source_path("nas/search_space.py")
-        assert _grep_source(path, "def _default_attention_params"), \
-            "search_space.py 应有 _default_attention_params 函数"
-
-    def test_grep_darts_sampler_class(self):
-        """darts.py 应含 class DARTSSampler。"""
-        path = _source_path("nas/darts.py")
-        assert _grep_source(path, "class DARTSSampler"), \
-            "darts.py 应有 DARTSSampler 类"
-
-    def test_grep_darts_pipeline_run_class(self):
-        """darts.py 应含 class DARTSPipelineRun。"""
-        path = _source_path("nas/darts.py")
-        assert _grep_source(path, "class DARTSPipelineRun"), \
-            "darts.py 应有 DARTSPipelineRun 类"
-
-    def test_grep_enas_sampler_class(self):
-        """sampler.py 应含 class ENASSampler。"""
-        path = _source_path("nas/sampler.py")
-        assert _grep_source(path, "class ENASSampler"), \
-            "sampler.py 应有 ENASSampler 类"
-
-    def test_grep_darts_registered(self):
-        """darts.py 应含 register_sampler("darts" 注册调用。"""
-        path = _source_path("nas/darts.py")
-        assert _grep_source(path, 'register_sampler("darts"'), \
-            "darts.py 应注册 DARTSSampler 到 SP"
-
-    def test_grep_enas_registered(self):
-        """sampler.py 应含 register_sampler("enas" 注册调用。"""
-        path = _source_path("nas/sampler.py")
-        assert _grep_source(path, 'register_sampler("enas"'), \
-            "sampler.py 应注册 ENASSampler 到 SP"
-
-    def test_grep_nas_init_exports_darts_enas(self):
-        """__init__.py 应导出 DARTSSampler, ENASSampler, DARTSPipelineRun, AttentionNet。"""
-        path = _source_path("nas/__init__.py")
-        assert _grep_source(path, "DARTSSampler"), \
-            "__init__.py 应导出 DARTSSampler"
-        assert _grep_source(path, "ENASSampler"), \
-            "__init__.py 应导出 ENASSampler"
-        assert _grep_source(path, "DARTSPipelineRun"), \
-            "__init__.py 应导出 DARTSPipelineRun"
-        assert _grep_source(path, "AttentionNet"), \
-            "__init__.py 应导出 AttentionNet"
-
-    def test_grep_darts_sampler_name(self):
-        """darts.py 应有 name = 'darts' 类属性。"""
-        path = _source_path("nas/darts.py")
-        assert _grep_source(path, 'name = "darts"'), \
-            "DARTSSampler.name 应为 'darts'"
-
-    def test_grep_enas_sampler_name(self):
-        """sampler.py 应有 name = 'enas' 类属性。"""
-        path = _source_path("nas/sampler.py")
-        assert _grep_source(path, 'name = "enas"'), \
-            "ENASSampler.name 应为 'enas'"
-
-    def test_grep_darts_warm_start(self):
-        """darts.py 应含 warm_start 方法（Sampler Protocol 合规）。"""
-        path = _source_path("nas/darts.py")
-        assert _grep_source(path, "def warm_start"), \
-            "DARTSSampler 应有 warm_start 方法"
-
-    def test_grep_enas_warm_start(self):
-        """sampler.py 应含 ENASSampler 的 warm_start 方法。"""
-        path = _source_path("nas/sampler.py")
-        # sampler.py 已有 EvolutionarySampler 的 warm_start；确保 ENAS 也有
-        content = path.read_text(encoding="utf-8")
-        # 找到 ENASSampler 类定义后的 warm_start
-        enas_idx = content.find("class ENASSampler")
-        assert enas_idx >= 0, "应含 ENASSampler 类"
-        enas_section = content[enas_idx:]
-        assert "def warm_start" in enas_section, \
-            "ENASSampler 应有 warm_start 方法"
-
-
-# ============================================================
 # P1.3: DARTS 真实超网测试（2026-07-19）
 # ============================================================
 @pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
@@ -1799,8 +1686,8 @@ class TestDARTSPipelineRunRealSupernet:
                      "train_iter", "val_iter"):
             assert attr not in run.__dict__, \
                 f"run() 泄露了 {attr} 引用"
-        # sampler 的 _supernet 应被解除（detach_supernet 已调用）
-        assert sampler._supernet is None
+        # sampler 的 supernet 应被解除（detach_supernet 已调用）
+        assert sampler.supernet is None
 
     def test_real_supernet_supernet_kwargs(self):
         """supernet_kwargs 传递给 DARTSSupernet。"""
@@ -1860,12 +1747,12 @@ class TestDARTSSamplerSupernetAttach:
         assert sampler._supernet is None
 
     def test_cleanup_clears_supernet_ref(self):
-        """cleanup() 应解除 _supernet 引用。"""
+        """cleanup() 应解除 supernet 引用。"""
         sampler = DARTSSampler()
         sn = DARTSSupernet(input_shape=(30, 100), num_classes=7)
         sampler.attach_supernet(sn)
         sampler.cleanup()
-        assert sampler._supernet is None
+        assert sampler.supernet is None
 
     def test_attach_supernet_grep_evidence(self):
         """grep 实证：darts.py 含 attach_supernet / detach_supernet 方法。"""

@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+import importlib
+import inspect
 from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict
@@ -529,7 +531,7 @@ class TestExperimentRunnerEventDriven:
             initial_count = len(runner.get_event_log())
             # 手动通过 orch 发射一个事件
             from senseframe.orchestration import make_event
-            orch._emit_event(
+            orch.emit_event(
                 EVENT_PIPELINE_SUCCEEDED, "fake_run",
                 {"phase": PHASE_SUCCEEDED},
             )
@@ -566,94 +568,79 @@ class TestExperimentRunnerEventDriven:
 # 反假绿：grep 实证检查（源码不可绕过）
 # ============================================================
 class TestGrepEvidence:
-    """源码 grep 实证：mock 可绕过运行时，但绕不过源码 grep。"""
+    """反射 + grep 实证：A 类（存在性）用反射 API；B 类（行为）保留 grep。
 
-    def test_orchestration_has_start_and_execute(self):
-        """orchestration.py 应定义 start_and_execute 方法。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "def start_and_execute("), \
-            "Orchestrator 应有 start_and_execute 方法（P2.11）"
+    P4b 冗余清理：以下 B 类 grep 断言因已有运行时测试覆盖而删除——
+      - test_method_py_uses_create_run_and_start: 已由 TestMethodRunnerOpPath 运行时覆盖
+      - test_runner_py_subscribes_pipeline_events: 已由 TestExperimentRunnerEventDriven 运行时覆盖
+    """
 
-    def test_orchestration_has_wait_for_completion(self):
-        """orchestration.py 应定义 wait_for_completion 方法。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "def wait_for_completion("), \
-            "Orchestrator 应有 wait_for_completion 方法（P2.11）"
+    # test_method_py_uses_create_run_and_start 已删除：
+    # 行为由 TestMethodRunnerOpPath 运行时测试覆盖（test_use_op_true_uses_op_path 等）
 
-    def test_orchestration_has_execute_pipeline(self):
-        """orchestration.py 应定义 _execute_pipeline 内部方法。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "def _execute_pipeline("), \
-            "Orchestrator 应有 _execute_pipeline 方法（P2.11）"
+    @pytest.mark.parametrize("module_path,attr_name", [
+        ("senseframe.orchestration", "Orchestrator.start_and_execute"),
+        ("senseframe.orchestration", "Orchestrator.wait_for_completion"),
+        ("senseframe.orchestration", "Orchestrator._execute_pipeline"),
+        ("senseframe.orchestration", "Orchestrator.shutdown"),
+        ("senseframe.experiment.method", "MethodRunner._run_pipeline_via_op"),
+        ("senseframe.experiment.runner", "ExperimentRunner._subscribe_op_events"),
+        ("senseframe.experiment.runner", "ExperimentRunner.get_event_log"),
+    ])
+    def test_attr_exists(self, module_path, attr_name):
+        """反射实证：模块属性存在性（参数化）。"""
+        mod = importlib.import_module(module_path)
+        parts = attr_name.split(".")
+        obj = mod
+        for part in parts[:-1]:
+            assert hasattr(obj, part), f"{module_path}.{part} 不存在"
+            obj = getattr(obj, part)
+        assert hasattr(obj, parts[-1]), f"{module_path}.{attr_name} 不存在"
 
-    def test_orchestration_has_thread_pool_executor(self):
-        """orchestration.py 应使用 ThreadPoolExecutor。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "ThreadPoolExecutor"), \
-            "应使用 ThreadPoolExecutor（P2.11 异步执行）"
-        assert _grep_source(path, "from concurrent.futures"), \
-            "应 import concurrent.futures（P2.11）"
-
-    def test_orchestration_has_shutdown(self):
-        """orchestration.py 应有 shutdown 方法（资源清理）。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "def shutdown("), \
-            "Orchestrator 应有 shutdown 方法（P2.11 资源清理）"
+    def test_orchestration_uses_thread_pool_executor(self):
+        """运行时验证：Orchestrator start_and_execute 后使用 ThreadPoolExecutor。"""
+        from concurrent.futures import ThreadPoolExecutor
+        orch = Orchestrator()
+        try:
+            pdef = PipelineDef.default()
+            orch.create_pipeline(pdef)
+            run_id = orch.create_run(pdef.name)
+            ctx = MagicMock()
+            ctx.completed_stages = []
+            ctx.failed_stage = None
+            ctx.output_dir = None
+            orch.bind_context(run_id, ctx)
+            orch.start_and_execute(run_id)
+            orch.wait_for_completion(run_id, timeout=5.0)
+            # 验证内部使用 ThreadPoolExecutor
+            assert isinstance(orch._executor, ThreadPoolExecutor)
+        finally:
+            orch.shutdown()
 
     def test_method_py_has_use_op_parameter(self):
-        """method.py 应有 use_op 参数。"""
-        path = _source_path("experiment/method.py")
-        assert _grep_source(path, "use_op: bool = False"), \
+        """反射实证：MethodRunner.__init__ 应有 use_op 参数。"""
+        sig = inspect.signature(MethodRunner.__init__)
+        assert "use_op" in sig.parameters, \
             "MethodRunner 应有 use_op 参数（P2.12）"
 
-    def test_method_py_has_run_pipeline_via_op(self):
-        """method.py 应有 _run_pipeline_via_op 方法。"""
-        path = _source_path("experiment/method.py")
-        assert _grep_source(path, "def _run_pipeline_via_op("), \
-            "MethodRunner 应有 _run_pipeline_via_op 方法（P2.12）"
-
-    def test_method_py_uses_create_run_and_start(self):
-        """method.py 应调用 OP create_run + start + complete/fail。"""
-        path = _source_path("experiment/method.py")
-        assert _grep_source(path, "orch.create_run("), \
-            "应调用 orch.create_run（P2.12）"
-        assert _grep_source(path, "orch.start("), \
-            "应调用 orch.start（P2.12）"
-        assert _grep_source(path, "orch.complete("), \
-            "应调用 orch.complete（P2.12）"
-        assert _grep_source(path, "orch.fail("), \
-            "应调用 orch.fail（P2.12）"
-
     def test_runner_py_has_use_op_parameter(self):
-        """runner.py 应有 use_op 参数。"""
-        path = _source_path("experiment/runner.py")
-        assert _grep_source(path, "use_op: bool = False"), \
+        """反射实证：ExperimentRunner.__init__ 应有 use_op 参数。"""
+        sig = inspect.signature(ExperimentRunner.__init__)
+        assert "use_op" in sig.parameters, \
             "ExperimentRunner 应有 use_op 参数（P2.13）"
 
-    def test_runner_py_has_subscribe_op_events(self):
-        """runner.py 应有 _subscribe_op_events 方法。"""
-        path = _source_path("experiment/runner.py")
-        assert _grep_source(path, "def _subscribe_op_events("), \
-            "ExperimentRunner 应有 _subscribe_op_events 方法（P2.13）"
-
-    def test_runner_py_subscribes_pipeline_events(self):
-        """runner.py 应订阅 EVENT_PIPELINE_SUCCEEDED / FAILED。"""
-        path = _source_path("experiment/runner.py")
-        assert _grep_source(path, "EVENT_PIPELINE_SUCCEEDED"), \
-            "应订阅 EVENT_PIPELINE_SUCCEEDED（P2.13）"
-        assert _grep_source(path, "EVENT_PIPELINE_FAILED"), \
-            "应订阅 EVENT_PIPELINE_FAILED（P2.13）"
-
-    def test_runner_py_has_get_event_log(self):
-        """runner.py 应有 get_event_log 方法。"""
-        path = _source_path("experiment/runner.py")
-        assert _grep_source(path, "def get_event_log("), \
-            "ExperimentRunner 应有 get_event_log 方法（P2.13）"
-
     def test_runner_py_thread_safe_event_collection(self):
-        """runner.py 应使用线程锁保护事件收集。"""
-        path = _source_path("experiment/runner.py")
-        assert _grep_source(path, "threading.Lock"), \
-            "应使用 threading.Lock 保护事件收集（P2.13 线程安全）"
-        assert _grep_source(path, "_event_lock"), \
-            "应有 _event_lock 字段（P2.13 线程安全）"
+        """运行时验证：ExperimentRunner use_op=True 时有线程锁保护事件收集。"""
+        import threading
+        config = _make_method_config()
+        design = _make_experiment_design(config)
+        orch = Orchestrator()
+        try:
+            runner = ExperimentRunner(
+                design=design, use_op=True, orchestrator=orch,
+            )
+            # 验证 _event_lock 存在且为 threading.Lock
+            assert hasattr(runner, "_event_lock")
+            assert isinstance(runner._event_lock, type(threading.Lock()))
+        finally:
+            orch.shutdown()

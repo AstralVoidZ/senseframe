@@ -16,7 +16,7 @@ SenseFrame 让 Agent 持有训练流程控制权：框架提供可组合的 Stag
 - **数据驱动** — `DataProfiler` 探查数据特征并推荐策略（task_type / loss / metric / normalization）
 - **可编程训练流程** — 9 个 Stage 可替换、插入 hook、跳过、断点续跑
 - **声明式 + 命令式** — YAML 快速启动，代码注入自定义逻辑
-- **资源感知路由** — 自动探测 CPU/GPU/内存，5 级路由选择训练路线
+- **资源感知路由** — 自动探测 CPU/GPU/内存，7 级路由选择训练路线
 - **自愈重试** — OOM 自动降 `batch_size` 重试
 - **结构化异常** — `SenseFrameError` 基类 + 20 个错误码，每个携带 `error_code`，消除字符串匹配
 - **产物溯源** — `ArtifactManifest` 记录全部产物 SHA-256，`verify_artifacts()` 校验完整性
@@ -152,6 +152,7 @@ senseframe/
 | `recommend` | 根据资源推荐模型 | `python -m senseframe.cli recommend --dataset UT_HAR_data` |
 | `experiment` | YAML 配置驱动训练 | `python -m senseframe.cli experiment --config configs/config.yaml` |
 | `export` | 多格式模型导出 | `python -m senseframe.cli export --formats onnx` |
+| `compare` | 对比两份配置（A/B 实验） | `python -m senseframe.cli compare a.yaml b.yaml --repeats 3` |
 | `predict` | 批量推理 | `python -m senseframe.cli predict --model model.pth --metadata metadata.json --samples samples.json` |
 | `exploration` | 探索状态管理 | `python -m senseframe.cli exploration list` |
 | `skills` | 技能库管理 | `python -m senseframe.cli skills list` |
@@ -280,7 +281,7 @@ class TimeSeriesScene(SceneContainer):
 - [配置 Schema](reference/reference_config_schema.md) — 完整字段与校验规则
 - [数据集与模型](reference/reference_datasets_models.md) — 数据集与模型支持表
 - [自省协议](reference/reference_introspect.md) — 字段契约 / 探索状态 / 技能库 / 断点续跑
-- [资源路由](reference/reference_resource_routing.md) — 5 级路由表 + 模型推荐
+- [资源路由](reference/reference_resource_routing.md) — 7 级路由表 + 模型推荐
 - [配置模板](reference/reference_training_templates.md) — YAML 配置模板
 - [MCP 子系统](reference/reference_mcp.md) — MCP 服务器工具与自省资源
 - [NAS + AutoAugment](reference/reference_nas_autoaugment.md) — 神经架构搜索与数据增强搜索

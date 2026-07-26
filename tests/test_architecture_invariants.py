@@ -56,7 +56,7 @@ class TestCQSCompliance:
         before = self._snapshot_all_registries()
         try:
             get_model_spec("NonExistentModel12345")
-        except (KeyError, Exception):
+        except Exception:
             pass  # 预期抛异常
         after = self._snapshot_all_registries()
         assert before == after, \
@@ -68,7 +68,7 @@ class TestCQSCompliance:
         before = self._snapshot_all_registries()
         try:
             get_dataset_spec("NonExistentDataset12345")
-        except (KeyError, Exception):
+        except Exception:
             pass
         after = self._snapshot_all_registries()
         assert before == after, \
@@ -80,7 +80,7 @@ class TestCQSCompliance:
         before = self._snapshot_all_registries()
         try:
             resolve_factory("GhostModel", "GhostDataset")
-        except (KeyError, Exception):
+        except Exception:
             pass
         after = self._snapshot_all_registries()
         assert before == after, \
@@ -112,6 +112,11 @@ class TestCQSCompliance:
 # B. 单一执行路径：三路归一（方案 1）
 # ============================================================
 
+# ARCHITECTURE_TRIPWIRE: 单一执行路径——run_experiment/reconcile/hpo 三路归一到 Pipeline.run()
+# 不可替代原因: "函数体不包含某些调用"是否定属性，反射/行为测试无法验证函数体内部不做什么；
+#   必须检查源码文本才能确认委托关系未被绕过（如别名导入、独立 stage 循环）。
+# 删除条件: 当委托关系由类型系统或框架强制保证时（如 run_experiment 变为 Pipeline.run 的
+#   类型约束薄包装，编译器/类型检查器可静态验证无独立执行逻辑）。
 class TestSingleExecutionPath:
     """run_experiment / reconcile / hpo 三条路径归一到 Pipeline.run()。"""
 
@@ -202,6 +207,13 @@ class TestSingleExecutionPath:
 # C. extra 纪律化：框架代码不写入 ctx.extra（方案 2）
 # ============================================================
 
+# ARCHITECTURE_TRIPWIRE: extra 纪律化——框架代码不写入 ctx.extra（方案 2）
+# 不可替代原因: "源码中不存在 ctx.extra[...] = 赋值"是否定属性，行为测试无法区分
+#   "从未写入"和"写入后又删除"；必须扫描源码文本才能确认框架代码不逃逸到 extra。
+#   注：本类中 test_failed_stage_is_first_class_field / test_feedback_is_first_class_field /
+#   test_schema_reports_first_class_fields 使用反射验证，属 A 类（非 grep），无需此注释。
+# 删除条件: 当 ctx.extra 对框架代码变为只读（如类型系统区分 AgentContext 与 FrameworkContext，
+#   或 extra 改为 property 仅允许 Agent 层写入）。
 class TestExtraDiscipline:
     """PipelineContext.extra 仅限 Agent 自由扩展，框架代码不得写入。"""
 
@@ -620,6 +632,11 @@ class TestDSP3Readiness:
 # F. 回归守卫：已消除的反模式不被重新引入
 # ============================================================
 
+# ARCHITECTURE_TRIPWIRE: 回归守卫——已消除的反模式不被重新引入（方案 F）
+# 不可替代原因: "整个代码库中不存在某函数/某调用模式"是否定属性，反射只能检查单个模块，
+#   无法覆盖全包扫描；行为测试无法验证"某段代码从未被执行过"。必须 grep 源码文本。
+# 删除条件: 当反模式在结构上不可能复现时（如旧函数所在模块已删除且模块结构阻止重建，
+#   或 CI linter 规则永久禁止相关模式）。
 class TestRegressionGuards:
     """静态分析守卫：确保已消除的反模式不被重新引入。"""
 
@@ -716,6 +733,15 @@ class TestRegressionGuards:
 # G. RFC-004 回归守卫：方案 A-G 的架构不变量
 # ============================================================
 
+# ARCHITECTURE_TRIPWIRE: RFC-004 方案 A-G 架构不变量回归守卫
+# 不可替代原因: 多数检查验证"源码必须包含/不包含特定模式"（如 to_lightning_params 调用、
+#   val_ 前缀字段、route_config.get("accelerator") 禁用），这些是源码级契约，
+#   行为测试只能验证结果正确性，无法验证实现路径是否合规。
+#   注：本类中部分测试（如 test_plan_a_get_device_memory_handles_missing_attrs、
+#   test_plan_e_trainer_defaults_are_best_practice、test_plan_f_release_resources_clears_large_objects）
+#   使用行为/反射验证，属 A/B 类，无需此注释。
+# 删除条件: 当契约由 linter 规则或类型系统强制执行时（如 mypy plugin 禁止直接访问
+#   route_config 内部字段，或 CI 检查 val_ 前缀命名规范）。
 class TestRFC004RegressionGuards:
     """RFC-004 方案 A-G 的回归守卫。
 
@@ -945,6 +971,13 @@ from senseframe.engine.runner.pipeline import Pipeline
 # H. P0 协议栈地基加固回归守卫
 # ============================================================
 
+# ARCHITECTURE_TRIPWIRE: P0 协议栈地基加固回归守卫
+# 不可替代原因: test_sp_tell_no_private_access 验证"源码中不存在对 ExplorationTracker
+#   私有字段的直接访问"，这是否定属性，行为测试无法区分"通过公共 API 访问"和"直接访问私有字段"。
+#   注：本类中 test_field_fill_stage_complete / test_stage_train_writes_complete /
+#   test_hpo_trial_result_renamed 使用反射/导入验证，属 A/B 类，无需此注释。
+# 删除条件: 当 ExplorationTracker 内部字段通过 __slots__ 或名称改写（name mangling）
+#   真正私有化，使直接访问在运行时即报错。
 class TestP0ProtocolFoundationGuards:
     """P0 协议栈地基加固的回归守卫。
 

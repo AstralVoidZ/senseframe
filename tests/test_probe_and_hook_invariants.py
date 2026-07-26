@@ -82,8 +82,8 @@ class TestHookOrderInvariance:
 
         # 模拟 on_validation_epoch_end 读取（不重置）
         # 此时 steps=3, loss=3.6 → train_loss = 1.2
-        if module._current_epoch_steps > 0:
-            train_loss = round(module._current_epoch_loss / module._current_epoch_steps, 6)
+        if module.current_epoch_steps > 0:
+            train_loss = round(module.current_epoch_loss / module.current_epoch_steps, 6)
         else:
             train_loss = None
         assert train_loss == 1.2, f"on_val_end 应从累积器算出正确 train_loss（1.2），实际: {train_loss}"
@@ -91,9 +91,9 @@ class TestHookOrderInvariance:
         # on_val_end 不重置累积器（关键不变量）
         # 模拟 on_train_epoch_end 也不重置（关键不变量）
         # 累积器值应保持不变
-        assert module._current_epoch_steps == 3, \
+        assert module.current_epoch_steps == 3, \
             "on_val_end / on_train_end 都不应重置 steps"
-        assert module._current_epoch_loss == 3.6, \
+        assert module.current_epoch_loss == 3.6, \
             "on_val_end / on_train_end 都不应重置 loss"
 
     def test_on_train_epoch_start_resets_accumulator(self):
@@ -107,7 +107,7 @@ class TestHookOrderInvariance:
         # mock trainer（on_train_epoch_start 需要 self.trainer.sanity_checking）
         class _MockTrainer:
             sanity_checking = False
-        module._trainer = _MockTrainer()
+        module.trainer = _MockTrainer()
 
         module.on_train_epoch_start()
 
@@ -124,19 +124,24 @@ class TestHookOrderInvariance:
 
         class _MockTrainer:
             sanity_checking = True
-        module._trainer = _MockTrainer()
+        module.trainer = _MockTrainer()
 
         module.on_train_epoch_start()
 
-        assert module._current_epoch_loss == 99.0, \
+        assert module.current_epoch_loss == 99.0, \
             "sanity_check 阶段不应重置累积器"
-        assert module._current_epoch_steps == 99
+        assert module.current_epoch_steps == 99
 
 
 # ============================================================
 # 3. stage_train 不调用 set_seed（RNG 自然流转，子进程隔离后不需要）
 # ============================================================
 
+# ARCHITECTURE_TRIPWIRE: stage_train 不调用 set_seed（RNG 自然流转契约）
+# 不可替代原因: "函数体不包含 set_seed 调用"是否定属性，行为测试只能验证 RNG 状态结果，
+#   无法确认 stage_train 入口是否调用了 set_seed（可能被其他 set_seed 掩盖）。
+# 删除条件: 当 RNG 管理由框架统一控制（如 Lightning seed_everything 全局接管），
+#   stage_train 无法独立调用 set_seed。
 class TestStageTrainNoSetSeed:
     """stage_train 入口不应调用 set_seed。
 
@@ -163,6 +168,12 @@ class TestStageTrainNoSetSeed:
 # 4. stage_probe_vram 子进程隔离契约
 # ============================================================
 
+# ARCHITECTURE_TRIPWIRE: stage_probe_vram 子进程隔离契约
+# 不可替代原因: "函数体不包含直接 CUDA 计算调用"是否定属性，行为测试无法区分
+#   "主进程执行了 CUDA 计算"和"子进程执行了 CUDA 计算"（结果相同）；
+#   必须检查源码确认 CUDA 操作全部委托给 _run_probe_in_subprocess。
+# 删除条件: 当子进程隔离由框架层强制保证（如 stage_probe_vram 变为纯调度器，
+#   类型系统禁止在主进程中引用 CUDA API）。
 class TestProbeSubprocessIsolation:
     """stage_probe_vram 应通过子进程隔离 probe，主进程不执行 CUDA 计算。
 

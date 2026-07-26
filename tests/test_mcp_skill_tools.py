@@ -314,7 +314,7 @@ class TestSkillRemove:
         derived_skill = lib.get("derived")
         assert derived_skill is not None
         derived_skill.depends_on = ["base"]
-        lib._skills["derived"] = derived_skill
+        lib.update(derived_skill)
 
         with pytest.raises(ToolError) as exc_info:
             await senseframe_skill_remove(name="base", force=False)
@@ -333,7 +333,7 @@ class TestSkillRemove:
         derived = lib.get("derived")
         assert derived is not None
         derived.depends_on = ["base"]
-        lib._skills["derived"] = derived
+        lib.update(derived)
 
         result = await senseframe_skill_remove(name="base", force=True)
         assert result.removed is True

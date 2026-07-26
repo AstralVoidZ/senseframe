@@ -697,12 +697,17 @@ class Pipeline:
         _logger.info("Restored stage outputs from checkpoint")
 
     @classmethod
-    def resume(cls, output_dir, pipeline_run=None) -> Tuple["Pipeline", List[str]]:
+    def resume(cls, output_dir, pipeline_run=None) -> Tuple["Pipeline", List[str], Optional[Path]]:
         """P1：从 output_dir 恢复 pipeline。
 
-        读取 pipeline_checkpoint.json，返回默认 pipeline 与已完成的 stage 名列表。
-        调用方可据此构造 PipelineContext 并设置 completed_stages +
-        stage_checkpoint_path 以跳过已完成 stage。
+        读取 pipeline_checkpoint.json，返回默认 pipeline、已完成的 stage 名列表
+        和 checkpoint 文件路径。调用方据此构造 PipelineContext 并设置：
+        - ctx.completed_stages = completed_stages
+        - ctx.stage_checkpoint_path = checkpoint_path
+
+        两者缺一不可：completed_stages 控制跳过哪些 stage，
+        stage_checkpoint_path 让 _restore_stage_outputs 从 checkpoint
+        恢复被跳过 stage 的可序列化产出（report/route_config/task_spec 等）。
 
         P1.2：支持传入 PipelineRun 实例，由 PipelineRun.phase 和
         PipelineRun.stages 状态驱动 completed_stages 恢复，实现 OP-3
@@ -713,7 +718,10 @@ class Pipeline:
             pipeline_run: PipelineRun 实例（OP 编排器提供），None 时走 JSON checkpoint
 
         Returns:
-            (pipeline, completed_stages): 默认 pipeline 和已完成 stage 名列表
+            (pipeline, completed_stages, checkpoint_path):
+            - pipeline: 默认 pipeline
+            - completed_stages: 已完成 stage 名列表（已过滤不可序列化 stage）
+            - checkpoint_path: pipeline_checkpoint.json 路径（pipeline_run 模式为 None）
 
         Raises:
             FileNotFoundError: 若 checkpoint 不存在且 pipeline_run 为 None
@@ -726,7 +734,7 @@ class Pipeline:
                 s.name for s in pipeline_run.stages
                 if s.phase == "succeeded"
             ]
-            return pipeline, completed
+            return pipeline, completed, None
 
         # 向后兼容：从 JSON checkpoint 恢复
         output_dir = Path(output_dir)
@@ -805,7 +813,7 @@ class Pipeline:
                 _non_serializable_in_completed, completed,
             )
 
-        return pipeline, completed
+        return pipeline, completed, ckpt_path
 
 
 def run_pipeline(

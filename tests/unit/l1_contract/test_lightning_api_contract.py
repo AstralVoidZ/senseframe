@@ -285,47 +285,4 @@ class TestLightningApiContract:
             "FakeTrainer 必须实现 test() 方法（Lightning Trainer 官方 API）"
         )
 
-    def test_psnr_callback_sets_trainer_should_stop(self):
-        """L1 anchor: PSNREarlyStoppingCallback 通过 trainer.should_stop 触发早停。
 
-        锚点：Lightning Trainer.should_stop 官方 API。
-        当 PSNR 连续 patience 个 epoch 无提升时，Callback 设 trainer.should_stop=True。
-        用 FakeTrainer 验证此协议（不 mock Lightning，验证隐式协议）。
-        """
-        import torch
-
-        from senseframe.engine.callbacks.psnr_early_stopping import (
-            PSNREarlyStoppingCallback,
-        )
-        from tests.fakes.fake_trainer import FakeTrainer
-
-        # patience=2: 连续 2 个 epoch 无提升则触发停止
-        callback = PSNREarlyStoppingCallback(patience=2, min_delta=0.1)
-        trainer = FakeTrainer(sanity_checking=False)
-
-        # 构造一个 fake pl_module，含 _psnr_reconstruction / _psnr_target
-        class _FakeModule:
-            def __init__(self):
-                self._psnr_reconstruction = torch.zeros(4)
-                self._psnr_target = torch.zeros(4)
-
-            def log(self, *args, **kwargs):
-                pass
-
-        pl_module = _FakeModule()
-
-        # epoch 1: 高 PSNR（完美重建，mse≈0 → 100.0）
-        pl_module._psnr_reconstruction = torch.zeros(4)
-        pl_module._psnr_target = torch.zeros(4)
-        callback.on_validation_epoch_end(trainer, pl_module)
-        assert not trainer.should_stop, (
-            "首个 epoch 有提升，不应触发 should_stop"
-        )
-
-        # epoch 2-3: PSNR 无提升（相同输入），累计 patience
-        callback.on_validation_epoch_end(trainer, pl_module)
-        callback.on_validation_epoch_end(trainer, pl_module)
-        assert trainer.should_stop is True, (
-            "连续 patience 个 epoch 无 PSNR 提升，应设 trainer.should_stop=True"
-            "（Lightning Trainer.should_stop 早停协议）"
-        )

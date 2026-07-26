@@ -294,8 +294,7 @@ def test_sensefi_path_env_in_docs():
     # SKILL.md 或 reference/ 下应提及此 env
     docs_to_check = [
         PROJECT_ROOT / "SKILL.md",
-        PROJECT_ROOT / "reference" / "datasets_and_models.md",
-        PROJECT_ROOT / "reference" / "scene_development.md",
+        PROJECT_ROOT / "reference" / "reference_datasets_models.md",
     ]
     found = False
     for doc_path in docs_to_check:

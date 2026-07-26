@@ -9,25 +9,12 @@ Anchor: bug 编号 I3 + 修复 commit 83a7ce2。
 """
 from __future__ import annotations
 
-import torch
-import torch.nn as nn
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-
-class _DummyDannModel(nn.Module):
-    """模拟 DANN 模型：forward(x_eeg, x_csi, lambda_) -> (logits, disc_loss)。"""
-
-    def __init__(self, num_classes=7):
-        super().__init__()
-        self.fc = nn.Linear(10, num_classes)
-
-    def forward(self, x_eeg, x_csi=None, lambda_=0.0):
-        logits = self.fc(x_eeg)
-        disc_loss = torch.tensor(0.0, requires_grad=True)
-        return logits, disc_loss
+from unit.l4_regression.conftest import _DummyDannModel
 
 
 @pytest.mark.l4_regression

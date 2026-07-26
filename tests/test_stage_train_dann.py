@@ -202,8 +202,6 @@ class TestStageTrainDannBranch:
         专门测试 wrapper 代码（Critical #1 final_eval + Important #2 freeze + Timer 写回）。
         _train_dann_loop 自身逻辑由 test_train_dann_loop_writes_back_ctx_metrics 覆盖。
         """
-        import time
-
         from senseframe.engine.runner.pipeline.stages import train as train_module
         from senseframe.engine.runner.callbacks import FrozenDict
 
@@ -238,19 +236,19 @@ class TestStageTrainDannBranch:
         # 关键：intermediate_values 必须是真实 dict，wrapper 会 FrozenDict(ctx.intermediate_values)
         ctx.intermediate_values = {}
 
-        # mock _train_dann_loop 为最小 no-op：仅设 best_model_score，
-        # sleep 确保 timer.elapsed > 0.01，round(elapsed, 2) 严格正
+        # mock _train_dann_loop 为最小 no-op：仅设 best_model_score
         def _fake_train_dann_loop(ctx, epochs, learning_rate):
             from senseframe.engine.runner.pipeline.stages.train import DannTrainResult
-            time.sleep(0.02)
             return DannTrainResult(
                 best_score=0.5, best_epoch=1,
                 best_val_loss=None, best_val_macro_f1=None,
                 best_state=None,
             )
 
+        # mock perf_counter 使 Timer.elapsed 确定性为正数，避免真实 sleep
         with patch.object(train_module, "_train_dann_loop", side_effect=_fake_train_dann_loop), \
-             patch("pytorch_lightning.Trainer") as mock_trainer_cls:
+             patch("pytorch_lightning.Trainer") as mock_trainer_cls, \
+             patch("senseframe.observability.time.perf_counter", side_effect=[100.0, 100.05]):
             train_module.stage_train(ctx)
             # 仍是 DANN 路径，Lightning Trainer 不应被实例化
             mock_trainer_cls.assert_not_called()

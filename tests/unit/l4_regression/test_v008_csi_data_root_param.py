@@ -14,25 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
-def _make_load_ctx(tmp_path, params=None):
-    """构造 stage_load 测试用 ctx mock。"""
-    ctx = MagicMock()
-    ctx.dry_run = True
-    ctx.config.scene.data_root = str(tmp_path)
-    ctx.config.scene.params = params
-    ctx.config.scene.dataset = "PhysioNet_MI"
-    ctx.config.scene.model_id = "ResNet18"
-    ctx.config.output_dir = str(tmp_path)
-    ctx.config.save_model = True
-    ctx.config.trainer.batch_size = 32
-    ctx.dataset = "PhysioNet_MI"
-    ctx.learning_mode = "supervised"
-    ctx.scene = MagicMock()
-    ctx.scene.load_dataset.return_value = MagicMock(
-        train=None, test=None, val=None, unsupervised=None, supervised_finetune=None)
-    ctx.output = MagicMock()
-    return ctx
+from unit.l4_regression.conftest import _make_load_ctx
 
 
 @pytest.mark.l4_regression

@@ -472,6 +472,15 @@ class ASHASampler:
 
         return trial_id not in kept_ids
 
+    @property
+    def active_rungs(self) -> list:
+        """返回当前有数据的 rung 索引列表。"""
+        return sorted(self._rungs.keys())
+
+    def rung_entry_count(self, rung: int) -> int:
+        """返回指定 rung 中的 entry 数量。"""
+        return len(self._rungs.get(rung, []))
+
     def warm_start(self, source_history: List[Dict[str, Any]]) -> None:
         """P3.2.1 ε4 元学习：no-op（ASHA 采样与 RandomSampler 等价，区别仅在 should_prune）。
 
@@ -522,13 +531,25 @@ class HyperbandSampler:
         # trial_id -> bracket index（确定性分配）
         self._trial_bracket: Dict[str, int] = {}
 
-    def _get_bracket(self, trial_id: str) -> int:
-        """获取 trial 所属的 bracket（基于 trial_id hash 确定性分配）。"""
+    def get_bracket(self, trial_id: str) -> int:
+        """返回 trial 分配的 bracket 索引。"""
         if trial_id not in self._trial_bracket:
             import hashlib
             h = int(hashlib.md5(trial_id.encode()).hexdigest(), 16)
             self._trial_bracket[trial_id] = h % self.n_brackets
         return self._trial_bracket[trial_id]
+
+    # backward compat
+    _get_bracket = get_bracket
+
+    def bracket_rung_entry_count(self, bracket: int, rung: int) -> int:
+        """返回指定 bracket 的指定 rung 中的 entry 数量。"""
+        if bracket not in range(len(self._brackets)):
+            return 0
+        rung_data = self._brackets[bracket]
+        if rung not in rung_data:
+            return 0
+        return len(rung_data[rung])
 
     def sample(self, search_space: SearchSpace, history: List[Dict[str, Any]]) -> Dict[str, Any]:
         """随机采样（与 RandomSampler 相同，Hyperband 的区别仅在 should_prune）。
@@ -689,6 +710,20 @@ class StudyManager:
         if study_id in self._studies:
             self._studies[study_id].status = "stopped"
             self._studies[study_id].completed_at = datetime.now().isoformat()
+
+    def get_tracker(self, study_id: str) -> "ExplorationTracker":
+        """获取指定 study 的 tracker。
+
+        Args:
+            study_id: study 标识符
+
+        Returns:
+            ExplorationTracker 实例
+
+        Raises:
+            KeyError: study_id 不存在
+        """
+        return self._trackers[study_id]
 
     # ---- SP-2: Ask-Tell ----
 

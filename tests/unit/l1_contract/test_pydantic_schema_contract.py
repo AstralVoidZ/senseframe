@@ -144,6 +144,10 @@ class TestPydanticSchemaContract:
 
         source = inspect.getsource(config_module)
 
+        # ARCHITECTURE_TRIPWIRE: engine/config.py 必须使用 pydantic v2 @field_validator，禁止 v1 @validator
+        # 不可替代原因: "源码中不存在 v1 @validator 装饰器"是否定属性，行为测试无法区分
+        #   v1/v2 装饰器（运行时行为可能相同）；必须检查源码文本确认迁移完成。
+        # 删除条件: 当 pydantic v1 兼容层完全移除，v1 @validator 在运行时即报错。
         # pydantic v2 契约：使用 @field_validator 装饰器
         assert "@field_validator" in source, (
             "engine/config.py 必须使用 pydantic v2 的 @field_validator 装饰器"
@@ -172,6 +176,10 @@ class TestPydanticSchemaContract:
 
         source = inspect.getsource(config_module)
 
+        # ARCHITECTURE_TRIPWIRE: engine/config.py 必须使用 pydantic v2 ConfigDict，禁止 v1 class Config
+        # 不可替代原因: "源码中不存在 v1 class Config 模式"是否定属性，行为测试无法区分
+        #   v1/v2 配置方式（运行时行为可能相同）；必须检查源码文本确认迁移完成。
+        # 删除条件: 当 pydantic v1 兼容层完全移除，v1 class Config 在运行时即报错。
         # pydantic v2 契约：使用 ConfigDict
         assert "ConfigDict" in source, (
             "engine/config.py 应使用 pydantic v2 的 ConfigDict 配置模型"

@@ -39,7 +39,9 @@ class FakeSampler:
         """采样下一组参数（返回搜索空间下界）。
 
         Args:
-            search_space: SearchSpace 对象（需有 params 属性，每个 param 有 low 属性）
+            search_space: SearchSpace 对象，支持两种接口：
+                - search_protocol.SearchSpace: parameters: List[ParameterSpec]
+                - scenes.base.SearchSpace: params: Dict[str, Dict]
             history: 历史试验列表
 
         Returns:
@@ -47,10 +49,14 @@ class FakeSampler:
         """
         self.sample_count += 1
         result: Dict[str, Any] = {}
-        # SearchSpace.params 是 Dict[str, ParameterSpec]，ParameterSpec 有 low 属性
-        if hasattr(search_space, "params"):
+        # 审查修复：支持 search_protocol.SearchSpace（parameters: List[ParameterSpec]）
+        # 和 scenes.base.SearchSpace（params: Dict）两种接口
+        if hasattr(search_space, "parameters"):
+            for spec in search_space.parameters:
+                result[spec.name] = getattr(spec, "low", 0)
+        elif hasattr(search_space, "params"):
             for name, spec in search_space.params.items():
-                result[name] = getattr(spec, "low", 0)
+                result[name] = spec.get("low", 0) if isinstance(spec, dict) else getattr(spec, "low", 0)
         return result
 
     def warm_start(self, source_history: List[Dict[str, Any]]) -> None:

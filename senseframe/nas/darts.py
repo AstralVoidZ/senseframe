@@ -214,6 +214,16 @@ class DARTSSampler:
         """解除附着的超网实例（P1.3 新增）。"""
         self._supernet = None
 
+    @property
+    def search_space(self):
+        """返回当前绑定的 SearchSpace（可能为 None）。"""
+        return self._search_space
+
+    @property
+    def supernet(self):
+        """返回当前绑定的 supernet（可能为 None）。"""
+        return self._supernet
+
     # ============================================================
     # 内部方法
     # ============================================================
@@ -674,6 +684,11 @@ class _InfiniteLoader:
             self._iter = iter(self.loader)
             # 递归一次：若新 iter 仍 StopIteration，下次 next() 会触发上面计数+1
             return self.next()
+
+    @property
+    def is_closed(self) -> bool:
+        """返回 loader 是否已关闭。"""
+        return self._iter is None
 
     def close(self) -> None:
         """释放 loader 和 iterator 引用（资源泄露修复）。"""

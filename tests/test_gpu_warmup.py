@@ -24,6 +24,10 @@ from senseframe.engine.runner.pipeline import stage_train
 # 1. _gpu_warmup 已移除
 # ============================================================
 
+# ARCHITECTURE_TRIPWIRE: _gpu_warmup 函数已从 pipeline 中移除
+# 不可替代原因: "模块中不存在某函数"是否定属性，行为测试无法验证"某函数从未被定义过"；
+#   必须通过反射/源码检查确认函数已删除。
+# 删除条件: 当 pipeline 模块结构稳定且 CI linter 禁止引入 _gpu_warmup 命名时。
 class TestGpuWarmupRemoved:
     """_gpu_warmup 函数应已从 pipeline 模块移除。"""
 
@@ -38,6 +42,10 @@ class TestGpuWarmupRemoved:
 # 2. stage_train 不调用 warmup
 # ============================================================
 
+# ARCHITECTURE_TRIPWIRE: stage_train 不调用 _gpu_warmup（子进程隔离后不需要 warmup）
+# 不可替代原因: "函数体不包含 _gpu_warmup 调用"是否定属性，行为测试无法区分
+#   "未调用 warmup"和"调用了 warmup 但无副作用"；必须检查源码文本。
+# 删除条件: 当 _gpu_warmup 函数从代码库中彻底删除且 CI 禁止重新引入时。
 class TestStageTrainNoWarmup:
     """stage_train 不应调用 _gpu_warmup 或包含 warmup 相关逻辑。"""
 
@@ -58,6 +66,11 @@ class TestStageTrainNoWarmup:
 # 3. stage_train 不调用 set_seed（RNG 自然流转）
 # ============================================================
 
+# ARCHITECTURE_TRIPWIRE: stage_train 不调用 set_seed（RNG 自然流转契约）
+# 不可替代原因: "函数体不包含 set_seed 调用"是否定属性，行为测试只能验证 RNG 状态结果，
+#   无法确认 stage_train 入口是否调用了 set_seed（可能被其他 set_seed 掩盖）。
+# 删除条件: 当 RNG 管理由框架统一控制（如 Lightning seed_everything 全局接管），
+#   stage_train 无法独立调用 set_seed。
 class TestStageTrainNoSetSeed:
     """stage_train 入口不应调用 set_seed。
 

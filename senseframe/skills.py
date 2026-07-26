@@ -265,6 +265,12 @@ class SkillLibrary:
         """
         return [skill for skill, _ in self.search_with_scores(query, top_k)]
 
+    def update(self, skill) -> None:
+        """更新已注册技能的属性（如 depends_on）。"""
+        if skill.name not in self._skills:
+            raise KeyError(f"Skill not found: {skill.name}")
+        self._skills[skill.name] = skill
+
     def remove(self, name: str, *, force: bool = False) -> bool:
         """移除技能（RFC-002 阶段 M：检查依赖）。
 

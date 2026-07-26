@@ -17,8 +17,13 @@ import threading
 import time
 from pathlib import Path
 
-import psutil
 import pytest
+
+# 审查修复：psutil 为可选依赖，未安装时优雅跳过而非 ImportError
+psutil = pytest.importorskip("psutil")
+
+# 审查修复：16 次真实训练必须标记 slow，避免默认 CI 执行
+pytestmark = pytest.mark.slow
 
 
 # ============================================================

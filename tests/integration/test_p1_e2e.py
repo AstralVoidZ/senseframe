@@ -21,6 +21,9 @@ import pytest
 pytest.importorskip("torch")
 pytest.importorskip("pytorch_lightning")
 
+# 审查修复：e2e 测试必须标记，避免默认 CI 执行（7 个真实训练测试）
+pytestmark = pytest.mark.e2e
+
 
 # ============================================================
 # ε1 损失搜索 e2e

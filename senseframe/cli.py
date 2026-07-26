@@ -1,5 +1,5 @@
 """
-CLI 接口：15 个子命令，所有输出为结构化 JSON。
+CLI 接口：16 个子命令，所有输出为结构化 JSON。
 
 命令：
 - probe:         探测硬件资源
@@ -9,6 +9,7 @@ CLI 接口：15 个子命令，所有输出为结构化 JSON。
 - paradigms:     列出 SOTA 范式
 - recommend:     根据资源推荐可用模型
 - export:        基于训练产物导出多格式模型
+- compare:       对比两份配置（A/B 实验）
 - predict:       批量推理
 - experiment:    执行声明式实验（YAML → ExperimentConfig → run_pipeline）
 - exploration:   探索状态管理（list/recommend/coverage/map/dashboard 子命令）

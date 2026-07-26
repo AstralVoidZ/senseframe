@@ -330,6 +330,7 @@ All commands emit structured JSON.
 | `recommend` | Recommend models by resource and dataset |
 | `experiment` | Train from a YAML config (`--dry-run` to preflight only) |
 | `export` | Export a model to ONNX / TorchScript / state_dict |
+| `compare` | Compare two configs (A/B experiment) |
 | `predict` | Batch inference from trained artifacts |
 | `exploration` | Exploration state management (list/recommend/coverage/map/dashboard) |
 | `skills` | Skill library management (list/search/show/remove) |

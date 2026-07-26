@@ -94,7 +94,7 @@ async def senseframe_exploration_recommend(
             study = manager.get_study(study_id)
             if study is None:
                 raise KeyError(f"Study '{study_id}' not found")
-            tracker = manager._trackers.get(study_id)  # type: ignore[attr-defined]
+            tracker = manager.get_tracker(study_id)
             if tracker is None:
                 # 理论上不会发生：create_study 时已初始化 tracker
                 raise KeyError(f"Tracker for study '{study_id}' not found")

@@ -54,6 +54,11 @@ class TestProbeWorkerRunnable:
 # 2. _run_probe_in_subprocess 函数结构
 # ============================================================
 
+# ARCHITECTURE_TRIPWIRE: 子进程内部实现契约
+# 守护属性: probe 子进程必须执行 model.eval()/torch.no_grad()/max_memory_allocated 等
+# 不可替代原因: 子进程内部行为无法从外部运行时测试验证（需 GPU + 子进程隔离）
+# 降级说明: 原分类为 B（行为检查），因运行时替代不可行，降级为 C（架构绊线）
+# 删除条件: 若 probe 改为进程内执行（非子进程），可改为运行时测试
 class TestRunProbeInSubprocessStructure:
     """_run_probe_in_subprocess 应正确启动子进程并解析结果。"""
 

@@ -150,6 +150,11 @@ class IntermediateMetricLogger(StageAwareCallback):
         # （Lightning 可能在 prune 后再触发 on_validation_epoch_end，重复检查无意义且可能误判）
         self._pruned_this_session = False
 
+    @property
+    def pruned_this_session(self) -> bool:
+        """返回本次会话是否已触发剪枝。"""
+        return self._pruned_this_session
+
     def on_validation_epoch_end(self, trainer, pl_module):
         # P1-5.20: 异常保护，Callback 异常不应中断训练
         try:

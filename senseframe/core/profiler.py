@@ -368,9 +368,12 @@ class DataProfiler:
         """
         # P1 改进：modality_hint 未显式传入时，从 scene.meta.modality 自动继承。
         # Pipeline 内部 stage_load 已显式传入 modality_hint，此分支主要服务直接调用场景。
+        # 注意：LazyWiFiCSIContainer 的 meta 是方法（需调用），而非属性。
         if modality_hint is None and scene is not None:
             _scene_meta = getattr(scene, "meta", None)
             if _scene_meta is not None:
+                if callable(_scene_meta):
+                    _scene_meta = _scene_meta()
                 modality_hint = getattr(_scene_meta, "modality", None)
         if learning_mode == "self_supervised":
             # P5 P2-3：自监督模式必须从 unsupervised 集采样画像。

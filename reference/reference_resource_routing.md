@@ -1,6 +1,6 @@
 # 资源路由与模型推荐
 
-## 五级路由表
+## 七级路由表
 
 框架自动探测硬件并路由到合适配置：
 
@@ -11,6 +11,8 @@
 | `gpu_entry` | GPU显存<4GB | cuda | 50.0M | ∞ | 64 | 16-mixed | 4 |
 | `gpu_standard` | GPU显存4-8GB | cuda | 100.0M | ∞ | 128 | 16-mixed | 4 |
 | `gpu_high` | GPU显存≥8GB | cuda | ∞ | ∞ | 256 | 16-mixed | 8 |
+| `mps_standard` | Apple Silicon + 统一内存<16GB | mps | 50.0M | 200 | 64 | 16-mixed | 0 |
+| `mps_high` | Apple Silicon + 统一内存≥16GB | mps | 100.0M | 200 | 128 | 16-mixed | 2 |
 
 **max_epochs cap**：`config.trainer.epochs` 与路由表 `max_epochs` 的较小值为实际训练 epochs。`gpu_*` 无上限（使用配置值）。此值同时作为 scheduler 的 `max_epochs` 参数（影响 cosine 的 `T_max` 与 step 的 `step_size`）。
 

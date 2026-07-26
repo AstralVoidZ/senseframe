@@ -14,6 +14,8 @@
 """
 from __future__ import annotations
 
+import importlib
+import inspect
 from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict
@@ -618,10 +620,45 @@ class TestMakeAutoAugmentDataModuleFactory:
 
 
 # ============================================================
-# P3.1.4: grep 实证检查（反假绿）
+# 模块完整性（合并自原 TestGrepEvidence）
 # ============================================================
-class TestGrepEvidence:
-    """grep 实证：源码检查所有 P3.1 实现关键点。"""
+class TestModuleIntegrity:
+    """模块完整性：验证 AutoAugment 模块关键类/函数/常量存在（合并自原 TestGrepEvidence）。"""
+
+    @pytest.mark.parametrize("module_path,attr_name", [
+        # senseframe.autoaugment.search_space
+        ("senseframe.autoaugment.search_space", "AugmentationSearchSpace"),
+        ("senseframe.autoaugment.search_space", "AugmentationParameterSpec"),
+        # senseframe.autoaugment.policy_builder
+        ("senseframe.autoaugment.policy_builder", "AutoAugmentPolicyBuilder"),
+        # senseframe.autoaugment.sampler
+        ("senseframe.autoaugment.sampler", "AutoAugmentSampler"),
+        # senseframe.autoaugment（__init__.py 导出）
+        ("senseframe.autoaugment", "make_autoaugment_datamodule_factory"),
+        ("senseframe.autoaugment", "AugmentationSearchSpace"),
+        ("senseframe.autoaugment", "AutoAugmentPolicyBuilder"),
+        ("senseframe.autoaugment", "AutoAugmentSampler"),
+        # senseframe.engine.datamodule
+        ("senseframe.engine.datamodule", "GenericDataModule"),
+    ])
+    def test_attr_exists(self, module_path, attr_name):
+        mod = importlib.import_module(module_path)
+        assert hasattr(mod, attr_name), f"{module_path}.{attr_name} 不存在"
+
+    @pytest.mark.parametrize("module_path,class_name,method_name", [
+        ("senseframe.autoaugment.search_space", "AugmentationSearchSpace", "to_sp_search_space"),
+        ("senseframe.autoaugment.search_space", "AugmentationSearchSpace", "validate_params"),
+        ("senseframe.autoaugment.search_space", "AugmentationParameterSpec", "to_sp_param"),
+        ("senseframe.autoaugment.policy_builder", "AutoAugmentPolicyBuilder", "build"),
+        ("senseframe.autoaugment.policy_builder", "AutoAugmentPolicyBuilder", "build_eval_transform"),
+        ("senseframe.autoaugment.sampler", "AutoAugmentSampler", "sample"),
+    ])
+    def test_method_exists(self, module_path, class_name, method_name):
+        mod = importlib.import_module(module_path)
+        cls = getattr(mod, class_name)
+        assert hasattr(cls, method_name), f"{module_path}.{class_name}.{method_name} 不存在"
+
+    # --- 值检查 / grep 实证 / 文件存在（保留） ---
 
     def test_search_space_file_exists(self):
         """AugmentationSearchSpace 源码文件存在。"""
@@ -629,76 +666,39 @@ class TestGrepEvidence:
         assert path.exists()
 
     def test_grep_supported_augment_ops(self):
-        """grep 实证：SUPPORTED_AUGMENT_OPS 常量定义。"""
-        path = _source_path("autoaugment/search_space.py")
-        assert _grep_source(path, "SUPPORTED_AUGMENT_OPS")
-        assert _grep_source(path, '"time_jitter"')
-        assert _grep_source(path, '"freq_masking"')
-        assert _grep_source(path, '"noise"')
-        assert _grep_source(path, '"cutout"')
-        assert _grep_source(path, '"none"')
-
-    def test_grep_augmentation_search_space_class(self):
-        """grep 实证：AugmentationSearchSpace 类定义。"""
-        path = _source_path("autoaugment/search_space.py")
-        assert _grep_source(path, "class AugmentationSearchSpace")
-        assert _grep_source(path, "def to_sp_search_space")
-        assert _grep_source(path, "def validate_params")
-
-    def test_grep_augmentation_parameter_spec_class(self):
-        """grep 实证：AugmentationParameterSpec 类定义。"""
-        path = _source_path("autoaugment/search_space.py")
-        assert _grep_source(path, "class AugmentationParameterSpec")
-        assert _grep_source(path, "def to_sp_param")
+        """反射验证：SUPPORTED_AUGMENT_OPS 常量定义。"""
+        from senseframe.autoaugment import search_space as aa_ss_mod
+        assert hasattr(aa_ss_mod, "SUPPORTED_AUGMENT_OPS")
+        assert "time_jitter" in SUPPORTED_AUGMENT_OPS
+        assert "freq_masking" in SUPPORTED_AUGMENT_OPS
+        assert "noise" in SUPPORTED_AUGMENT_OPS
+        assert "cutout" in SUPPORTED_AUGMENT_OPS
+        assert "none" in SUPPORTED_AUGMENT_OPS
 
     def test_grep_policy_builder_file_exists(self):
         """AutoAugmentPolicyBuilder 源码文件存在。"""
         path = _source_path("autoaugment/policy_builder.py")
         assert path.exists()
 
-    def test_grep_policy_builder_class(self):
-        """grep 实证：AutoAugmentPolicyBuilder 类定义。"""
-        path = _source_path("autoaugment/policy_builder.py")
-        assert _grep_source(path, "class AutoAugmentPolicyBuilder")
-        assert _grep_source(path, "def build(")
-        assert _grep_source(path, "def build_eval_transform")
-
     def test_grep_augment_ops_registered(self):
-        """grep 实证：增强原语注册到 _AUGMENT_OPS。"""
-        path = _source_path("autoaugment/policy_builder.py")
-        assert _grep_source(path, "_AUGMENT_OPS")
-        assert _grep_source(path, '"time_jitter": _time_jitter')
-        assert _grep_source(path, '"freq_masking": _freq_masking')
-        assert _grep_source(path, '"noise": _noise')
-        assert _grep_source(path, '"cutout": _cutout')
+        """反射验证：增强原语注册到 _AUGMENT_OPS。"""
+        from senseframe.autoaugment.policy_builder import _AUGMENT_OPS
+        assert isinstance(_AUGMENT_OPS, dict)
+        assert callable(get_augment_op("time_jitter"))
+        assert callable(get_augment_op("freq_masking"))
+        assert callable(get_augment_op("noise"))
+        assert callable(get_augment_op("cutout"))
 
     def test_grep_sampler_file_exists(self):
         """AutoAugmentSampler 源码文件存在。"""
         path = _source_path("autoaugment/sampler.py")
         assert path.exists()
 
-    def test_grep_autoaugment_sampler_class(self):
-        """grep 实证：AutoAugmentSampler 类定义 + SP 注册。"""
+    def test_grep_autoaugment_sampler_name_and_registration(self):
+        """AutoAugmentSampler.name 应为 'autoaugment' + SP 注册 grep 实证。"""
+        assert AutoAugmentSampler.name == "autoaugment"
         path = _source_path("autoaugment/sampler.py")
-        assert _grep_source(path, "class AutoAugmentSampler")
-        assert _grep_source(path, 'name = "autoaugment"')
-        assert _grep_source(path, "def sample(")
-        # SP 注册
         assert _grep_source(path, 'register_sampler("autoaugment", AutoAugmentSampler)')
-
-    def test_grep_init_file_exports(self):
-        """grep 实证：__init__.py 导出 + make_autoaugment_datamodule_factory。"""
-        path = _source_path("autoaugment/__init__.py")
-        assert _grep_source(path, "def make_autoaugment_datamodule_factory")
-        assert _grep_source(path, "from .search_space import")
-        assert _grep_source(path, "from .policy_builder import")
-        assert _grep_source(path, "from .sampler import")
-
-    def test_grep_make_autoaugment_datamodule_factory_returns_generic_datamodule(self):
-        """grep 实证：make_autoaugment_datamodule_factory 返回 GenericDataModule。"""
-        path = _source_path("autoaugment/__init__.py")
-        assert _grep_source(path, "from ..engine.datamodule import GenericDataModule")
-        assert _grep_source(path, "return GenericDataModule(")
 
     def test_grep_autoaugment_registered_in_sp_registry(self):
         """grep 实证：AutoAugmentSampler 在 SP 注册表中（通过 list_samplers 验证）。"""
@@ -711,6 +711,9 @@ class TestGrepEvidence:
         这是 P3.1 零侵入设计的核心：通过 datamodule_factory 注入，无需修改 stage_build。
         拆分背景：原 pipeline.py 拆分为 pipeline/ 包，stage_build 位于 pipeline/stages/build.py。
         """
+        # ARCHITECTURE_TRIPWIRE: stage_build 必须保留 datamodule_factory 分支
+        # 不可替代原因: 深嵌在 stage_build 复杂构造流程中，无法独立单元测试
+        # 删除条件: 若 datamodule_factory 逻辑提取为独立函数，可改为运行时测试
         path = _source_path("engine/runner/pipeline/stages/build.py")
         # datamodule_factory 分支应在 P3.1 之前就存在
         assert _grep_source(path, "datamodule_factory is not None")

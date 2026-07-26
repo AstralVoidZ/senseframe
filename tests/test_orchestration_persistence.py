@@ -16,6 +16,8 @@
 """
 from __future__ import annotations
 
+import importlib
+import inspect
 import json
 from pathlib import Path
 from typing import Any, Dict, List
@@ -538,7 +540,7 @@ class TestOrchestratorPersistence:
     def test_orchestrator_default_no_event_sink(self):
         """默认构造无 event_sink（向后兼容）。"""
         orch = Orchestrator()
-        assert orch._event_sink is None
+        assert orch.event_sink is None
         try:
             pass
         finally:
@@ -867,84 +869,54 @@ class TestK8sOperatorAdapter:
 # P3.4.5: 反假绿 grep 实证测试
 # ============================================================
 class TestGrepEvidenceOpPersistence:
-    """grep 实证：源码检查所有 P3.4 实现关键点（反假绿）。
+    """反射 + grep 实证：源码结构检查所有 P3.4 实现关键点（反假绿）。
 
-    所有 grep 测试必须用真实文件读取 + 字符串匹配，禁止 mock。
+    A 类（存在性）用反射 API；B 类（行为）保留 grep。
     """
 
-    def test_grep_orchestration_store_file_exists(self):
-        """grep 实证：orchestration_store.py 存在。"""
-        path = _source_path("orchestration_store.py")
-        assert path.exists(), f"{path} should exist"
+    @pytest.mark.parametrize("module_path,attr_name", [
+        ("senseframe.orchestration_store", "OrchestrationStore"),
+        ("senseframe.orchestration_store", "OrchestrationStore.save_run"),
+        ("senseframe.orchestration_store", "OrchestrationStore.load_run"),
+        ("senseframe.orchestration_store", "OrchestrationStore.list_runs"),
+        ("senseframe.orchestration_store", "OrchestrationStore.delete_run"),
+        ("senseframe.orchestration_store", "FileOrchestrationStore"),
+        ("senseframe.orchestration", "PipelineRun.from_dict"),
+        ("senseframe.orchestration", "StageStatus.from_dict"),
+        ("senseframe.orchestration", "Orchestrator.recover"),
+        ("senseframe.orchestration", "FileEventSink"),
+        ("senseframe.orchestration", "EventSink"),
+        ("senseframe.orchestration", "EventSink.emit"),
+        ("senseframe.orchestration", "K8sOperatorAdapter.to_cr_manifest"),
+        ("senseframe.orchestration", "K8sOperatorAdapter.from_cr_manifest"),
+    ])
+    def test_attr_exists(self, module_path, attr_name):
+        """反射实证：模块属性存在性（参数化）。"""
+        mod = importlib.import_module(module_path)
+        parts = attr_name.split(".")
+        obj = mod
+        for part in parts[:-1]:
+            assert hasattr(obj, part), f"{module_path}.{part} 不存在"
+            obj = getattr(obj, part)
+        assert hasattr(obj, parts[-1]), f"{module_path}.{attr_name} 不存在"
 
-    def test_grep_orchestration_store_protocol(self):
-        """grep 实证：orchestration_store.py 含 class OrchestrationStore（Protocol）。"""
-        path = _source_path("orchestration_store.py")
-        assert _grep_source(path, "class OrchestrationStore(Protocol)")
-        # Protocol 四元接口
-        assert _grep_source(path, "def save_run(")
-        assert _grep_source(path, "def load_run(")
-        assert _grep_source(path, "def list_runs(")
-        assert _grep_source(path, "def delete_run(")
+    def test_orchestrator_init_store_param(self):
+        """反射实证：Orchestrator.__init__ 含 store 和 event_sink 参数。"""
+        sig = inspect.signature(Orchestrator.__init__)
+        assert "store" in sig.parameters
+        assert "event_sink" in sig.parameters
 
-    def test_grep_file_orchestration_store_class(self):
-        """grep 实证：orchestration_store.py 含 class FileOrchestrationStore。"""
-        path = _source_path("orchestration_store.py")
-        assert _grep_source(path, "class FileOrchestrationStore")
+    def test_k8s_operator_adapter_class(self):
+        """反射实证：K8sOperatorAdapter 类存在且含 K8s CRD 常量。"""
+        assert inspect.isclass(K8sOperatorAdapter)
+        assert hasattr(K8sOperatorAdapter, "API_VERSION")
+        assert K8sOperatorAdapter.API_VERSION == "senseframe.io/v1"
+        assert hasattr(K8sOperatorAdapter, "KIND")
+        assert K8sOperatorAdapter.KIND == "PipelineRun"
 
-    def test_grep_pipeline_run_from_dict(self):
-        """grep 实证：orchestration.py 含 PipelineRun.from_dict 方法定义。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "def from_dict(cls, d: Dict[str, Any]) -> \"PipelineRun\"")
-        # 递归调用 StageStatus.from_dict
-        assert _grep_source(path, "StageStatus.from_dict(s) for s in stages_data")
-
-    def test_grep_stage_status_from_dict(self):
-        """grep 实证：orchestration.py 含 StageStatus.from_dict 方法定义。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "def from_dict(cls, d: Dict[str, Any]) -> \"StageStatus\"")
-
-    def test_grep_orchestrator_init_store_param(self):
-        """grep 实证：Orchestrator.__init__ 含 store 参数。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "def __init__(self, store: Optional[\"OrchestrationStore\"] = None")
-        assert _grep_source(path, "event_sink: Optional[EventSink] = None")
-
-    def test_grep_orchestrator_recover_method(self):
-        """grep 实证：orchestration.py 含 def recover 方法定义。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "def recover(self) -> List[str]:")
-
-    def test_grep_file_event_sink_class(self):
-        """grep 实证：orchestration.py 含 class FileEventSink。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "class FileEventSink")
-
-    def test_grep_event_sink_protocol(self):
-        """grep 实证：orchestration.py 含 class EventSink（Protocol）。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "class EventSink(Protocol)")
-        assert _grep_source(path, "def emit(self, event: CloudEvent) -> None: ...")
-
-    def test_grep_k8s_operator_adapter_class(self):
-        """grep 实证：orchestration.py 含 class K8sOperatorAdapter。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "class K8sOperatorAdapter")
-        # K8s CRD 常量
-        assert _grep_source(path, "API_VERSION = \"senseframe.io/v1\"")
-        assert _grep_source(path, "KIND = \"PipelineRun\"")
-
-    def test_grep_k8s_to_cr_manifest(self):
-        """grep 实证：orchestration.py 含 def to_cr_manifest / from_cr_manifest。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "def to_cr_manifest(self, run: PipelineRun)")
-        assert _grep_source(path, "def from_cr_manifest(self, manifest: Dict[str, Any])")
-
-    def test_grep_orchestrator_event_sink_emit(self):
-        """grep 实证：_emit_event 含 self._event_sink 引用。"""
-        path = _source_path("orchestration.py")
-        assert _grep_source(path, "self._event_sink is not None")
-        assert _grep_source(path, "self._event_sink.emit(event)")
+    # test_grep_orchestrator_event_sink_emit 已删除：
+    # 行为由 TestOrchestratorEventSinkIntegration 运行时测试覆盖
+    # （test_orchestrator_with_event_sink_emits_to_sink / test_orchestrator_without_event_sink_no_error）
 
 
 # ============================================================

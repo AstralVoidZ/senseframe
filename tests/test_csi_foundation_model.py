@@ -305,7 +305,8 @@ class TestPretrainMAE:
         model.eval()
         with torch.no_grad():
             torch.manual_seed(42)
-            loss = model._mae_forward_loss(x, mask_ratio=0.5)
+            recon, target, mask = model.mae_reconstruct(x, 0.5)
+            loss = ((recon - target) ** 2).mean()
         assert torch.isfinite(loss), f"loss not finite: {loss}"
 
     def test_pretrain_loss_decreases(self):
@@ -344,7 +345,8 @@ class TestPretrainMAE:
         model.eval()
         with torch.no_grad():
             torch.manual_seed(42)
-            loss = model._mae_forward_loss(x, mask_ratio=0.75)
+            recon, target, mask = model.mae_reconstruct(x, 0.75)
+            loss = ((recon - target) ** 2).mean()
         assert torch.isfinite(loss), f"loss not finite: {loss}"
 
     def test_pretrain_with_dataloader(self):
@@ -663,7 +665,8 @@ class TestReplacePatchEmbedder:
         x_eeg = torch.randn(4, *self.EEG_SHAPE)
         with torch.no_grad():
             torch.manual_seed(42)
-            loss = model._mae_forward_loss(x_eeg, mask_ratio=0.5)
+            recon, target, mask = model.mae_reconstruct(x_eeg, 0.5)
+            loss = ((recon - target) ** 2).mean()
         assert torch.isfinite(loss), f"MAE loss 应为有限值, 实际 {loss}"
         assert loss.item() > 0, "MAE loss 应为正"
 

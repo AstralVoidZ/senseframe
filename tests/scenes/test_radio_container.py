@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import importlib
 import inspect
 from dataclasses import fields
 from pathlib import Path
@@ -28,6 +29,11 @@ from senseframe.scenes import (
     SceneContainer, SceneMeta,
 )
 from senseframe.scenes.base import DatasetBundle
+from senseframe.scenes.radio import container as radio_container_mod
+from senseframe.scenes.radio import models as radio_models_mod
+from senseframe.scenes.radio import datasets as radio_datasets_mod
+from senseframe.scenes.radio import transforms as radio_transforms_mod
+from senseframe.scenes.radio.container import RadioContainer
 
 
 # ============================================================
@@ -277,67 +283,39 @@ class TestRadioDatasetBundleFilling:
 # grep 实证（防止代码漂移）
 # ============================================================
 class TestRadioGrepEvidence:
-    """Radio 场景源码 grep 实证。"""
+    """Radio 场景源码反射实证。"""
 
-    def test_radio_container_exists(self):
-        """radio/container.py 应存在。"""
-        path = _source_path("scenes/radio/container.py")
-        assert path.exists(), f"radio container 不存在: {path}"
-
-    def test_radio_container_class_defined(self):
-        """RadioContainer 类应在 container.py 中定义。"""
-        path = _source_path("scenes/radio/container.py")
-        assert _grep_source(path, "class RadioContainer"), \
-            "radio/container.py 未定义 RadioContainer 类"
-
-    def test_radio_models_defined(self):
-        """radio/models.py 应定义 CNN1D / ResNet1D / Transformer1D。"""
-        path = _source_path("scenes/radio/models.py")
-        assert _grep_source(path, "class CNN1D")
-        assert _grep_source(path, "class ResNet1D")
-        assert _grep_source(path, "class Transformer1D")
+    @pytest.mark.parametrize("desc,check", [
+        ("radio.container module", lambda: importlib.import_module("senseframe.scenes.radio.container") is not None),
+        ("RadioContainer class", lambda: hasattr(radio_container_mod, "RadioContainer")),
+        ("CNN1D", lambda: hasattr(radio_models_mod, "CNN1D")),
+        ("ResNet1D", lambda: hasattr(radio_models_mod, "ResNet1D")),
+        ("Transformer1D", lambda: hasattr(radio_models_mod, "Transformer1D")),
+        ("LazyRadioContainer", lambda: hasattr(importlib.import_module("senseframe.scenes._radio_lazy"), "LazyRadioContainer")),
+        ("TRANSFORM_REGISTRY", lambda: hasattr(importlib.import_module("senseframe.scenes.radio.transforms"), "TRANSFORM_REGISTRY")),
+        ("register function", lambda: callable(getattr(importlib.import_module("senseframe.scenes.radio._register"), "register", None))),
+        ("RadioContainer.meta", lambda: callable(getattr(RadioContainer, "meta", None))),
+        ("RadioContainer.load_dataset", lambda: callable(getattr(RadioContainer, "load_dataset", None))),
+        ("RadioContainer.build_model_for_dataset", lambda: callable(getattr(RadioContainer, "build_model_for_dataset", None))),
+        ("RadioContainer.get_dataset_info", lambda: callable(getattr(RadioContainer, "get_dataset_info", None))),
+    ])
+    def test_module_integrity(self, desc, check):
+        """模块 / 类 / 函数存在性检查。"""
+        assert check(), f"Radio 场景缺少: {desc}"
 
     def test_radio_datasets_defined(self):
         """radio/datasets.py 应定义 DATASET_INFO 含 RadioML2016A 和 RadioML2018。"""
-        path = _source_path("scenes/radio/datasets.py")
-        assert _grep_source(path, "RadioML2016A")
-        assert _grep_source(path, "RadioML2018")
-
-    def test_radio_lazy_proxy_exists(self):
-        """_radio_lazy.py 应存在并定义 LazyRadioContainer。"""
-        path = _source_path("scenes/_radio_lazy.py")
-        assert path.exists()
-        assert _grep_source(path, "class LazyRadioContainer")
+        assert hasattr(radio_datasets_mod, 'DATASET_INFO')
+        assert "RadioML2016A" in radio_datasets_mod.DATASET_INFO
+        assert "RadioML2018" in radio_datasets_mod.DATASET_INFO
 
     def test_radio_registered_in_scenes_init(self):
         """scenes/__init__.py 应通过 declare_lazy_scene 注册 radio。"""
         path = _source_path("scenes/__init__.py")
-        assert _grep_source(path, 'declare_lazy_scene("radio"')
+        assert _grep_source(path, 'declare_lazy_scene("radio"')  # ARCHITECTURE_TRIPWIRE: 延迟注册是架构契约，反射无法验证注册调用是否写在源码中
 
     def test_radio_meta_modality_iq(self):
-        """scenes/__init__.py 中 radio 的 modality 应为 'iq'。"""
-        path = _source_path("scenes/__init__.py")
-        content = path.read_text(encoding="utf-8")
-        # 简化：检查 radio 块内含 modality="iq"
-        assert 'modality="iq"' in content or "modality='iq'" in content, \
-            "scenes/__init__.py 未设置 radio 的 modality='iq'"
-
-    def test_radio_transforms_module_exists(self):
-        """radio/transforms.py 应存在。"""
-        path = _source_path("scenes/radio/transforms.py")
-        assert path.exists()
-        assert _grep_source(path, "TRANSFORM_REGISTRY")
-
-    def test_radio_register_module_exists(self):
-        """radio/_register.py 应存在并定义 register 函数。"""
-        path = _source_path("scenes/radio/_register.py")
-        assert path.exists()
-        assert _grep_source(path, "def register()")
-
-    def test_radio_container_4_abstract_methods(self):
-        """RadioContainer 应实现 4 个抽象方法。"""
-        path = _source_path("scenes/radio/container.py")
-        for method in ("def meta(", "def load_dataset(",
-                       "def build_model_for_dataset(", "def get_dataset_info("):
-            assert _grep_source(path, method), \
-                f"radio/container.py 缺少抽象方法: {method}"
+        """radio 的 modality 应为 'iq'。"""
+        meta = list_scenes()["radio"]
+        assert meta.modality == "iq", \
+            "radio 场景 modality 应为 'iq'"

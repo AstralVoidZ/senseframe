@@ -503,6 +503,21 @@ class Orchestrator:
         # P3.4.3: CloudEvent 外部 sink（None 时不写外部日志，向后兼容）
         self._event_sink: Optional[EventSink] = event_sink
 
+    @property
+    def is_shutdown(self) -> bool:
+        """返回 Orchestrator 是否已 shutdown。"""
+        return self._executor is None
+
+    @property
+    def store(self):
+        """返回 OrchestrationStore（可能为 None）。"""
+        return self._store
+
+    @property
+    def event_sink(self):
+        """返回 EventSink（可能为 None）。"""
+        return self._event_sink
+
     def _persist_run(self, run: PipelineRun) -> None:
         """持久化单个 run 到 store（P3.4.2 内部辅助）。
 
@@ -913,7 +928,7 @@ class Orchestrator:
             raise KeyError(f"PipelineRun '{run_id}' not found")
         return run
 
-    def _emit_event(self, event_type: str, run_id: str, data: Dict[str, Any]) -> None:
+    def emit_event(self, event_type: str, run_id: str, data: Dict[str, Any]) -> None:
         """发射 CloudEvent（OP-5 + P3.4.3 外部 sink）。"""
         event = make_event(event_type, run_id, data)
         # 通知进程内订阅者（原有逻辑）
@@ -939,6 +954,9 @@ class Orchestrator:
                     "event sink emit failed (event_type=%s, run_id=%s): %s",
                     event_type, run_id, e,
                 )
+
+    # backward compat
+    _emit_event = emit_event
 
     # ============================================================
     # P2.11: 异步执行（reconcile 真循环 + wait_for_completion）

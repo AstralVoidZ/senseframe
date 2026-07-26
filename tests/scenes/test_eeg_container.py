@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import importlib
 import inspect
 from dataclasses import fields
 from pathlib import Path
@@ -28,6 +29,11 @@ from senseframe.scenes import (
     SceneContainer, SceneMeta,
 )
 from senseframe.scenes.base import DatasetBundle
+from senseframe.scenes.eeg import container as eeg_container_mod
+from senseframe.scenes.eeg import models as eeg_models_mod
+from senseframe.scenes.eeg import datasets as eeg_datasets_mod
+from senseframe.scenes.eeg import transforms as eeg_transforms_mod
+from senseframe.scenes.eeg.container import EEGContainer
 
 
 # ============================================================
@@ -375,81 +381,54 @@ class TestEEGDatasetBundleFilling:
 # grep 实证（防止代码漂移）
 # ============================================================
 class TestEEGGrepEvidence:
-    """EEG 场景源码 grep 实证。"""
+    """EEG 场景源码反射实证。"""
 
-    def test_eeg_container_exists(self):
-        path = _source_path("scenes/eeg/container.py")
-        assert path.exists()
-
-    def test_eeg_container_class_defined(self):
-        path = _source_path("scenes/eeg/container.py")
-        assert _grep_source(path, "class EEGContainer")
-
-    def test_eeg_models_defined(self):
-        path = _source_path("scenes/eeg/models.py")
-        assert _grep_source(path, "class EEGNet")
-        assert _grep_source(path, "class DeepConvNet")
-        assert _grep_source(path, "class TransformerEEG")
-
-    def test_eeg_self_supervised_model_defined(self):
-        """EEG 模型文件应含自监督模型 EEGLowEncoder。"""
-        path = _source_path("scenes/eeg/models.py")
-        assert _grep_source(path, "class EEGLowEncoder"), \
-            "eeg/models.py 未定义自监督模型 EEGLowEncoder"
-        assert _grep_source(path, "SELFSUP_MODEL_REGISTRY"), \
-            "eeg/models.py 未定义 SELFSUP_MODEL_REGISTRY"
+    @pytest.mark.parametrize("desc,check", [
+        ("eeg.container module", lambda: importlib.import_module("senseframe.scenes.eeg.container") is not None),
+        ("EEGContainer class", lambda: hasattr(eeg_container_mod, "EEGContainer")),
+        ("EEGNet", lambda: hasattr(eeg_models_mod, "EEGNet")),
+        ("DeepConvNet", lambda: hasattr(eeg_models_mod, "DeepConvNet")),
+        ("TransformerEEG", lambda: hasattr(eeg_models_mod, "TransformerEEG")),
+        ("EEGLowEncoder", lambda: hasattr(eeg_models_mod, "EEGLowEncoder")),
+        ("SELFSUP_MODEL_REGISTRY", lambda: hasattr(eeg_models_mod, "SELFSUP_MODEL_REGISTRY")),
+        ("LazyEEGContainer", lambda: hasattr(importlib.import_module("senseframe.scenes._eeg_lazy"), "LazyEEGContainer")),
+        ("TRANSFORM_REGISTRY", lambda: hasattr(importlib.import_module("senseframe.scenes.eeg.transforms"), "TRANSFORM_REGISTRY")),
+        ("register function", lambda: callable(getattr(importlib.import_module("senseframe.scenes.eeg._register"), "register", None))),
+        ("EEGContainer.meta", lambda: callable(getattr(EEGContainer, "meta", None))),
+        ("EEGContainer.load_dataset", lambda: callable(getattr(EEGContainer, "load_dataset", None))),
+        ("EEGContainer.build_model_for_dataset", lambda: callable(getattr(EEGContainer, "build_model_for_dataset", None))),
+        ("EEGContainer.get_dataset_info", lambda: callable(getattr(EEGContainer, "get_dataset_info", None))),
+    ])
+    def test_module_integrity(self, desc, check):
+        """模块 / 类 / 函数存在性检查。"""
+        assert check(), f"EEG 场景缺少: {desc}"
 
     def test_eeg_datasets_defined(self):
-        path = _source_path("scenes/eeg/datasets.py")
-        assert _grep_source(path, "BCI_Competition_IV_2a")
-        assert _grep_source(path, "PhysioNet_MI")
-
-    def test_eeg_lazy_proxy_exists(self):
-        path = _source_path("scenes/_eeg_lazy.py")
-        assert path.exists()
-        assert _grep_source(path, "class LazyEEGContainer")
+        assert hasattr(eeg_datasets_mod, 'DATASET_INFO')
+        assert "BCI_Competition_IV_2a" in eeg_datasets_mod.DATASET_INFO
+        assert "PhysioNet_MI" in eeg_datasets_mod.DATASET_INFO
 
     def test_eeg_registered_in_scenes_init(self):
         path = _source_path("scenes/__init__.py")
-        assert _grep_source(path, 'declare_lazy_scene("eeg"')
+        assert _grep_source(path, 'declare_lazy_scene("eeg"')  # ARCHITECTURE_TRIPWIRE: 延迟注册是架构契约，反射无法验证注册调用是否写在源码中
 
     def test_eeg_meta_modality_eeg(self):
-        path = _source_path("scenes/__init__.py")
-        content = path.read_text(encoding="utf-8")
-        assert 'modality="eeg"' in content or "modality='eeg'" in content, \
-            "scenes/__init__.py 未设置 eeg 的 modality='eeg'"
+        meta = list_scenes()["eeg"]
+        assert meta.modality == "eeg", \
+            "eeg 场景 modality 应为 'eeg'"
 
     def test_eeg_meta_self_supervised_mode(self):
-        """scenes/__init__.py 中 eeg 应声明 supported_learning_modes 含 self_supervised。"""
-        path = _source_path("scenes/__init__.py")
-        content = path.read_text(encoding="utf-8")
-        # 简化：检查 eeg 块附近含 self_supervised
-        assert "self_supervised" in content
-
-    def test_eeg_transforms_module_exists(self):
-        path = _source_path("scenes/eeg/transforms.py")
-        assert path.exists()
-        assert _grep_source(path, "TRANSFORM_REGISTRY")
-
-    def test_eeg_register_module_exists(self):
-        path = _source_path("scenes/eeg/_register.py")
-        assert path.exists()
-        assert _grep_source(path, "def register()")
-
-    def test_eeg_container_4_abstract_methods(self):
-        path = _source_path("scenes/eeg/container.py")
-        for method in ("def meta(", "def load_dataset(",
-                       "def build_model_for_dataset(", "def get_dataset_info("):
-            assert _grep_source(path, method), \
-                f"eeg/container.py 缺少抽象方法: {method}"
+        """eeg 应声明 supported_learning_modes 含 self_supervised。"""
+        meta = list_scenes()["eeg"]
+        assert "self_supervised" in meta.supported_learning_modes
 
     def test_eeg_container_handles_self_supervised(self):
-        """eeg/container.py 应处理 self_supervised 模式。"""
-        path = _source_path("scenes/eeg/container.py")
-        assert _grep_source(path, "self_supervised"), \
-            "eeg/container.py 未处理 self_supervised 模式"
+        """EEGContainer 应处理 self_supervised 模式。"""
+        src = inspect.getsource(EEGContainer)
+        assert "self_supervised" in src, \
+            "EEGContainer 未处理 self_supervised 模式"
 
     def test_eeg_datasets_supports_self_supervised(self):
         """eeg/datasets.py 应支持 self_supervised 模式加载。"""
-        path = _source_path("scenes/eeg/datasets.py")
-        assert _grep_source(path, "self_supervised")
+        src = inspect.getsource(eeg_datasets_mod)
+        assert "self_supervised" in src

@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+import importlib
+import inspect
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -93,10 +95,10 @@ class TestSamplerWarmStart:
     """Sampler Protocol warm_start 扩展测试（P3.2.1）。"""
 
     def test_sampler_protocol_has_warm_start_method(self):
-        """Sampler Protocol 含 warm_start 方法定义。"""
-        path = _source_path("search_protocol.py")
-        assert _grep_source(path, "def warm_start(")
-        assert _grep_source(path, "source_history: List[Dict[str, Any]]")
+        """Sampler Protocol 含 warm_start 方法定义（反射验证）。"""
+        assert hasattr(Sampler, "warm_start")
+        sig = inspect.signature(Sampler.warm_start)
+        assert "source_history" in sig.parameters
 
     def test_random_sampler_still_satisfies_protocol(self):
         """RandomSampler 仍通过 isinstance(x, Sampler) 检查（向后兼容）。
@@ -362,7 +364,7 @@ class TestMetaLearner:
 
         assert count == 2
         # 验证 tracker.history 已被注入
-        tracker = sm._trackers[study_id]
+        tracker = sm.get_tracker(study_id)
         assert len(tracker.history) == 2
         assert tracker.history[0]["trial_id"] == "src_1"
         assert tracker.history[1]["trial_id"] == "src_2"
@@ -397,7 +399,7 @@ class TestMetaLearner:
 
         # 仅 src_1 被注入
         assert count == 1
-        tracker = sm._trackers[study_id]
+        tracker = sm.get_tracker(study_id)
         assert len(tracker.history) == 1
         assert tracker.history[0]["trial_id"] == "src_1"
 
@@ -435,7 +437,7 @@ class TestMetaLearner:
 
         assert count == 0
         # tracker.history 未被修改
-        tracker = sm._trackers[study_id]
+        tracker = sm.get_tracker(study_id)
         assert len(tracker.history) == 0
 
     def test_warm_start_nonexistent_study_raises(self, tmp_path):
@@ -482,7 +484,7 @@ class TestMetaLearner:
 
         # 仅 src_1（value=0.85 > 0.7）被注入
         assert count == 1
-        tracker = sm._trackers[study_id]
+        tracker = sm.get_tracker(study_id)
         assert tracker.history[0]["trial_id"] == "src_1"
 
     def test_warm_start_custom_threshold(self, tmp_path):
@@ -511,7 +513,7 @@ class TestMetaLearner:
 
         # 仅 src_2（val_accuracy=0.85 > 0.8）被注入
         assert count == 1
-        tracker = sm._trackers[study_id]
+        tracker = sm.get_tracker(study_id)
         assert tracker.history[0]["trial_id"] == "src_2"
 
     def test_warm_start_with_real_study_manager(self, tmp_path):
@@ -542,7 +544,7 @@ class TestMetaLearner:
 
         # 4 个成功（0.85, 0.78, 0.92, 0.88），1 个失败（0.65）
         assert count == 4
-        tracker = sm._trackers[study_id]
+        tracker = sm.get_tracker(study_id)
         assert len(tracker.history) == 4
 
         # 后续 ask 应能从扩展后的 history 中读取
@@ -583,7 +585,7 @@ class TestCreateStudyWarmStart:
         )
 
         # tracker.history 应已注入源数据集的成功策略
-        tracker = sm._trackers[study_id]
+        tracker = sm.get_tracker(study_id)
         assert len(tracker.history) == 1
         assert tracker.history[0]["trial_id"] == "src_1"
 
@@ -602,7 +604,7 @@ class TestCreateStudyWarmStart:
         )
 
         # tracker.history 为空
-        tracker = sm._trackers[study_id]
+        tracker = sm.get_tracker(study_id)
         assert len(tracker.history) == 0
 
     def test_create_study_warm_start_without_store(self, tmp_path):
@@ -620,7 +622,7 @@ class TestCreateStudyWarmStart:
         )
 
         # 不报错，tracker.history 为空（no-op）
-        tracker = sm._trackers[study_id]
+        tracker = sm.get_tracker(study_id)
         assert len(tracker.history) == 0
 
     def test_create_study_warm_start_full_flow(self, tmp_path):
@@ -645,7 +647,7 @@ class TestCreateStudyWarmStart:
 
         # 保存源历史
         store = HistoryStore(base_dir=tmp_path)
-        store.save_history("UT_HAR_data", source_sm._trackers[source_study])
+        store.save_history("UT_HAR_data", source_sm.get_tracker(source_study))
 
         # 2. 创建新 study 并 warm-start
         target_sm = StudyManager()
@@ -659,7 +661,7 @@ class TestCreateStudyWarmStart:
         )
 
         # 3. 验证 tracker.history 已被注入
-        tracker = target_sm._trackers[target_study]
+        tracker = target_sm.get_tracker(target_study)
         # 3 个成功（0.76, 0.84, 0.92）
         assert len(tracker.history) == 3
 
@@ -698,55 +700,50 @@ class TestCreateStudyWarmStart:
 # grep 实证测试（反假绿）
 # ============================================================
 class TestGrepEvidence:
-    """grep 实证：源码检查所有 P3.2 实现关键点。"""
+    """反射 + grep 实证：A 类（存在性）用反射 API；B 类（行为）保留 grep。"""
 
-    def test_grep_sampler_protocol_warm_start(self):
-        """grep 实证：search_protocol.py 含 warm_start 方法定义。"""
-        path = _source_path("search_protocol.py")
-        assert _grep_source(path, "def warm_start(")
-        assert _grep_source(path, "source_history: List[Dict[str, Any]]")
+    @pytest.mark.parametrize("module_path,attr_name", [
+        ("senseframe.automl", "HistoryStore"),
+        ("senseframe.automl", "HistoryStore.save_history"),
+        ("senseframe.automl", "HistoryStore.load_history"),
+        ("senseframe.automl", "HistoryStore.list_datasets"),
+        ("senseframe.automl", "MetaLearner"),
+        ("senseframe.nas.sampler", "EvolutionarySampler.warm_start"),
+        ("senseframe.autoaugment.sampler", "AutoAugmentSampler.warm_start"),
+    ])
+    def test_attr_exists(self, module_path, attr_name):
+        """反射实证：模块属性存在性（参数化）。"""
+        mod = importlib.import_module(module_path)
+        parts = attr_name.split(".")
+        obj = mod
+        for part in parts[:-1]:
+            assert hasattr(obj, part), f"{module_path}.{part} 不存在"
+            obj = getattr(obj, part)
+        assert hasattr(obj, parts[-1]), f"{module_path}.{attr_name} 不存在"
 
-    def test_grep_history_store_class(self):
-        """grep 实证：exploration.py 含 class HistoryStore 定义。"""
-        path = _source_path("exploration.py")
-        assert _grep_source(path, "class HistoryStore")
-        assert _grep_source(path, "def save_history")
-        assert _grep_source(path, "def load_history")
-        assert _grep_source(path, "def list_datasets")
+    def test_sampler_protocol_warm_start(self):
+        """反射实证：Sampler Protocol 含 warm_start 方法且参数含 source_history。"""
+        assert hasattr(Sampler, "warm_start")
+        sig = inspect.signature(Sampler.warm_start)
+        assert "source_history" in sig.parameters
 
-    def test_grep_meta_learner_class(self):
-        """grep 实证：automl/meta_learner.py 含 class MetaLearner 定义。"""
-        path = _source_path("automl/meta_learner.py")
-        assert path.exists()
-        assert _grep_source(path, "class MetaLearner")
-        assert _grep_source(path, "def warm_start")
-        assert _grep_source(path, "success_threshold")
+    def test_meta_learner_class(self):
+        """反射实证：MetaLearner 类存在且含 warm_start 方法 + success_threshold 参数。"""
+        assert inspect.isclass(MetaLearner)
+        assert hasattr(MetaLearner, "warm_start")
+        assert callable(MetaLearner.warm_start)
+        sig = inspect.signature(MetaLearner.warm_start)
+        assert "success_threshold" in sig.parameters
 
-    def test_grep_create_study_warm_start_from(self):
-        """grep 实证：search_protocol.py create_study 含 warm_start_from 参数。"""
-        path = _source_path("search_protocol.py")
-        assert _grep_source(path, "warm_start_from: Optional[str]")
-        assert _grep_source(path, "history_store: Optional")
-        assert _grep_source(path, "warm_start_from and history_store is not None")
-        # 延迟导入 MetaLearner
-        assert _grep_source(path, "from .automl.meta_learner import MetaLearner")
+    def test_create_study_warm_start_from(self):
+        """反射实证：StudyManager.create_study 含 warm_start_from / history_store 参数。
 
-    def test_grep_automl_exports_meta_learner(self):
-        """grep 实证：automl/__init__.py 导出 MetaLearner 和 HistoryStore。"""
-        path = _source_path("automl/__init__.py")
-        assert _grep_source(path, "MetaLearner")
-        assert _grep_source(path, "HistoryStore")
-        assert _grep_source(path, "from .meta_learner import MetaLearner")
-
-    def test_grep_evolutionary_sampler_warm_start(self):
-        """grep 实证：EvolutionarySampler 实现 warm_start 方法。"""
-        path = _source_path("nas/sampler.py")
-        assert _grep_source(path, "def warm_start(")
-
-    def test_grep_autoaugment_sampler_warm_start(self):
-        """grep 实证：AutoAugmentSampler 实现 warm_start 方法。"""
-        path = _source_path("autoaugment/sampler.py")
-        assert _grep_source(path, "def warm_start(")
+        注：条件逻辑行为已由 TestCreateStudyWarmStart 运行时测试覆盖
+        （test_create_study_with_warm_start / test_create_study_warm_start_without_store）。
+        """
+        sig = inspect.signature(StudyManager.create_study)
+        assert "warm_start_from" in sig.parameters
+        assert "history_store" in sig.parameters
 
 
 # ============================================================
@@ -790,7 +787,7 @@ class TestMetaLearningIntegration:
         )
 
         # 3. 验证 tracker.history 已被注入（仅成功策略）
-        tracker = sm._trackers[study_id]
+        tracker = sm.get_tracker(study_id)
         assert len(tracker.history) == 1
         assert tracker.history[0]["trial_id"] == "src_best"
 
@@ -838,7 +835,7 @@ class TestMetaLearningIntegration:
         )
 
         # 3. 验证 tracker.history 已被注入 3 个成功策略
-        tracker = sm._trackers[study_id]
+        tracker = sm.get_tracker(study_id)
         assert len(tracker.history) == 3
 
         # 4. ask 多次：sampler 会从 history 中读取成功策略

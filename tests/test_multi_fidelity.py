@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import importlib
 import inspect
 from dataclasses import fields
 from pathlib import Path
@@ -169,7 +170,7 @@ class TestASHASampler:
         asha.should_prune("t1", {0: 0.5}, 0)  # 记录 t1
         asha.should_prune("t1", {0: 0.5}, 0)  # 不应重复记录
         # rung 0 应只有 1 个 entry
-        assert len(asha._rungs[0]) == 1
+        assert asha.rung_entry_count(0) == 1
 
     def test_should_prune_multiple_rungs(self):
         """多 rung 独立跟踪。"""
@@ -243,7 +244,7 @@ class TestHyperbandSampler:
         bracket_trials: Dict[int, List[str]] = {}
         for i in range(100):
             tid = f"iso_trial_{i}"
-            b = h._get_bracket(tid)
+            b = h.get_bracket(tid)
             if b not in bracket_trials:
                 bracket_trials[b] = []
             bracket_trials[b].append(tid)
@@ -264,8 +265,8 @@ class TestHyperbandSampler:
             h.should_prune(tid, {0: 0.9 - 0.1 * i}, 0)
 
         # 两个 bracket 的 rung 0 应有独立的 entries
-        assert len(h._brackets[brackets[0]][0]) == 4
-        assert len(h._brackets[brackets[1]][0]) == 4
+        assert h.bracket_rung_entry_count(brackets[0], 0) == 4
+        assert h.bracket_rung_entry_count(brackets[1], 0) == 4
 
 
 # ============================================================
@@ -679,74 +680,84 @@ class TestMethodRunnerPrunerIntegration:
 # ============================================================
 # 反假绿：grep 实证检查（源码不可绕过）
 # ============================================================
+# 混合 A/B/C 类测试：本类同时包含三类断言——
+#   A 类（反射/行为）：如 test_pipeline_has_intermediate_values_field 通过源码路径检查字段定义
+#   B 类（集成行为）：检查模块间集成代码存在性
+#   C 类（架构绊线）：register_pruner 注册调用和 _FIELD_FILL_STAGE 映射是架构契约，
+#     注册行为是模块加载时的副作用，反射无法验证"注册调用是否写在源码中"；
+#     _FIELD_FILL_STAGE 映射是 DSP schema 的数据源，必须与源码字面量一致。
+#     C 类断言以行内 # ARCHITECTURE_TRIPWIRE: 标注。
+#
+# P4b 冗余清理：以下 B 类 grep 断言因已有运行时测试覆盖而删除——
+#   - test_method_py_has_pruner_integration: 已由 TestMethodRunnerPrunerIntegration 运行时覆盖
+#   - test_orchestrator_has_realtime_pruning: 已由 TestRealTimePruning 运行时覆盖
+#   - test_method_py_uses_realtime_pruning: 已由 TestMethodRunnerRealTimePruning 运行时覆盖
 class TestGrepEvidence:
     """源码 grep 实证：mock 可绕过运行时，但绕不过源码 grep。"""
 
-    def test_search_protocol_has_pruner_protocol(self):
-        """search_protocol.py 应定义 Pruner Protocol。"""
-        path = _source_path("search_protocol.py")
-        assert _grep_source(path, "class Pruner(Protocol)"), \
-            "search_protocol.py 应定义 class Pruner(Protocol)"
-        assert _grep_source(path, "@runtime_checkable"), \
-            "Pruner 应有 @runtime_checkable 装饰器"
+    @pytest.mark.parametrize("module_path,attr_name", [
+        ("senseframe.search_protocol", "register_pruner"),
+        ("senseframe.search_protocol", "get_pruner"),
+        ("senseframe.search_protocol", "list_pruners"),
+        ("senseframe.engine.runner.orchestrator", "IntermediateMetricLogger"),
+        ("senseframe.engine.runner.orchestrator", "IntermediateMetricLogger.on_validation_epoch_end"),
+    ])
+    def test_attr_exists(self, module_path, attr_name):
+        """反射实证：模块属性存在性（参数化）。"""
+        mod = importlib.import_module(module_path)
+        parts = attr_name.split(".")
+        obj = mod
+        for part in parts[:-1]:
+            assert hasattr(obj, part), f"{module_path}.{part} 不存在"
+            obj = getattr(obj, part)
+        assert hasattr(obj, parts[-1]), f"{module_path}.{attr_name} 不存在"
 
-    def test_search_protocol_has_pruner_registry(self):
-        """search_protocol.py 应有 Pruner 注册表三件套。"""
-        path = _source_path("search_protocol.py")
-        assert _grep_source(path, "def register_pruner("), "应有 register_pruner"
-        assert _grep_source(path, "def get_pruner("), "应有 get_pruner"
-        assert _grep_source(path, "def list_pruners("), "应有 list_pruners"
+    def test_search_protocol_has_pruner_protocol(self):
+        """反射实证：Pruner 是 runtime_checkable Protocol。"""
+        assert inspect.isclass(Pruner)
+        assert getattr(Pruner, "_is_protocol", False) is True
+        assert hasattr(Pruner, "__protocol_attrs__")
 
     def test_search_protocol_has_asha_and_hyperband(self):
-        """search_protocol.py 应定义 ASHASampler 和 HyperbandSampler。"""
+        """反射实证：ASHASampler 和 HyperbandSampler 类存在。"""
+        assert inspect.isclass(ASHASampler)
+        assert inspect.isclass(HyperbandSampler)
+        # ARCHITECTURE_TRIPWIRE: 注册是架构契约，模块加载副作用无法通过反射验证
         path = _source_path("search_protocol.py")
-        assert _grep_source(path, "class ASHASampler:"), "应有 ASHASampler 类"
-        assert _grep_source(path, "class HyperbandSampler:"), "应有 HyperbandSampler 类"
-        assert _grep_source(path, 'register_pruner("asha"'), "应注册 asha 为 pruner"
-        assert _grep_source(path, 'register_pruner("hyperband"'), "应注册 hyperband 为 pruner"
+        assert _grep_source(path, 'register_pruner("asha"'), "应注册 asha 为 pruner"  # ARCHITECTURE_TRIPWIRE: 注册是架构契约，模块加载副作用无法通过反射验证
+        assert _grep_source(path, 'register_pruner("hyperband"'), "应注册 hyperband 为 pruner"  # ARCHITECTURE_TRIPWIRE: 同上
 
-    def test_method_py_has_pruner_integration(self):
-        """method.py 应包含 pruner 集成代码。"""
-        path = _source_path("experiment/method.py")
-        assert _grep_source(path, "self.pruner"), "MethodRunner 应有 self.pruner 属性"
-        assert _grep_source(path, "should_prune("), "应调用 should_prune"
-        assert _grep_source(path, "TrialStatus.PRUNED"), "应使用 TrialStatus.PRUNED"
-        assert _grep_source(path, 'state="pruned"'), "应 tell state=pruned"
-        assert _grep_source(path, "intermediate_values"), "应处理 intermediate_values"
+    # test_method_py_has_pruner_integration 已删除：
+    # 行为由 TestMethodRunnerPrunerIntegration + TestMethodRunnerRealTimePruning 运行时测试覆盖
 
     def test_pipeline_has_intermediate_values_field(self):
-        """pipeline/context.py 应定义 intermediate_values 字段。
-
-        拆分背景：原 pipeline.py 拆分为 pipeline/ 包，PipelineContext 位于 pipeline/context.py。
-        """
-        path = _source_path("engine/runner/pipeline/context.py")
-        assert _grep_source(path, "intermediate_values: Dict[int, float]"), \
-            "PipelineContext 应有 intermediate_values: Dict[int, float] 字段"
+        """反射实证：PipelineContext 应有 intermediate_values 字段。"""
+        field_names = {f.name for f in fields(PipelineContext)}
+        assert "intermediate_values" in field_names, \
+            "PipelineContext 应有 intermediate_values 字段"
 
     def test_pipeline_has_intermediate_metric_logger(self):
         """pipeline/stages/build.py 应注入 IntermediateMetricLogger 回调。
 
         拆分背景：原 pipeline.py 拆分为 pipeline/ 包，stage_build 位于 pipeline/stages/build.py。
         """
+        # ARCHITECTURE_TRIPWIRE: stage_build 必须注入 IntermediateMetricLogger 回调
+        # 不可替代原因: 深嵌在 stage_build 复杂构造流程中，无法独立单元测试
+        # 删除条件: 若 stage_build 拆分为更细粒度的子函数，可改为运行时测试
         path = _source_path("engine/runner/pipeline/stages/build.py")
         assert _grep_source(path, "IntermediateMetricLogger"), \
             "stage_build 应使用 IntermediateMetricLogger"
         assert _grep_source(path, "intermediate_values=ctx.intermediate_values"), \
             "应将 ctx.intermediate_values 传给回调"
 
-    def test_orchestrator_has_intermediate_metric_logger_class(self):
-        """orchestrator.py 应定义 IntermediateMetricLogger 类。"""
-        path = _source_path("engine/runner/orchestrator.py")
-        assert _grep_source(path, "class IntermediateMetricLogger"), \
-            "orchestrator.py 应定义 IntermediateMetricLogger 类"
-        assert _grep_source(path, "on_validation_epoch_end"), \
-            "IntermediateMetricLogger 应实现 on_validation_epoch_end"
-
     def test_pipeline_export_intermediate_values_to_train_output(self):
         """pipeline/stages/export.py 应将 intermediate_values 写入 TrainOutput.training。
 
         拆分背景：原 pipeline.py 拆分为 pipeline/ 包，stage_export 位于 pipeline/stages/export.py。
         """
+        # ARCHITECTURE_TRIPWIRE: stage_export 必须将 intermediate_values 写入 TrainOutput
+        # 不可替代原因: 深嵌在 stage_export 的 TrainingSummary 构造中，无法独立单元测试
+        # 删除条件: 若 TrainingSummary 构造提取为独立函数，可改为运行时测试
         path = _source_path("engine/runner/pipeline/stages/export.py")
         # P5 P2-7 阶段2：构造点改为 validate_training_summary 调用
         assert _grep_source(path, '"intermediate_values": ctx.intermediate_values'), \
@@ -758,6 +769,7 @@ class TestGrepEvidence:
         拆分背景：原 pipeline.py 拆分为 pipeline/ 包，_FIELD_FILL_STAGE 位于 pipeline/context.py。
         """
         path = _source_path("engine/runner/pipeline/context.py")
+        # ARCHITECTURE_TRIPWIRE: _FIELD_FILL_STAGE 映射是 DSP schema 数据源，必须与源码字面量一致
         assert _grep_source(path, '"intermediate_values": "stage_train"'), \
             "_FIELD_FILL_STAGE 应映射 intermediate_values → stage_train"
 
@@ -766,53 +778,41 @@ class TestGrepEvidence:
     # ============================================================
 
     def test_context_has_pruner_field(self):
-        """pipeline/context.py 应定义 pruner 字段（agent 注入 pruner 实例）。"""
-        path = _source_path("engine/runner/pipeline/context.py")
-        assert _grep_source(path, "pruner: Optional[Any] = None"), \
-            "PipelineContext 应有 pruner: Optional[Any] = None 字段"
+        """反射实证：PipelineContext 应有 pruner 字段。"""
+        field_names = {f.name for f in fields(PipelineContext)}
+        assert "pruner" in field_names, \
+            "PipelineContext 应有 pruner 字段"
 
     def test_context_has_pruned_fields(self):
-        """pipeline/context.py 应定义 pruned/pruned_epoch 字段（stage_train 写入）。"""
-        path = _source_path("engine/runner/pipeline/context.py")
-        assert _grep_source(path, "pruned: bool = False"), \
-            "PipelineContext 应有 pruned: bool = False 字段"
-        assert _grep_source(path, "pruned_epoch: Optional[int] = None"), \
-            "PipelineContext 应有 pruned_epoch: Optional[int] = None 字段"
+        """反射实证：PipelineContext 应有 pruned/pruned_epoch 字段。"""
+        field_names = {f.name for f in fields(PipelineContext)}
+        assert "pruned" in field_names, \
+            "PipelineContext 应有 pruned 字段"
+        assert "pruned_epoch" in field_names, \
+            "PipelineContext 应有 pruned_epoch 字段"
 
     def test_context_field_fill_stage_has_pruner(self):
         """_FIELD_FILL_STAGE 应映射 pruner → agent。"""
         path = _source_path("engine/runner/pipeline/context.py")
+        # ARCHITECTURE_TRIPWIRE: _FIELD_FILL_STAGE 映射是 DSP schema 数据源
         assert _grep_source(path, '"pruner": "agent"'), \
             "_FIELD_FILL_STAGE 应映射 pruner → agent"
 
     def test_context_field_fill_stage_has_pruned(self):
         """_FIELD_FILL_STAGE 应映射 pruned/pruned_epoch → stage_train。"""
         path = _source_path("engine/runner/pipeline/context.py")
+        # ARCHITECTURE_TRIPWIRE: _FIELD_FILL_STAGE 映射是 DSP schema 数据源
         assert _grep_source(path, '"pruned": "stage_train"'), \
             "_FIELD_FILL_STAGE 应映射 pruned → stage_train"
+        # ARCHITECTURE_TRIPWIRE: 同上
         assert _grep_source(path, '"pruned_epoch": "stage_train"'), \
             "_FIELD_FILL_STAGE 应映射 pruned_epoch → stage_train"
 
-    def test_orchestrator_has_realtime_pruning(self):
-        """orchestrator.py IntermediateMetricLogger 应包含实时剪枝代码。"""
-        path = _source_path("engine/runner/orchestrator.py")
-        # pruner 注入参数
-        assert _grep_source(path, "pruner: Any = None"), \
-            "IntermediateMetricLogger.__init__ 应接受 pruner 参数"
-        assert _grep_source(path, "trial_id: str ="), \
-            "IntermediateMetricLogger.__init__ 应接受 trial_id 参数"
-        assert _grep_source(path, "on_pruned"), \
-            "IntermediateMetricLogger.__init__ 应接受 on_pruned 回调"
-        # 实时剪枝逻辑
-        assert _grep_source(path, "trainer.should_stop = True"), \
-            "IntermediateMetricLogger 应设 trainer.should_stop = True"
-        assert _grep_source(path, "_pruned_this_session"), \
-            "IntermediateMetricLogger 应有幂等标志 _pruned_this_session"
-        assert _grep_source(path, "self.pruner.should_prune("), \
-            "IntermediateMetricLogger 应调用 self.pruner.should_prune"
-
     def test_build_py_injects_pruner(self):
         """pipeline/stages/build.py 应将 ctx.pruner 注入 IntermediateMetricLogger。"""
+        # ARCHITECTURE_TRIPWIRE: stage_build 必须将 ctx.pruner/trial_id 注入回调
+        # 不可替代原因: 深嵌在 stage_build 复杂构造流程中，无法独立单元测试
+        # 删除条件: 若 stage_build 拆分为更细粒度的子函数，可改为运行时测试
         path = _source_path("engine/runner/pipeline/stages/build.py")
         assert _grep_source(path, "pruner=ctx.pruner"), \
             "stage_build 应将 ctx.pruner 传给 IntermediateMetricLogger"
@@ -845,36 +845,52 @@ class TestGrepEvidence:
         assert _grep_source(path, '"pruned_epoch": ctx.pruned_epoch'), \
             "stage_export 应将 ctx.pruned_epoch 写入 TrainingSummary 构造"
 
-    def test_method_py_uses_realtime_pruning(self):
-        """experiment/method.py 应通过 run_pipeline 的 pruner/trial_id 参数启用实时早停。"""
-        path = _source_path("experiment/method.py")
-        assert _grep_source(path, "pruner=self.pruner"), \
-            "MethodRunner 应传 pruner=self.pruner 给 run_pipeline"
-        assert _grep_source(path, "trial_id=trial.trial_id"), \
-            "MethodRunner 应传 trial_id=trial.trial_id 给 run_pipeline"
-        assert _grep_source(path, "real_time_pruned"), \
-            "MethodRunner 应读取 real_time_pruned 状态"
-        # 兼容旧路径：实时剪枝未触发时回退到事后剪枝
-        assert _grep_source(path, "should_prune = real_time_pruned"), \
-            "MethodRunner 应将 should_prune 初始化为 real_time_pruned"
-
     def test_schemas_has_pruned_fields(self):
-        """schemas.py TrainingSummary 应有 pruned/pruned_epoch 字段。"""
-        path = _source_path("schemas.py")
-        assert _grep_source(path, "pruned: bool = False"), \
-            "TrainingSummary 应有 pruned: bool = False 字段"
-        assert _grep_source(path, "pruned_epoch: Optional[int] = None"), \
-            "TrainingSummary 应有 pruned_epoch: Optional[int] = None 字段"
+        """反射实证：TrainingSummary 应有 pruned/pruned_epoch 字段。"""
+        from senseframe.schemas import TrainingSummary
+        field_names = {f.name for f in fields(TrainingSummary)}
+        assert "pruned" in field_names, \
+            "TrainingSummary 应有 pruned 字段"
+        assert "pruned_epoch" in field_names, \
+            "TrainingSummary 应有 pruned_epoch 字段"
 
     def test_runtime_run_pipeline_accepts_pruner(self):
-        """pipeline/runtime.py run_pipeline 应接受 pruner/trial_id 参数。"""
-        path = _source_path("engine/runner/pipeline/runtime.py")
-        assert _grep_source(path, "pruner: Any = None"), \
+        """反射实证：run_pipeline 应接受 pruner/trial_id 参数。"""
+        from senseframe.engine.runner.pipeline.runtime import run_pipeline
+        sig = inspect.signature(run_pipeline)
+        assert "pruner" in sig.parameters, \
             "run_pipeline 应接受 pruner 参数"
-        assert _grep_source(path, "trial_id: str ="), \
+        assert "trial_id" in sig.parameters, \
             "run_pipeline 应接受 trial_id 参数"
-        assert _grep_source(path, "ctx.pruner = pruner"), \
+    def test_runtime_run_pipeline_injects_pruner_to_ctx(self):
+        """运行时实证：run_pipeline 应将 pruner/trial_id 注入 ctx。"""
+        from unittest.mock import patch, MagicMock
+        from senseframe.engine.runner.pipeline.runtime import run_pipeline
+
+        captured_ctx = {}
+        def _fake_run(self, ctx):
+            captured_ctx["pruner"] = ctx.pruner
+            captured_ctx["trial_id"] = ctx.trial_id
+            from senseframe.engine.runner.pipeline.runtime import StageResult
+            return StageResult(ok=True, output=MagicMock(status="completed"))
+
+        mock_pruner = MagicMock()
+        with patch("senseframe.engine.runner.pipeline.runtime.Pipeline.run", _fake_run):
+            with patch("senseframe.engine.runner.pipeline.runtime.Pipeline.default") as mock_default:
+                mock_pipeline = MagicMock()
+                mock_pipeline.run = lambda ctx: _fake_run(mock_pipeline, ctx)
+                mock_default.return_value = mock_pipeline
+                try:
+                    run_pipeline(
+                        MagicMock(), pruner=mock_pruner, trial_id="t_001",
+                    )
+                except Exception:
+                    pass  # config mock 可能触发后续错误，只需捕获 ctx
+
+        assert captured_ctx.get("pruner") is mock_pruner, \
             "run_pipeline 应将 pruner 写到 ctx.pruner"
+        assert captured_ctx.get("trial_id") == "t_001", \
+            "run_pipeline 应将 trial_id 写到 ctx.trial_id"
 
 
 # ============================================================
@@ -907,7 +923,7 @@ class TestRealTimePruning:
         assert iv == {1: 0.5}
         # 不应触发剪枝
         assert trainer.should_stop is False
-        assert cb._pruned_this_session is False
+        assert cb.pruned_this_session is False
 
     def test_pruner_returns_false_no_stop(self):
         """pruner 返回 False 时不应设 trainer.should_stop。"""
@@ -927,7 +943,7 @@ class TestRealTimePruning:
         trainer = self._make_trainer(current_epoch=0, val_accuracy=0.7)
         cb.on_validation_epoch_end(trainer, None)
         assert trainer.should_stop is False
-        assert cb._pruned_this_session is False
+        assert cb.pruned_this_session is False
         assert pruned_calls == []
         # intermediate_values 仍写入
         assert iv == {1: 0.7}
@@ -950,7 +966,7 @@ class TestRealTimePruning:
         trainer = self._make_trainer(current_epoch=2, val_accuracy=0.3)
         cb.on_validation_epoch_end(trainer, None)
         assert trainer.should_stop is True
-        assert cb._pruned_this_session is True
+        assert cb.pruned_this_session is True
         # epoch_1indexed = 2+1 = 3
         assert pruned_calls == [3]
         assert iv == {3: 0.3}
@@ -972,7 +988,7 @@ class TestRealTimePruning:
         trainer = self._make_trainer(current_epoch=0, val_accuracy=0.5)
         cb.on_validation_epoch_end(trainer, None)
         assert trainer.should_stop is False
-        assert cb._pruned_this_session is False
+        assert cb.pruned_this_session is False
         # intermediate_values 仍应被写入（pruner 异常不影响指标捕获）
         assert iv == {1: 0.5}
 
@@ -1046,7 +1062,7 @@ class TestRealTimePruning:
         cb.on_validation_epoch_end(trainer, None)
         # should_stop 仍应被设为 True（回调异常不影响主流程）
         assert trainer.should_stop is True
-        assert cb._pruned_this_session is True
+        assert cb.pruned_this_session is True
 
     def test_rung_is_current_epoch_1indexed(self):
         """传给 pruner.should_prune 的 rung 应为当前 epoch（1-indexed）。"""
